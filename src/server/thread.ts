@@ -157,6 +157,7 @@ export interface ThreadDependencies {
     turnId: string,
     signal: AbortSignal,
   ) => Promise<{ prompt: string } | undefined>;
+  stoppedOutcomes?: (turnId: string) => Promise<string[]>;
   bindVerificationQuestion?: (
     turnId: string,
     messageId: string,
@@ -1351,6 +1352,7 @@ async function loadTurnContext(turn: any, dependencies: ThreadDependencies) {
     learnedSkills,
     connectedApps,
     mcpServers,
+    confirmedActions,
   ] = await Promise.all([
     loadMessage(sourceMessageId),
     pool.query(
@@ -1386,6 +1388,7 @@ async function loadTurnContext(turn: any, dependencies: ThreadDependencies) {
       ? dependencies.connectedApps?.()
       : dependencies.connectedApps?.().catch(() => undefined),
     dependencies.mcpServers?.().catch(() => undefined),
+    dependencies.stoppedOutcomes?.(turn.id),
   ]);
   const preference = preferences.rows[0];
   const related =
@@ -1418,6 +1421,7 @@ async function loadTurnContext(turn: any, dependencies: ThreadDependencies) {
       ...(previous.rows[0]?.status === 'failed' && previous.rows[0].error
         ? { previousFailure: previous.rows[0].error }
         : {}),
+      ...(confirmedActions?.length ? { confirmedActions } : {}),
       ...(related.length ? { relatedConversation: related } : {}),
       ...(learnedSkills?.length ? { learnedSkills } : {}),
       ...(connectedApps ? { connectedApps } : {}),
