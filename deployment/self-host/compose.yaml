@@ -143,6 +143,7 @@ services:
   workspace-network:
     image: nod-workspace:${NOD_IMAGE_TAG:-local}
     pull_policy: never
+    dns: [1.1.1.1, 8.8.8.8]
     user: root
     restart: unless-stopped
     init: true

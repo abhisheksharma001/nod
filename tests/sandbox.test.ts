@@ -58,6 +58,7 @@ test(
     const segment = Math.floor(Math.random() * 200) + 20;
     const privateAddress = `10.71.${segment}.2`;
     const ipv6Address = `fd71:${segment}::2`;
+    const publicIpv6Address = `2606:4700:71:${segment}::2`;
     const publicAddress = '93.184.216.34';
     const metadataAddress = '169.254.169.254';
     const config = join(root, 'compose.json');
@@ -80,7 +81,17 @@ test(
       networks[0]!,
     );
     await docker('network', 'create', '--internal', '--subnet', '169.254.0.0/16', networks[1]!);
-    await docker('network', 'create', '--internal', '--subnet', '93.184.216.0/24', networks[2]!);
+    await docker(
+      'network',
+      'create',
+      '--internal',
+      '--subnet',
+      '93.184.216.0/24',
+      '--ipv6',
+      '--subnet',
+      `2606:4700:71:${segment}::/64`,
+      networks[2]!,
+    );
     await docker(
       'run',
       '-d',
@@ -122,6 +133,8 @@ Server(('::', 8080), Handler).serve_forever()
       'connect',
       '--ip',
       publicAddress,
+      '--ip6',
+      publicIpv6Address,
       '--alias',
       'public-fixture',
       networks[2]!,
@@ -134,6 +147,7 @@ Server(('::', 8080), Handler).serve_forever()
       [networks[0]!, `[${ipv6Address}]`],
       [networks[1]!, metadataAddress],
       [networks[2]!, publicAddress],
+      [networks[2]!, `[${publicIpv6Address}]`],
     ])
       assert.equal(
         await docker(
@@ -192,6 +206,7 @@ Server(('::', 8080), Handler).serve_forever()
         metadataAddress,
         'private-fixture',
         `[${ipv6Address}]`,
+        `[${publicIpv6Address}]`,
       ])
         await assert.rejects(request(address), /fetch failed|TimeoutError/);
       await assert.rejects(request(publicAddress, '/redirect'), /fetch failed|TimeoutError/);

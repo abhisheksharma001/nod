@@ -90,8 +90,6 @@ To configure a domain before the first start, run `sh setup.sh`, set `NOD_PUBLIC
 
 This option compiles the application and its browser tools on the server. Use a prebuilt bundle to avoid that first build. Neither option needs a separately installed database.
 
-The workspace uses a separate firewall container. It blocks private and reserved IPv4 destinations, including cloud metadata services, and external IPv6 traffic. The workspace starts only after this firewall is ready. Keep the `workspace-network` service and its network settings when you change the Compose file. These rules do not change the server's own connections to models or apps.
-
 ### Open a remote server without a domain
 
 On your own computer, open a tunnel to the server:
@@ -189,6 +187,8 @@ flowchart LR
 ```
 
 The database, workspace, and browser stay private. Model keys and saved credentials stay with the server, outside the workspace and browser containers.
+
+The workspace uses a separate firewall container. It blocks private and reserved IPv4 destinations, including cloud metadata services, and external IPv6 traffic. The workspace starts only after this firewall is ready. Keep the `workspace-network` service and its network settings when you change the Compose file. Its DNS requests use public resolvers at `1.1.1.1` and `8.8.8.8`. These rules do not change the server's own connections to models or apps.
 
 The stack uses named volumes for its persistent data. Recreating a container keeps those volumes. Deleting the volumes removes your data.
 
