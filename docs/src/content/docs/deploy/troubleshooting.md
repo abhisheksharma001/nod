@@ -148,6 +148,18 @@ stateDiagram-v2
 
 Ask Nod to check the result in the app or website before you try again. See [One use, one result](/trust/outcomes/).
 
+### Nod asks before many browser steps
+
+Nod checks each browser step that could send, submit or change something, such as a click that submits a form. There is no setting that turns the check off. Nod asks when your words don't cover the step.
+
+To get fewer questions:
+
+- **Name the outcome and the site.** "Book a table for two at 7pm on the restaurant's website" covers the steps up to the booking. A vague request makes Nod ask more.
+- **Set a rule.** Tell Nod in chat, for example "You can fill in and submit the contact form on example.com without asking." A rule covers only the action and site it names.
+- **Accept the offer.** After you approve a step that will come up again, Nod offers once to stop asking for it.
+
+Reading steps run without asking unless you told Nod to ask first. These include opening pages, searching, filtering, cookie choices, and moving through a form before its last step. See [Browser steps](/trust/approvals/#browser-steps) and [Your rules](/trust/approvals/#your-rules).
+
 ## Get help
 
 ### Send feedback with a diagnostic report
