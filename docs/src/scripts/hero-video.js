@@ -11,5 +11,6 @@ export function startHeroVideo() {
     player.allow = 'autoplay; encrypted-media; picture-in-picture; fullscreen';
     player.allowFullscreen = true;
     play.replaceWith(player);
+    player.focus();
   });
 }

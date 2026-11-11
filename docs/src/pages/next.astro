@@ -154,7 +154,7 @@ const panelSizes = '(min-width: 1440px) 808px, (min-width: 1100px) 56vw, 92vw';
             fetchpriority="high"
           />
           <div class="lp-hero-video">
-            <button type="button" class="lp-video-play" id="heroPlayBtn" aria-label="Play the Nod video">
+            <button type="button" class="lp-video-play" id="heroPlayBtn">
               <Image
                 src={heroVideoPoster}
                 alt=""
@@ -164,8 +164,8 @@ const panelSizes = '(min-width: 1440px) 808px, (min-width: 1100px) 56vw, 92vw';
                 quality={80}
                 loading="eager"
               />
-              <span class="lp-video-play-label mono" aria-hidden="true"
-                ><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M4.5 2.5v11l9-5.5z"></path></svg
+              <span class="lp-video-play-label mono"
+                ><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4.5 2.5v11l9-5.5z"></path></svg
                 >Play video</span
               >
             </button>
