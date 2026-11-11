@@ -5,11 +5,18 @@ sidebar:
   order: 1
 ---
 
-import { Steps } from '@astrojs/starlight/components';
+import { Aside, Steps } from '@astrojs/starlight/components';
 
 Run Nod on a Linux server or Mac mini, then use the same assistant from your other devices.
 
 One server belongs to one person. Its access token grants full access to that person's assistant and connected accounts. There is no registration or multi-user setup.
+
+<Aside type="caution" title="Cloud hosting">
+  Cloud VM metadata services can provide cloud credentials to workspace commands. Keep Nod's
+  workspace firewall enabled and configure your provider's metadata access controls, such as [AWS
+  instance metadata
+  options](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-options.html).
+</Aside>
 
 ## What you need
 
