@@ -2,6 +2,7 @@ import { pool } from './db.ts';
 import { authToken, dataRoot, desktopMode, host, port, publicOrigin, webRoot } from './config.ts';
 import { accessKey } from './access.ts';
 import { createApplication, createDefaultAdapters } from './composition.ts';
+import { events } from './events.ts';
 
 let stopping = false;
 let closeApplication: (() => Promise<void>) | undefined;
@@ -10,9 +11,15 @@ const parent = (
     parentPort?: {
       on(event: 'message', listener: (event: { data: unknown }) => void): void;
       removeListener(event: 'message', listener: (event: { data: unknown }) => void): void;
+      postMessage(message: unknown): void;
     };
   }
 ).parentPort;
+if (desktopMode)
+  events.on('event', (event) => {
+    if (event.type === 'activity')
+      parent?.postMessage({ type: 'nod-activity', doing: event.items.map((item) => item.doing) });
+  });
 const runtimeReady =
   desktopMode && process.env.NOD_DESKTOP_RUNTIME_PENDING === 'true'
     ? new Promise<void>((resolve) => {

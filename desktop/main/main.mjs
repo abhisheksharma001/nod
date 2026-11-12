@@ -11,6 +11,7 @@ import {
   net,
   Notification,
   powerMonitor,
+  powerSaveBlocker,
   protocol,
   safeStorage,
   screen,
@@ -179,6 +180,7 @@ let engineOrigin = '';
 let engineBound = false;
 let authToken = '';
 let remoteConnection;
+let awakeBlocker;
 let connectionSettingsOpen = false;
 let onboardingSetupOpen = false;
 let connectionReturnsToOnboarding = false;
@@ -1594,6 +1596,15 @@ async function saveConnection(input) {
   });
 }
 
+function stayAwake(working) {
+  if (working && awakeBlocker === undefined)
+    awakeBlocker = powerSaveBlocker.start('prevent-app-suspension');
+  if (!working && awakeBlocker !== undefined) {
+    powerSaveBlocker.stop(awakeBlocker);
+    awakeBlocker = undefined;
+  }
+}
+
 async function stopEngine() {
   enginePreferencesReady = false;
   engineRuntimeReady = false;
@@ -2182,6 +2193,8 @@ async function startEngine({ runtime, signal, pending = false }) {
     }
     if (engine === child && message?.type === 'nod-1password-open') openOnePassword(child);
     if (engine === child && message?.type === 'nod-trash') void moveToTrash(child, message);
+    if (engine === child && message?.type === 'nod-activity')
+      stayAwake(Array.isArray(message.doing) && message.doing.some((doing) => doing !== 'queued'));
   });
   child.stdout?.resume();
   let diagnostics = '';
@@ -2202,6 +2215,7 @@ async function startEngine({ runtime, signal, pending = false }) {
   });
   child.on('exit', (code) => {
     if (engine !== child) return;
+    stayAwake(false);
     if (!closingEngine)
       failure =
         (status.phase === 'error' && status.error) ||
