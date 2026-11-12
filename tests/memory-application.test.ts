@@ -698,6 +698,8 @@ test('memory refuses card numbers and login links but keeps links with long nume
     'Pays with card 4111 1111 1111 1111.',
     'Backup card 5555-5555-5555-4444',
     'Amex 378282246310005',
+    'Old Visa 4222222222222',
+    'Old Visa 4222 2222 22222',
     'Card 4111 1111 1111 1111 12/27',
     'Ref 7 4111 1111 1111 1111',
     'Dashboard at https://owner:example-pass@example.com/admin',

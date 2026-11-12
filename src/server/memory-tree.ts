@@ -20,15 +20,15 @@ const keyOrLoginLink = new RegExp(
 );
 function holdsCard(run: string) {
   const groups = run.split(/[ -]/);
-  return groups.some((_, start) => {
+  for (let start = 0; start < groups.length; start++) {
     let digits = '';
-    for (const group of groups.slice(start)) {
-      digits += group;
-      if (digits.length > 19) return false;
-      if (digits.length >= 14 && cardNumber(digits)) return true;
+    for (let end = start; end < groups.length; end++) {
+      digits += groups[end];
+      if (digits.length > 19) break;
+      if (cardNumber(digits)) return true;
     }
-    return false;
-  });
+  }
+  return false;
 }
 export function personalSecret(text: string) {
   return keyOrLoginLink.test(text) || [...text.matchAll(digitRun)].some(([run]) => holdsCard(run));
