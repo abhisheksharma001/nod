@@ -12477,7 +12477,7 @@ test(
     const activity = createActivity({
       pool,
       ownerId: owner,
-      onWorking: (working) => seen.push(working),
+      keepAwake: { set: (working) => seen.push(working) },
       recheckMs: 50,
     });
     const until = async (count: number) => {
@@ -12514,14 +12514,21 @@ test(
       refresh();
       await until(1);
       assert.deepEqual(seen, [true]);
-      await pool.query("UPDATE turns SET status='succeeded' WHERE id=$1", [scheduled]);
+      await pool.query('ALTER TABLE turns RENAME TO turns_unavailable');
       await until(2);
       assert.deepEqual(seen, [true, false]);
+      await pool.query('ALTER TABLE turns_unavailable RENAME TO turns');
+      refresh();
+      await until(3);
+      assert.deepEqual(seen, [true, false, true]);
+      await pool.query("UPDATE turns SET status='succeeded' WHERE id=$1", [scheduled]);
+      await until(4);
+      assert.deepEqual(seen, [true, false, true, false]);
       activity.close();
       await pool.query("UPDATE turns SET status='running' WHERE id=$1", [scheduled]);
       refresh();
       await delay(400);
-      assert.deepEqual(seen, [true, false]);
+      assert.deepEqual(seen, [true, false, true, false]);
     } finally {
       activity.close();
       await pool.end();

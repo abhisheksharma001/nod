@@ -10,7 +10,6 @@ const parent = (
     parentPort?: {
       on(event: 'message', listener: (event: { data: unknown }) => void): void;
       removeListener(event: 'message', listener: (event: { data: unknown }) => void): void;
-      postMessage(message: unknown): void;
     };
   }
 ).parentPort;
@@ -28,9 +27,6 @@ const runtimeReady =
     : undefined;
 const { app } = await createApplication(createDefaultAdapters(process.env), {
   runtimeReady,
-  ...(desktopMode && parent
-    ? { onWorking: (working: boolean) => parent.postMessage({ type: 'nod-working', working }) }
-    : {}),
 });
 closeApplication = () => app.close();
 if (!desktopMode && process.env.NODE_ENV !== 'production') {
@@ -106,7 +102,9 @@ await app.listen({
 const address = app.server?.address();
 const listeningPort = address && typeof address === 'object' ? address.port : port;
 if (desktopMode)
-  parent?.postMessage({
+  (
+    process as NodeJS.Process & { parentPort?: { postMessage(message: unknown): void } }
+  ).parentPort?.postMessage({
     type: 'nod-ready',
     port: listeningPort,
   });

@@ -3,6 +3,7 @@ import type { Activity } from '../shared/contracts.ts';
 import { events, type ServerEvent } from './events.ts';
 import { logFailure } from './failure-log.ts';
 import { ownerStarted } from './thread.ts';
+import type { KeepAwake } from '../ports/keep-awake.ts';
 
 export type LiveWork = Activity & {
   channel: string;
@@ -61,48 +62,45 @@ export function createActivity({
   pool,
   ownerId,
   model,
-  onWorking,
+  keepAwake,
   recheckMs = 60_000,
 }: {
   pool: Pool;
   ownerId: string;
   model?: () => string | undefined;
-  onWorking?: (working: boolean) => void;
+  keepAwake?: KeepAwake;
   recheckMs?: number;
 }) {
   let last = '[]';
   let timer: ReturnType<typeof setTimeout> | undefined;
   let publishing = Promise.resolve();
+  let statusChanged = false;
   let working = false;
-  let workingTimer: ReturnType<typeof setTimeout> | undefined;
-  let workingDue = 0;
-  let checking = Promise.resolve();
+  let recheck: ReturnType<typeof setInterval> | undefined;
   let closed = false;
 
-  function checkWorking(delay: number) {
-    if (!onWorking || closed) return;
-    const due = Date.now() + delay;
-    if (workingTimer && workingDue <= due) return;
-    clearTimeout(workingTimer);
-    workingDue = due;
-    workingTimer = setTimeout(() => {
-      workingTimer = undefined;
-      checking = checking
-        .then(async () => {
-          const { rows } = await pool.query(
-            "SELECT EXISTS(SELECT 1 FROM turns WHERE owner_id=$1 AND status='running') AS working",
-            [ownerId],
-          );
-          if (rows[0].working === working) return;
-          working = rows[0].working;
-          onWorking(working);
-        })
-        .catch((cause) => logFailure('working_read_failed', cause))
-        .finally(() => {
-          if (working) checkWorking(recheckMs);
-        });
-    }, delay);
-    workingTimer.unref?.();
+  async function checkWorking() {
+    if (!keepAwake) return;
+    let next = false;
+    try {
+      const { rows } = await pool.query(
+        "SELECT EXISTS(SELECT 1 FROM turns WHERE owner_id=$1 AND status='running') AS working",
+        [ownerId],
+      );
+      next = rows[0].working;
+    } catch (cause) {
+      logFailure('working_read_failed', cause);
+    }
+    if (closed || next === working) return;
+    working = next;
+    clearInterval(recheck);
+    recheck = working
+      ? setInterval(() => {
+          publishing = publishing.then(checkWorking);
+        }, recheckMs)
+      : undefined;
+    recheck?.unref?.();
+    keepAwake.set(working);
   }
 
   async function read(): Promise<LiveWork[]> {
@@ -142,6 +140,8 @@ export function createActivity({
     );
 
   function publish() {
+    const changed = statusChanged;
+    statusChanged = false;
     publishing = publishing
       .then(async () => {
         const items = visible(await read());
@@ -151,11 +151,12 @@ export function createActivity({
         events.emit('event', { type: 'activity', ownerId, items });
       })
       .catch((cause) => logFailure('activity_read_failed', cause));
+    if (changed) publishing = publishing.then(checkWorking);
   }
 
   const listen = (event: ServerEvent) => {
     if (event.type !== 'refresh' && event.type !== 'working') return;
-    checkWorking(250);
+    if (event.type === 'refresh') statusChanged = true;
     if (timer) return;
     timer = setTimeout(() => {
       timer = undefined;
@@ -169,13 +170,13 @@ export function createActivity({
     current: async () => visible(await read()),
     start() {
       events.on('event', listen);
-      checkWorking(0);
+      publishing = publishing.then(checkWorking);
     },
     close() {
       events.off('event', listen);
       clearTimeout(timer);
       closed = true;
-      clearTimeout(workingTimer);
+      clearInterval(recheck);
     },
   };
 }

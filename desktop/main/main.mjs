@@ -2194,7 +2194,8 @@ async function startEngine({ runtime, signal, pending = false }) {
     }
     if (engine === child && message?.type === 'nod-1password-open') openOnePassword(child);
     if (engine === child && message?.type === 'nod-trash') void moveToTrash(child, message);
-    if (engine === child && message?.type === 'nod-working') stayAwake(message.working === true);
+    if (engine === child && !closingEngine && message?.type === 'nod-working')
+      stayAwake(message.working === true);
   });
   child.stdout?.resume();
   let diagnostics = '';
