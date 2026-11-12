@@ -93,7 +93,7 @@ export function createActivity({
             "SELECT EXISTS(SELECT 1 FROM turns WHERE owner_id=$1 AND status='running') AS working",
             [ownerId],
           );
-          if (closed || rows[0].working === working) return;
+          if (rows[0].working === working) return;
           working = rows[0].working;
           onWorking(working);
         })
