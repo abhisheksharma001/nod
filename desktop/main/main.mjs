@@ -43,7 +43,6 @@ import { createAppPreferencesStore } from './app-preferences.mjs';
 import { createChatReadCursorStore } from './chat-read-cursors.mjs';
 import { registerArtifactFileHandlers } from './artifact-file-handlers.mjs';
 import { saveArtifactDownload } from './downloads.mjs';
-import { waitForEngineHealth } from './engine-health.mjs';
 import { createDesktopLifecycle, startupErrorDetails } from './lifecycle.mjs';
 import { createMacEncryption } from './mac-encryption.mjs';
 import { createDesktopUpdater, createUpdateSource, startDesktopUpdateChecks } from './updates.mjs';
@@ -2101,15 +2100,32 @@ async function startEngine({ runtime, signal, pending = false }) {
       showSettings('general', true);
     }
   });
-  const ready = await waitForEngineHealth({
-    request: () => engineRequest('/api/health'),
-    active: () => engine === child,
-    signal,
-    log: (line) =>
-      writeDiagnostic(`${line} Engine reported its port: ${engineBound ? 'yes' : 'no'}.`).catch(
-        () => {},
-      ),
-  });
+  const started = Date.now();
+  const deadline = started + 120_000;
+  let ready = false;
+  let lastFailure = 'none';
+  while (Date.now() < deadline && engine === child && !signal.aborted) {
+    try {
+      const response = await engineRequest('/api/health');
+      if (response.ok && (await response.json()).ok === true) {
+        ready = true;
+        break;
+      }
+      lastFailure = response.ok ? 'unexpected response' : `HTTP ${response.status}`;
+    } catch (error) {
+      lastFailure =
+        [error?.cause?.code, error?.code].find((code) => typeof code === 'string') ||
+        error?.name ||
+        'error';
+    }
+    await new Promise((accept) => setTimeout(accept, 300));
+  }
+  if (!ready && engine === child && !signal.aborted && Date.now() >= deadline) {
+    const waited = ((Date.now() - started) / 1000).toFixed(1);
+    await writeDiagnostic(
+      `Background service health check timed out after ${waited}s. Engine process still running: yes. Last health check: ${lastFailure}. Engine reported its port: ${engineBound ? 'yes' : 'no'}.`,
+    ).catch(() => {});
+  }
   if (!ready || engine !== child || signal.aborted) {
     await stopEngine();
     throw new Error(
