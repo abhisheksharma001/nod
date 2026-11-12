@@ -4295,17 +4295,17 @@ test('the computer stays awake only while the local engine reports running work'
   f.crash();
   assert.equal((await f.prepare()).phase, 'ready');
   const [engine] = f.children;
-  engine.emit('message', { type: 'nod-activity', doing: ['queued'] });
+  engine.emit('message', { type: 'nod-working', working: 'yes' });
   assert.deepEqual(f.awake(), []);
-  engine.emit('message', { type: 'nod-activity', doing: ['queued', 'model'] });
-  engine.emit('message', { type: 'nod-activity', doing: ['tool'] });
+  engine.emit('message', { type: 'nod-working', working: true });
+  engine.emit('message', { type: 'nod-working', working: true });
   assert.deepEqual(f.awake(), ['prevent-app-suspension']);
-  engine.emit('message', { type: 'nod-activity', doing: ['queued'] });
+  engine.emit('message', { type: 'nod-working', working: false });
   assert.deepEqual(f.awake(), []);
-  engine.emit('message', { type: 'nod-activity', doing: ['model'] });
+  engine.emit('message', { type: 'nod-working', working: true });
   engine.emit('exit', 1);
   assert.deepEqual(f.awake(), []);
-  engine.emit('message', { type: 'nod-activity', doing: ['model'] });
+  engine.emit('message', { type: 'nod-working', working: true });
   assert.deepEqual(f.awake(), []);
 });
 

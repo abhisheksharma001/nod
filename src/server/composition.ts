@@ -659,6 +659,7 @@ export async function createApplication(
     channels?: boolean;
     heartbeat?: boolean;
     runtimeReady?: Promise<void>;
+    onWorking?: (working: boolean) => void;
   } = {},
 ) {
   const diagnostics: {
@@ -691,6 +692,7 @@ async function initializeApplication(
     channels?: boolean;
     heartbeat?: boolean;
     runtimeReady?: Promise<void>;
+    onWorking?: (working: boolean) => void;
   },
   diagnostics: { log?: Awaited<ReturnType<typeof createFeedbackLog>>; failure: FailureLogSink },
 ) {
@@ -1035,6 +1037,7 @@ async function initializeApplication(
     pool,
     ownerId,
     model: () => adapters.models?.current.label,
+    onWorking: options.onWorking,
   });
   const observedSource = (catalog: ObservationSource[], id: string) =>
     catalog.find((source) => source.id === id) ??

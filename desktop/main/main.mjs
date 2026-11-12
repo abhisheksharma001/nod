@@ -1606,6 +1606,7 @@ function stayAwake(working) {
 }
 
 async function stopEngine() {
+  stayAwake(false);
   enginePreferencesReady = false;
   engineRuntimeReady = false;
   stopNotifications?.();
@@ -2193,8 +2194,7 @@ async function startEngine({ runtime, signal, pending = false }) {
     }
     if (engine === child && message?.type === 'nod-1password-open') openOnePassword(child);
     if (engine === child && message?.type === 'nod-trash') void moveToTrash(child, message);
-    if (engine === child && message?.type === 'nod-activity')
-      stayAwake(Array.isArray(message.doing) && message.doing.some((doing) => doing !== 'queued'));
+    if (engine === child && message?.type === 'nod-working') stayAwake(message.working === true);
   });
   child.stdout?.resume();
   let diagnostics = '';

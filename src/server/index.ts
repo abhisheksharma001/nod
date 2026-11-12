@@ -2,7 +2,6 @@ import { pool } from './db.ts';
 import { authToken, dataRoot, desktopMode, host, port, publicOrigin, webRoot } from './config.ts';
 import { accessKey } from './access.ts';
 import { createApplication, createDefaultAdapters } from './composition.ts';
-import { events } from './events.ts';
 
 let stopping = false;
 let closeApplication: (() => Promise<void>) | undefined;
@@ -15,11 +14,6 @@ const parent = (
     };
   }
 ).parentPort;
-if (desktopMode)
-  events.on('event', (event) => {
-    if (event.type === 'activity')
-      parent?.postMessage({ type: 'nod-activity', doing: event.items.map((item) => item.doing) });
-  });
 const runtimeReady =
   desktopMode && process.env.NOD_DESKTOP_RUNTIME_PENDING === 'true'
     ? new Promise<void>((resolve) => {
@@ -34,6 +28,9 @@ const runtimeReady =
     : undefined;
 const { app } = await createApplication(createDefaultAdapters(process.env), {
   runtimeReady,
+  ...(desktopMode && parent
+    ? { onWorking: (working: boolean) => parent.postMessage({ type: 'nod-working', working }) }
+    : {}),
 });
 closeApplication = () => app.close();
 if (!desktopMode && process.env.NODE_ENV !== 'production') {
@@ -109,9 +106,7 @@ await app.listen({
 const address = app.server?.address();
 const listeningPort = address && typeof address === 'object' ? address.port : port;
 if (desktopMode)
-  (
-    process as NodeJS.Process & { parentPort?: { postMessage(message: unknown): void } }
-  ).parentPort?.postMessage({
+  parent?.postMessage({
     type: 'nod-ready',
     port: listeningPort,
   });

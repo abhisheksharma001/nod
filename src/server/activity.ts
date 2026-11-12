@@ -61,14 +61,49 @@ export function createActivity({
   pool,
   ownerId,
   model,
+  onWorking,
+  recheckMs = 60_000,
 }: {
   pool: Pool;
   ownerId: string;
   model?: () => string | undefined;
+  onWorking?: (working: boolean) => void;
+  recheckMs?: number;
 }) {
   let last = '[]';
   let timer: ReturnType<typeof setTimeout> | undefined;
   let publishing = Promise.resolve();
+  let working = false;
+  let workingTimer: ReturnType<typeof setTimeout> | undefined;
+  let workingDue = 0;
+  let checking = Promise.resolve();
+  let closed = false;
+
+  function checkWorking(delay: number) {
+    if (!onWorking || closed) return;
+    const due = Date.now() + delay;
+    if (workingTimer && workingDue <= due) return;
+    clearTimeout(workingTimer);
+    workingDue = due;
+    workingTimer = setTimeout(() => {
+      workingTimer = undefined;
+      checking = checking
+        .then(async () => {
+          const { rows } = await pool.query(
+            "SELECT EXISTS(SELECT 1 FROM turns WHERE owner_id=$1 AND status='running') AS working",
+            [ownerId],
+          );
+          if (closed || rows[0].working === working) return;
+          working = rows[0].working;
+          onWorking(working);
+        })
+        .catch((cause) => logFailure('working_read_failed', cause))
+        .finally(() => {
+          if (working) checkWorking(recheckMs);
+        });
+    }, delay);
+    workingTimer.unref?.();
+  }
 
   async function read(): Promise<LiveWork[]> {
     const { rows } = await pool.query(query, [ownerId]);
@@ -119,7 +154,9 @@ export function createActivity({
   }
 
   const listen = (event: ServerEvent) => {
-    if ((event.type !== 'refresh' && event.type !== 'working') || timer) return;
+    if (event.type !== 'refresh' && event.type !== 'working') return;
+    checkWorking(250);
+    if (timer) return;
     timer = setTimeout(() => {
       timer = undefined;
       publish();
@@ -132,10 +169,13 @@ export function createActivity({
     current: async () => visible(await read()),
     start() {
       events.on('event', listen);
+      checkWorking(0);
     },
     close() {
       events.off('event', listen);
       clearTimeout(timer);
+      closed = true;
+      clearTimeout(workingTimer);
     },
   };
 }
