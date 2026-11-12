@@ -807,7 +807,7 @@ test(
           assert.match(
             (await db.pool.query('SELECT prompt FROM turns WHERE id=$1', [lateRuns[0]!.turnId]))
               .rows[0].prompt,
-            /\nThis run was due at Tue 6 Nov, 10:00 WET and started at Wed 7 Nov, 10:00 WET\.$/,
+            /\nThis run was due at Tue,? 6 Nov 2035, 10:00 WET and started at Wed,? 7 Nov 2035, 10:00 WET\.$/,
           );
         },
       );
@@ -815,6 +815,7 @@ test(
         'a late recurring run says when it was due, when it started and what was skipped',
         async () => {
           const before = clock;
+          clock = new Date('2035-11-07T10:00:00.000Z');
           const promptOf = async (id: string) => {
             const [run] = await runs(id);
             return (await db.pool.query('SELECT prompt FROM turns WHERE id=$1', [run!.turnId]))
@@ -829,11 +830,9 @@ test(
           clock = new Date(new Date(late.nextRun!).getTime() + 2 * 86_400_000 + 36_720_000);
           await deliver([await jobFor(late.id)]);
           const prompt = await promptOf(late.id);
-          assert.ok(
-            prompt.includes(
-              'This run was due at Fri 9 Nov, 08:00 WET and started at Sun 11 Nov, 18:12 WET. 2 later runs were skipped.',
-            ),
+          assert.match(
             prompt,
+            /This run was due at Fri,? 9 Nov 2035, 08:00 WET and started at Sun,? 11 Nov 2035, 18:12 WET\. 2 later runs were skipped\.$/,
           );
           assert.equal(prompt.replace(/\nThis run was due.*$/, ''), base);
           clock = before;
