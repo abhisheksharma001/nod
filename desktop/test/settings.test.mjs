@@ -46,6 +46,7 @@ import { createReadinessNotice, createUnreadBadge, isQuietTime } from '../main/n
 import { saveArtifactDownload } from '../main/downloads.mjs';
 import { createArtifactFiles } from '../main/artifact-files.mjs';
 import { createDesktopLifecycle, startupErrorDetails } from '../main/lifecycle.mjs';
+import { waitForEngineHealth } from '../main/engine-health.mjs';
 import { createMacEncryption } from '../main/mac-encryption.mjs';
 import { waitFor } from '../runtime/index.mjs';
 import { appOpenPath } from '../main/app-links.mjs';
@@ -421,6 +422,7 @@ async function runningDesktop(
   {
     allowStart = false,
     reportReady = true,
+    healthTimeoutMs,
     initialState = 'running',
     storedProfile,
     prepareRuntime,
@@ -644,6 +646,10 @@ async function runningDesktop(
     isQuietTime,
     watchAssistantMessages: () => () => {},
     startupErrorDetails,
+    waitForEngineHealth: (options) =>
+      waitForEngineHealth(
+        healthTimeoutMs ? { ...options, timeoutMs: healthTimeoutMs, intervalMs: 5 } : options,
+      ),
     createDesktopLifecycle: (options) =>
       createDesktopLifecycle({
         ...options,
@@ -3772,6 +3778,30 @@ test('the engine token waits for the engine Nod started to report its port', asy
   f.children[0].emit('exit', 1);
   assert.equal((await prepared).phase, 'error');
   assert.deepEqual(requests, []);
+});
+
+test('a background service that never answers its health check leaves a timeout line in the startup log', async (t) => {
+  const f = await runningDesktop(t, async () => Response.json({ ok: true }), {
+    allowStart: true,
+    reportReady: false,
+    healthTimeoutMs: 100,
+  });
+  f.crash();
+  const status = await f.prepare();
+  assert.equal(status.phase, 'error');
+  assert.match(status.error, /did not respond/);
+  const log = await waitFor(
+    async () => {
+      const value = await readFile(join(f.profileRoot, 'logs/startup.log'), 'utf8');
+      assert.match(value, /Background service health check timed out/);
+      return value;
+    },
+    { attempts: 40, interval: 25 },
+  );
+  assert.match(
+    log,
+    /health check timed out after \d+\.\ds\. Engine process still running: yes\. Last health check: Error\. Engine reported its port: no\.\n/,
+  );
 });
 
 test('a failed backend launch preserves saved setup and one retry starts one replacement', async (t) => {

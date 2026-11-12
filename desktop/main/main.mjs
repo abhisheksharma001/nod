@@ -43,6 +43,7 @@ import { createAppPreferencesStore } from './app-preferences.mjs';
 import { createChatReadCursorStore } from './chat-read-cursors.mjs';
 import { registerArtifactFileHandlers } from './artifact-file-handlers.mjs';
 import { saveArtifactDownload } from './downloads.mjs';
+import { waitForEngineHealth } from './engine-health.mjs';
 import { createDesktopLifecycle, startupErrorDetails } from './lifecycle.mjs';
 import { createMacEncryption } from './mac-encryption.mjs';
 import { createDesktopUpdater, createUpdateSource, startDesktopUpdateChecks } from './updates.mjs';
@@ -2100,18 +2101,15 @@ async function startEngine({ runtime, signal, pending = false }) {
       showSettings('general', true);
     }
   });
-  const deadline = Date.now() + 120_000;
-  let ready = false;
-  while (Date.now() < deadline && engine === child && !signal.aborted) {
-    try {
-      const response = await engineRequest('/api/health');
-      if (response.ok && (await response.json()).ok === true) {
-        ready = true;
-        break;
-      }
-    } catch {}
-    await new Promise((accept) => setTimeout(accept, 300));
-  }
+  const ready = await waitForEngineHealth({
+    request: () => engineRequest('/api/health'),
+    active: () => engine === child,
+    signal,
+    log: (line) =>
+      writeDiagnostic(`${line} Engine reported its port: ${engineBound ? 'yes' : 'no'}.`).catch(
+        () => {},
+      ),
+  });
   if (!ready || engine !== child || signal.aborted) {
     await stopEngine();
     throw new Error(
