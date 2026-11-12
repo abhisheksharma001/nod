@@ -48,6 +48,9 @@ import { createMacEncryption } from './mac-encryption.mjs';
 import { createDesktopUpdater, createUpdateSource, startDesktopUpdateChecks } from './updates.mjs';
 import { startWindowsInstall } from './windows-update.mjs';
 import { appOpenPath } from './app-links.mjs';
+import { trustSystemCertificates } from './system-certificates.mjs';
+
+trustSystemCertificates();
 
 const desktopRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const engineRoot = app.isPackaged

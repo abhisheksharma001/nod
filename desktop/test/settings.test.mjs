@@ -472,6 +472,7 @@ async function runningDesktop(
   const appEvents = new EventEmitter();
   const externalURLs = [];
   const trashed = [];
+  const systemCertificates = [];
   const updateMenu = {};
   const restartMenu = {};
   const ipc = Object.assign(new EventEmitter(), {
@@ -511,6 +512,7 @@ async function runningDesktop(
     readFileSync: (path) =>
       JSON.stringify(path.endsWith('posthog-host.json') ? posthogHost : appPages),
     appOpenPath,
+    trustSystemCertificates: () => systemCertificates.push('trusted'),
     app: {
       on: (name, listener) => appEvents.on(name, listener),
       once: (name, listener) => appEvents.once(name, listener),
@@ -893,6 +895,7 @@ async function runningDesktop(
     notifications,
     externalURLs,
     trashed,
+    systemCertificates,
     rendererReady,
     updateMenu,
     restartMenu,
@@ -4408,6 +4411,26 @@ test('the remote desktop starts without a local runtime and fences tokens to its
   } finally {
     await f.close();
   }
+});
+
+test('server checks run after the app trusts operating system certificates', async (t) => {
+  const seen = [];
+  const f = await runningDesktop(
+    t,
+    async (resource) => {
+      seen.push([String(resource), [...f.systemCertificates]]);
+      return Response.json({
+        user: { id: 'server-owner' },
+        settings: { onboardingCompleted: true },
+      });
+    },
+    { initialState: 'fresh' },
+  );
+  await f.checkRemoteConnection({
+    url: 'https://assistant.example.test',
+    token: randomBytes(32).toString('base64url'),
+  });
+  assert.deepEqual(seen, [['https://assistant.example.test/api/session', ['trusted']]]);
 });
 
 test('remote setup remains visible and navigable while the encrypted server token waits for macOS storage', async (t) => {
