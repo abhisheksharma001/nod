@@ -2038,6 +2038,7 @@ async function installUpdate() {
 
 async function quit(complete, failure = 'Nod could not finish shutting down.') {
   quitting = true;
+  stayAwake(false);
   await persistCurrentZoomFactor().catch(
     (error) => void writeDiagnostic(error.message).catch(() => {}),
   );
@@ -2194,7 +2195,7 @@ async function startEngine({ runtime, signal, pending = false }) {
     }
     if (engine === child && message?.type === 'nod-1password-open') openOnePassword(child);
     if (engine === child && message?.type === 'nod-trash') void moveToTrash(child, message);
-    if (engine === child && !closingEngine && message?.type === 'nod-working')
+    if (engine === child && !closingEngine && !quitting && message?.type === 'nod-working')
       stayAwake(message.working === true);
   });
   child.stdout?.resume();
