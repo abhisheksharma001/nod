@@ -4309,6 +4309,21 @@ test('the computer stays awake only while the local engine reports running work'
   assert.deepEqual(f.awake(), []);
 });
 
+test('quitting releases the computer at once and a late working message cannot take it back', async (t) => {
+  const f = await runningDesktop(t, async () => Response.json({ ok: true }), { allowStart: true });
+  f.crash();
+  assert.equal((await f.prepare()).phase, 'ready');
+  const [engine] = f.children;
+  engine.emit('message', { type: 'nod-working', working: true });
+  assert.deepEqual(f.awake(), ['prevent-app-suspension']);
+  const quitting = f.quit(async () => {});
+  assert.deepEqual(f.awake(), []);
+  engine.emit('message', { type: 'nod-working', working: true });
+  assert.deepEqual(f.awake(), []);
+  f.crash();
+  await quitting;
+});
+
 test('a stale engine cannot open a 1Password helper', async (t) => {
   const f = await runningDesktop(t, async () => Response.json({ ok: true }), { allowStart: true });
   f.crash();
