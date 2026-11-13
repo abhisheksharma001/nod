@@ -82,6 +82,7 @@ export function createActivity({
   async function checkWorking() {
     if (!keepAwake) return;
     let next = false;
+    let failed = false;
     try {
       const { rows } = await pool.query(
         "SELECT EXISTS(SELECT 1 FROM turns WHERE owner_id=$1 AND status='running') AS working",
@@ -89,17 +90,22 @@ export function createActivity({
       );
       next = rows[0].working;
     } catch (cause) {
+      failed = true;
       logFailure('working_read_failed', cause);
     }
-    if (closed || next === working) return;
+    if (closed) return;
+    if ((next || failed) !== (recheck !== undefined)) {
+      clearInterval(recheck);
+      recheck =
+        next || failed
+          ? setInterval(() => {
+              publishing = publishing.then(checkWorking);
+            }, recheckMs)
+          : undefined;
+      recheck?.unref?.();
+    }
+    if (next === working) return;
     working = next;
-    clearInterval(recheck);
-    recheck = working
-      ? setInterval(() => {
-          publishing = publishing.then(checkWorking);
-        }, recheckMs)
-      : undefined;
-    recheck?.unref?.();
     keepAwake.set(working);
   }
 
