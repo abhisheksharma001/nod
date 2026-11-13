@@ -87,9 +87,71 @@ export interface IntegrationInboxPoll {
 }
 export class IntegrationInboxCursorExpired extends Error {}
 export class IntegrationPermissionError extends Error {}
+export type IntegrationCatalogAccessCode =
+  'installation_enrollment_required' | 'installation_revoked' | 'browser_pairing_required';
 export class IntegrationCatalogAccessDenied extends Error {
-  constructor() {
-    super('The app catalog is unavailable. Try again later.');
+  constructor(readonly code?: IntegrationCatalogAccessCode) {
+    super(
+      code === 'installation_enrollment_required'
+        ? 'This Nod installation needs enrollment for app access. Contact support if it remains blocked.'
+        : code === 'installation_revoked'
+          ? 'App access for this Nod installation was revoked. Contact support to restore it.'
+          : code === 'browser_pairing_required'
+            ? 'App access needs browser pairing. Complete the app connection in your browser, then try again.'
+            : 'The app catalog could not authorize this request. Contact support if it persists.',
+    );
+    if (code) this.message += ` Proxy code: ${code}. HTTP 403.`;
+  }
+}
+export type IntegrationCatalogProxyErrorCode =
+  | 'rate_limited'
+  | 'installation_busy'
+  | 'public_budget_exceeded'
+  | 'provider_rate_limited'
+  | 'service_unavailable'
+  | 'security_service_unavailable'
+  | 'public_access_unavailable'
+  | 'provider_unavailable'
+  | 'provider_request_failed'
+  | 'catalog_unavailable'
+  | 'operation_timeout'
+  | 'invalid_limit_configuration'
+  | 'invalid_provider_response'
+  | 'unsafe_provider_response';
+export class IntegrationCatalogFailure extends Error {
+  readonly statusCode: number;
+  constructor(
+    readonly reason: IntegrationConnectionError['reason'],
+    readonly status?: number,
+    readonly code?: IntegrationCatalogProxyErrorCode,
+  ) {
+    super(
+      code === 'public_budget_exceeded'
+        ? 'The app request limit has been reached. Wait for it to reset before trying again.'
+        : code === 'provider_rate_limited'
+          ? 'The app provider is limiting requests. Wait for its limit to reset before trying again.'
+          : reason === 'rate_limit'
+            ? 'The app catalog is receiving too many requests. Wait a moment, then try again.'
+            : reason === 'timeout'
+              ? 'The app catalog took too long to respond. Try again shortly.'
+              : reason === 'authorization' || reason === 'permission'
+                ? 'The app catalog could not authorize this request. Try again later.'
+                : reason === 'invalid_request'
+                  ? 'The app catalog request was rejected. Try again later.'
+                  : 'The app catalog is unavailable. Try again later.',
+    );
+    if (code) this.message += ` Proxy code: ${code}.`;
+    if (status !== undefined) this.message += ` HTTP ${status}.`;
+    this.statusCode =
+      status === 502
+        ? 502
+        : reason === 'rate_limit'
+          ? 429
+          : reason === 'timeout'
+            ? 504
+            : reason === 'invalid_request'
+              ? 502
+              : 503;
   }
 }
 export class IntegrationConnectionError extends Error {
