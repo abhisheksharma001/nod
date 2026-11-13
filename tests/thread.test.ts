@@ -6,7 +6,7 @@ import {
   type AnswerChoices,
 } from '../src/shared/answer-choices.ts';
 import assert from 'node:assert/strict';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -39,6 +39,7 @@ import type {
   SubmitMessageResponse,
   Task,
   Turn,
+  WorkspaceCommand,
 } from '../src/shared/contracts.ts';
 import { fakeComputer, fakeWorkspace } from './runtime-fixtures.ts';
 import { createMemoryLearning } from '../src/server/memory-learning.ts';
@@ -190,6 +191,48 @@ test(
       },
     );
     await thread.initializeThreads();
+    await t.test('periodic checks use an installation-spread five-minute schedule', async () => {
+      const { createWorkConsumers } = await import('../src/server/work-admission.ts');
+      const consumers = createWorkConsumers();
+      await consumers.pause();
+      await thread.boss.createQueue('heartbeat', { retryLimit: 0 });
+      await thread.boss.schedule('heartbeat', '*/5 * * * *', {}, { tz: 'UTC' });
+      try {
+        const phases = new Set<number>();
+        for (const heartbeatKey of ['a'.repeat(64), 'c'.repeat(64), undefined]) {
+          await createTriage({
+            consumers,
+            heartbeatKey,
+            signal: async () => {},
+            due: async () => {},
+          }).initializeHeartbeat();
+          const schedule = await thread.boss.getSchedule('heartbeat');
+          assert.ok(schedule);
+          assert.equal(schedule.timezone, 'UTC');
+          const phase =
+            createHash('sha256')
+              .update(heartbeatKey ?? ownerId)
+              .digest()[0] % 5;
+          phases.add(phase);
+          const next = thread.boss.previewSchedule(schedule.cron, {
+            tz: schedule.timezone,
+            from: new Date('2026-01-01T00:00:00Z'),
+            count: 13,
+          });
+          assert.equal(next.length, 13);
+          assert.ok(next.every((instant) => instant.getUTCMinutes() % 5 === phase));
+          assert.ok(
+            next.every(
+              (instant, index) =>
+                !index || instant.getTime() - next[index - 1].getTime() === 300000,
+            ),
+          );
+        }
+        assert.equal(phases.size, 3);
+      } finally {
+        await consumers.close();
+      }
+    });
     const analyticsEvents: Parameters<ProductAnalytics['capture']>[0][] = [];
     const analytics = await createAnalytics({
       provider: { capture: (event) => analyticsEvents.push(event), shutdown: async () => {} },
@@ -660,6 +703,11 @@ test(
         if (context.prompt === 'release-retry') failRelease = 1;
         if (context.prompt === 'ask-question')
           return { status: 'waiting_user', message: 'Which account should I use?' };
+        if (context.prompt === '👍' && context.replyTo?.text === 'Which account should I use?') {
+          assert.ok(context.currentMessageId);
+          await context.reply('Synthetic reaction follow-up.', undefined, context.currentMessageId);
+          return { status: 'succeeded' };
+        }
         if (context.prompt === 'ask-approval')
           return { status: 'waiting_user', waitingFor: 'approval' };
         if (context.prompt === 'ask-credentials') {
@@ -1070,6 +1118,76 @@ test(
             assert.ok(!emitted.includes(privateValue));
         },
       );
+
+      await t.test('a task command stream shows only its own owner’s commands', async (t) => {
+        const turns: string[] = [];
+        const tasksMade: string[] = [];
+        const callIds: string[] = [];
+        const commandTask = async (owner: string, status: string, command: string) => {
+          const id = randomUUID();
+          const turnId = randomUUID();
+          tasksMade.push(id);
+          turns.push(turnId);
+          await db.pool.query(
+            "INSERT INTO turns(id,owner_id,thread_id,session_id,source,prompt,status,background) VALUES($1,$2,$3,$4,'task','Synthetic command task',$5,true)",
+            [turnId, owner, threadId, id, status],
+          );
+          await db.pool.query(
+            "INSERT INTO tasks(id,owner_id,turn_id,session_id,title,done_when,now_text,applied_revision) VALUES($1,$2,$3,$1,'Synthetic command task','Synthetic result','Working',1)",
+            [id, owner, turnId],
+          );
+          await db.pool.query('UPDATE turns SET task_id=$2 WHERE id=$1', [turnId, id]);
+          const events = [
+            ['tool_start', randomUUID(), { command }],
+            ['tool_start', randomUUID(), { command: `${command} --second` }],
+          ] as const;
+          callIds.push(...events.map(([, callId]) => callId));
+          for (const [index, [type, callId, record]] of events.entries())
+            await db.pool.query(
+              "INSERT INTO turn_events(id,turn_id,type,summary,call_id,command,created_at) VALUES($1,$2,$3,'bash',$4,$5,now()+$6*interval '1 second')",
+              [randomUUID(), turnId, type, callId, record, index],
+            );
+          await db.pool.query(
+            "INSERT INTO turn_events(id,turn_id,type,summary,call_id,command) VALUES($1,$2,'tool_complete','bash',$3,$4)",
+            [randomUUID(), turnId, events[0][1], { exitCode: 2, output: 'synthetic output' }],
+          );
+          return id;
+        };
+        t.after(async () => {
+          await db.pool.query('UPDATE turns SET task_id=NULL WHERE id=ANY($1::uuid[])', [turns]);
+          await db.pool.query('DELETE FROM turn_events WHERE turn_id=ANY($1::uuid[])', [turns]);
+          await db.pool.query('DELETE FROM tasks WHERE id=ANY($1::uuid[])', [tasksMade]);
+          await db.pool.query('DELETE FROM turns WHERE id=ANY($1::uuid[])', [turns]);
+        });
+        const own = await commandTask(ownerId, 'running', 'ls synthetic-own');
+        const ended = await commandTask(ownerId, 'cancelled', 'ls synthetic-ended');
+        const foreign = await commandTask('synthetic-other-command-owner', 'running', 'cat x');
+        const read = async (id: string) => {
+          const response = await request('GET', `/api/tasks/${id}/commands`);
+          return { status: response.statusCode, body: response.json() };
+        };
+        const mine = await read(own);
+        assert.equal(mine.status, 200);
+        assert.deepEqual(
+          mine.body.commands.map((command: WorkspaceCommand) => [
+            command.command,
+            command.state,
+            command.exitCode,
+            command.output,
+          ]),
+          [
+            ['ls synthetic-own', 'finished', 2, 'synthetic output'],
+            ['ls synthetic-own --second', 'running', null, ''],
+          ],
+        );
+        const stopped = await read(ended);
+        assert.equal(stopped.body.commands[1].state, 'interrupted');
+        for (const executionId of [...callIds, ...turns])
+          assert.equal(JSON.stringify([mine.body, stopped.body]).includes(executionId), false);
+        const other = await read(foreign);
+        assert.equal(other.status, 404);
+        assert.equal(JSON.stringify(other.body).includes('cat x'), false);
+      });
 
       await t.test('first-card tasks stay in the ledger after 100 newer tasks', async (t) => {
         const owner = `first-card-ledger-${randomUUID()}`;
@@ -4297,6 +4415,48 @@ test(
         assert.equal(ran(response[0]!.turn_id)?.prompt, '👍');
         assert.equal(ran(response[0]!.turn_id)?.replyTo?.id, asked);
         assert.equal(ran(response[0]!.turn_id)?.replyTo?.text, 'Which account should I use?');
+        const followUp = (
+          await db.pool.query<{ id: string; reply_to_message_id: string }>(
+            "SELECT id,reply_to_message_id FROM messages WHERE owner_id=$1 AND turn_id=$2 AND role='assistant' ORDER BY created_at DESC,id DESC LIMIT 1",
+            [ownerId, response[0]!.turn_id],
+          )
+        ).rows[0]!;
+        assert.equal(followUp.reply_to_message_id, response[0]!.id);
+        const state = (await request('GET', '/api/state')).json();
+        assert.equal(
+          state.messages.some((message: { id: string }) => message.id === response[0]!.id),
+          false,
+        );
+        assert.equal(
+          state.messages.find((message: { id: string }) => message.id === asked)?.reaction,
+          '👍',
+        );
+        assert.equal(
+          state.messages.find((message: { id: string }) => message.id === followUp.id)?.replyTo,
+          null,
+        );
+        const history = (
+          await request('GET', `/api/messages?threadId=${question.threadId}`)
+        ).json();
+        assert.equal(
+          history.messages.some((message: { id: string }) => message.id === response[0]!.id),
+          false,
+        );
+        assert.equal(
+          history.messages.find((message: { id: string }) => message.id === followUp.id)?.replyTo,
+          null,
+        );
+        const search = (
+          await request('GET', `/api/messages/search?q=${encodeURIComponent('👍')}`)
+        ).json();
+        assert.equal(
+          search.some((message: { id: string }) => message.id === response[0]!.id),
+          false,
+        );
+        assert.equal(
+          (await request('GET', `/api/messages/around/${response[0]!.id}`)).statusCode,
+          404,
+        );
         assert.equal(
           analyticsEvents.filter((event) => event.event === 'owner_message_accepted').length,
           beforeAccepted + 1,
