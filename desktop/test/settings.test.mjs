@@ -4309,6 +4309,17 @@ test('the computer stays awake only while the local engine reports running work'
   assert.deepEqual(f.awake(), []);
 });
 
+test('a malformed working message does not release the computer', async (t) => {
+  const f = await runningDesktop(t, async () => Response.json({ ok: true }), { allowStart: true });
+  f.crash();
+  assert.equal((await f.prepare()).phase, 'ready');
+  const [engine] = f.children;
+  engine.emit('message', { type: 'nod-working', working: true });
+  for (const working of ['yes', 0, null, undefined])
+    engine.emit('message', { type: 'nod-working', working });
+  assert.deepEqual(f.awake(), ['prevent-app-suspension']);
+});
+
 test('quitting releases the computer at once and a late working message cannot take it back', async (t) => {
   const f = await runningDesktop(t, async () => Response.json({ ok: true }), { allowStart: true });
   f.crash();
