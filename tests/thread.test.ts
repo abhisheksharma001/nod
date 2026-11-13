@@ -12518,7 +12518,6 @@ test(
       await until(2);
       assert.deepEqual(seen, [true, false]);
       await pool.query('ALTER TABLE turns_unavailable RENAME TO turns');
-      refresh();
       await until(3);
       assert.deepEqual(seen, [true, false, true]);
       await pool.query("UPDATE turns SET status='succeeded' WHERE id=$1", [scheduled]);
