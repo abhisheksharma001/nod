@@ -360,6 +360,30 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
     return provider;
   }
 
+  function serviceWait(work: 'read' | 'background' | 'action', action?: string) {
+    const wait = provider.connectionBackoff?.();
+    if (
+      !wait ||
+      work === 'read' ||
+      (action &&
+        (isLocalFilesAction(action) ||
+          ['CONNECTED_HTTP', 'CONNECTED_MCP_CALL', 'CONNECTED_CLI'].includes(action)))
+    )
+      return;
+    const reason = `${wait.code ? `${wait.code}, ` : ''}HTTP ${wait.status}`;
+    throw Object.assign(
+      new IntegrationError(
+        `The connection service ${wait.status === 429 ? 'is rate limiting this install' : 'is unavailable'} (${reason}), so Nod is not calling it until ${new Date(wait.until).toISOString()}. ${
+          work === 'background'
+            ? 'Nod did not read this source. Do not retry this source now; it is checked again after that time.'
+            : 'Nod did not send this action. It can run after that time.'
+        }`,
+        wait.status,
+      ),
+      { status: wait.status, notRun: true },
+    );
+  }
+
   function assertOwner(ownerId: string) {
     if (ownerId !== configuredOwner)
       throw new IntegrationError('This account is unavailable.', 403);
@@ -587,6 +611,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
           const row = pending.shift()!;
           let timer: ReturnType<typeof setTimeout> | undefined;
           try {
+            serviceWait('background');
             const remote = await Promise.race([
               provider.inspectAccount(row.account_id!, row.owner_id),
               new Promise<never>((_, reject) => {
@@ -1605,6 +1630,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
     turn?: TurnRef,
     signal?: AbortSignal,
     expectedBinding?: string,
+    work: 'read' | 'background' | 'action' = 'action',
   ) {
     assertOwner(ownerId);
     signal?.throwIfAborted();
@@ -1648,6 +1674,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
         let failed: unknown;
         if (provider.configured && (!connectionId || rows.length)) {
           try {
+            serviceWait(work);
             const found = await withAccountSession(ownerId, rows, signal, async (session) => {
               signal?.throwIfAborted();
               return session.search(query, signal);
@@ -1751,7 +1778,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
           discovered: discovered?.accounts ?? [],
           ...(failed
             ? {
-                incomplete: `Could not search ${providerId}. Matching tools may be missing; retry before concluding that no action exists.`,
+                incomplete: `${failure(`Could not search ${providerId}`, failed)} Matching tools may be missing.`,
               }
             : {}),
         };
@@ -1759,6 +1786,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
         throw requestFailure('App tool search failed', error);
       }
     }
+    serviceWait(work, action);
     return executeApproved(
       ownerId,
       action,
@@ -2084,6 +2112,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
     if (input.revision !== undefined && input.revision !== activityRevision(row))
       throw Object.assign(new Error('The source changed before its read.'), { notRun: true });
     const { connectionId: _, revision: _revision, ...query } = input;
+    serviceWait('background');
     return withServiceAnalytics(
       options.analytics,
       connectionAnalytics(row.slug),
@@ -2133,6 +2162,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
           const signal = AbortSignal.any([stop.signal, AbortSignal.timeout(15000)]);
           let onAbort = () => {};
           try {
+            serviceWait('background');
             const token = z
               .string()
               .min(1)
@@ -2217,6 +2247,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
           const pollSignal = AbortSignal.any([stop.signal, pollDeadline]);
           let pollFinished = false;
           try {
+            serviceWait('background');
             const result = await provider.pollInbox!(row.account_id!, row.inbox_cursor, pollSignal);
             pollSignal.throwIfAborted();
             pollFinished = true;
@@ -2878,6 +2909,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
     watchState,
     execute,
     executeApproved,
+    serviceWait,
     prepare,
     emailCode,
     inboxSnippets,

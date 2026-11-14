@@ -1347,6 +1347,7 @@ async function initializeApplication(
                 : action.startsWith('NOD_')
                   ? personal.manage(action.slice('NOD_'.length), args, provenance)
                   : (async () => {
+                      integrations.serviceWait('action', action);
                       const savedBinding = provenance.details?.verifiedBinding;
                       const verifiedBinding =
                         typeof savedBinding === 'string' ? savedBinding : undefined;
@@ -1417,6 +1418,7 @@ async function initializeApplication(
                               { threadId: provenance.threadId, turnId: provenance.turnId },
                               provenance.signal,
                               verifiedBinding,
+                              'read',
                             )
                             .catch((error: unknown) => {
                               throw Object.assign(
@@ -1568,6 +1570,8 @@ async function initializeApplication(
         { connectionId: account.connectionId, query },
         undefined,
         signal,
+        undefined,
+        'background',
       );
     },
     read: async (
@@ -1577,6 +1581,7 @@ async function initializeApplication(
       signal: AbortSignal,
     ) => {
       signal.throwIfAborted();
+      integrations.serviceWait('background', tool.action);
       if (
         (await integrations.binding(account.connectionId)) !== account.binding ||
         !(await trust.readOnly(
@@ -1592,7 +1597,15 @@ async function initializeApplication(
       signal.throwIfAborted();
       if ((await integrations.binding(account.connectionId)) !== account.binding)
         throw new Error('This connected account changed.');
-      return integrations.execute(ownerId, tool.action, args, undefined, signal, account.binding);
+      return integrations.execute(
+        ownerId,
+        tool.action,
+        args,
+        undefined,
+        signal,
+        account.binding,
+        'background',
+      );
     },
     current: async (accounts: AppAccount[], client?: import('pg').PoolClient) => {
       for (const account of accounts)
@@ -2354,9 +2367,18 @@ async function initializeApplication(
             keptOut: await localFiles.keepOut(turn, String(args.path ?? ''), client),
           }));
         }
+        const readWork = (await turnOrigin(turn.turnId))?.source === 'user' ? 'read' : 'background';
         if (action === 'SEARCH_TOOLS') {
           await options.admit?.(false);
-          const result = await integrations.execute(ownerId, action, args, turn, options.signal);
+          const result = await integrations.execute(
+            ownerId,
+            action,
+            args,
+            turn,
+            options.signal,
+            undefined,
+            readWork,
+          );
           return result;
         }
         const prepare = () =>
@@ -2433,6 +2455,7 @@ async function initializeApplication(
               turn,
               options.signal,
               deleteBinding,
+              readWork,
             );
           } catch (error) {
             options.signal?.throwIfAborted();
@@ -2467,6 +2490,7 @@ async function initializeApplication(
               turn,
               options.signal,
               deleteBinding,
+              !verdict.confirm && verdict.basis.kind === 'read' ? readWork : 'action',
             );
             await ledger.action(
               turn.turnId,
