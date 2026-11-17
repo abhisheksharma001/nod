@@ -761,7 +761,10 @@ export function createChatSdkTransport(
           if (input.replyToMessageId)
             body.set(
               'reply_parameters',
-              JSON.stringify({ message_id: Number(input.replyToMessageId.split(':').at(-1)) }),
+              JSON.stringify({
+                message_id: Number(input.replyToMessageId.split(':').at(-1)),
+                allow_sending_without_reply: true,
+              }),
             );
           let bytes: Uint8Array;
           try {
@@ -896,6 +899,7 @@ export function createChatSdkTransport(
                     ? {
                         reply_parameters: {
                           message_id: Number(input.replyToMessageId.split(':').at(-1)),
+                          allow_sending_without_reply: true,
                         },
                       }
                     : {}),
