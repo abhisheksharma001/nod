@@ -1327,6 +1327,87 @@ test(
   },
 );
 
+test('Telegram voice, contact and location replies still send when the message they answer is gone', async () => {
+  const calls: { method: string; replyParameters: unknown }[] = [];
+  const empty = { rows: [], rowCount: 0 };
+  const pool = {
+    query: async () => empty,
+    connect: async () => ({ query: async () => empty, release() {} }),
+    on() {},
+    end: async () => {},
+  } as unknown as pg.Pool;
+  const fakeFetch: typeof fetch = async (input, init) => {
+    const method = String(input).split('/').at(-1)!;
+    const body = init?.body;
+    const replyParameters =
+      body instanceof FormData
+        ? body.get('reply_parameters')
+        : JSON.parse(String(body)).reply_parameters;
+    calls.push({
+      method,
+      replyParameters:
+        typeof replyParameters === 'string' ? JSON.parse(replyParameters) : replyParameters,
+    });
+    return Response.json({
+      ok: true,
+      result: { message_id: 500, date: 1, chat: { id: 123456, type: 'private' } },
+    });
+  };
+  const transport = createChatSdkTransport(pool, fixtureEnv, { fetch: fakeFetch });
+  const attachment = (name: string, mimeType: string, text: string) => {
+    const bytes = Buffer.from(text);
+    return { name, mimeType, size: bytes.length, read: async () => new Uint8Array(bytes) };
+  };
+  const send = (text: string, ...attachments: ReturnType<typeof attachment>[]) =>
+    transport.post({
+      channelId: 'telegram',
+      accountId: '987',
+      threadId: 'telegram:123456',
+      replyToMessageId: '123456:41',
+      text,
+      attachments,
+    });
+  const original = globalThis.fetch;
+  globalThis.fetch = fakeFetch;
+  try {
+    await send('hello');
+    await send('', attachment('reply.ogg', 'audio/ogg', 'OggS synthetic voice'));
+    await send(
+      '',
+      attachment(
+        'contact.vcf',
+        'text/vcard',
+        'BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Synthetic Contact\r\nTEL:+34600000000\r\nEND:VCARD',
+      ),
+    );
+    await send(
+      '',
+      attachment(
+        'location.json',
+        'application/json',
+        JSON.stringify({ latitude: 41.4, longitude: 2.17 }),
+      ),
+    );
+    await send(
+      '',
+      attachment(
+        'location.json',
+        'application/json',
+        JSON.stringify({ latitude: 41.4, longitude: 2.17, name: 'Synthetic park' }),
+      ),
+    );
+  } finally {
+    globalThis.fetch = original;
+  }
+  assert.deepEqual(
+    calls.filter(({ method }) => method !== 'getMe'),
+    ['sendMessage', 'sendVoice', 'sendContact', 'sendLocation', 'sendVenue'].map((method) => ({
+      method,
+      replyParameters: { message_id: 41, allow_sending_without_reply: true },
+    })),
+  );
+});
+
 test('Telegram media keeps native replies and checks the sender before any download', async () => {
   const bytes = Buffer.from('synthetic image bytes');
   const requests: string[] = [];
