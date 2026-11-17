@@ -90,6 +90,7 @@ export interface Activity {
   received?: true;
   background?: true;
   runId?: string;
+  recent?: Array<{ id: string; summary: string; site: string | null }>;
 }
 export interface VaultLoginEntry {
   kind: 'login';

@@ -17,6 +17,7 @@ import { ModelRuntime, type ProviderModelConfig } from '@earendil-works/pi-codin
 import { Agent, Dispatcher1Wrapper } from 'undici';
 import { z } from 'zod';
 import { createRemoteJWKSet, customFetch, jwtVerify } from 'jose';
+import { logFailure } from '../../ports/failure-log.ts';
 import { ModelAuthError, ModelWorkspaceSelectionError } from '../../ports/models.ts';
 import { ElevenLabsConnectionError, readElevenLabsVoices } from '../elevenlabs/speech.ts';
 import { openAIBaseUrl, openAIRequestError } from '../openai/api.ts';
@@ -28,6 +29,7 @@ import type {
 } from '../../ports/models.ts';
 import {
   bedrockRegionPattern,
+  boundedPrice,
   modelProviders,
   modelProviderNames,
   type ModelProvider,
@@ -446,7 +448,9 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
     async signIn({ signal: requestedSignal, hostId, previous }) {
       const controller = new AbortController();
       const signal = AbortSignal.any([requestedSignal, controller.signal]);
-      const canceled = () => new ModelAuthError('ChatGPT sign-in was canceled.');
+      const refused = (message: string, reason: string) =>
+        new ModelAuthError(message, false, { cause: { reason } });
+      const canceled = (reason = 'aborted') => refused('ChatGPT sign-in was canceled.', reason);
       if (signal.aborted) throw canceled();
       const saved = chatgptCredentialSchema.safeParse(previous).data;
       const state = random();
@@ -482,7 +486,7 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
       const expected = new URL(callbackUrl);
       const complete = (callback: URL) => {
         if (settled || claimed || signal.aborted)
-          throw new ModelAuthError('This sign-in request has expired. Start a new connection.');
+          throw refused('This sign-in request has expired. Start a new connection.', 'expired');
         if (
           callback.origin !== expected.origin ||
           callback.pathname !== expected.pathname ||
@@ -492,15 +496,15 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
           callback.searchParams.getAll('state').length !== 1 ||
           callback.searchParams.get('state') !== state
         )
-          throw new ModelAuthError('This sign-in callback is invalid or was declined.');
+          throw refused('This sign-in callback is invalid or was declined.', 'callback_mismatch');
         if (callback.searchParams.has('error')) {
           if (
             callback.searchParams.getAll('error').length !== 1 ||
             !callback.searchParams.get('error') ||
             callback.searchParams.has('code')
           )
-            throw new ModelAuthError('This sign-in callback is invalid.');
-          const declined = canceled();
+            throw refused('This sign-in callback is invalid.', 'invalid_callback');
+          const declined = canceled('declined');
           claimed = true;
           refuse(declined);
           throw declined;
@@ -515,7 +519,7 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
             ? issued[0]
             : undefined;
         if (codes.length !== 1 || !codes[0] || !clientId)
-          throw new ModelAuthError('This sign-in callback is invalid.');
+          throw refused('This sign-in callback is invalid.', 'invalid_callback');
         claimed = true;
         grant({ code: codes[0], clientId });
       };
@@ -537,7 +541,13 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
             () => send(200),
             () => send(400),
           );
-        } catch {
+        } catch (error) {
+          if (!claimed)
+            logFailure('model_sign_in_failed', Object(error).cause, {
+              provider: 'openai',
+              reason: Object(Object(error).cause).reason,
+              phase: 'callback',
+            });
           send(400);
         }
       });
@@ -566,10 +576,18 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
         signal.removeEventListener('abort', abort);
         await close();
         if (error instanceof ModelAuthError) throw error;
+        const busy = error instanceof Error && 'code' in error && error.code === 'EADDRINUSE';
         throw new ModelAuthError(
-          error instanceof Error && 'code' in error && error.code === 'EADDRINUSE'
+          busy
             ? 'Port 1455 is already in use. Close the other Nod app or another sign-in, then try again.'
             : 'ChatGPT sign-in couldn’t start. Try again.',
+          false,
+          {
+            cause: {
+              reason: busy ? 'callback_port_unavailable' : 'callback_server_failed',
+              code: Object(error).code,
+            },
+          },
         );
       }
       exchange = (async (): Promise<ModelCredential> => {
@@ -1323,11 +1341,7 @@ export async function createPiModelRuntime(
           : body;
         settleBudget = await access.reserve?.(() => {
           const prices = target.cost;
-          return prices &&
-            [prices.input, prices.output, prices.cacheRead, prices.cacheWrite].every(
-              (price) => Number.isFinite(price) && price >= 0,
-            ) &&
-            Math.max(prices.input, prices.output, prices.cacheRead, prices.cacheWrite) > 0
+          return boundedPrice(prices)
             ? (Buffer.byteLength(JSON.stringify(prepared)) *
                 Math.max(prices.input * 2, prices.cacheWrite, prices.cacheRead) +
                 output * prices.output) /

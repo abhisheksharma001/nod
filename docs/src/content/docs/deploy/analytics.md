@@ -128,7 +128,7 @@ Model `request_kind` separates `chat`, `task`, `observer`, `helper`, `compaction
 | `chat_message_sent`                               | Attachment/reply booleans, text/voice input, and composer/task-card/ask-Nod/task-reply/answer-choice/approval-card source.                          |
 | `owner_message_accepted`                          | Newly committed owner message by bounded channel. Excludes duplicates, commands, private verification, message text, and private message/turn IDs.  |
 | `chat_stop_requested`                             | Stop requested in the app.                                                                                                                          |
-| `task_card_started`, `task_action`                | Card kind and bounded position, or fixed task control, including Show commands. Command text and output are excluded.                               |
+| `task_card_started`, `task_action`                | Card kind, learned or common origin, and bounded position, or fixed task control, including Show commands. Command text and output are excluded.    |
 | `setup_link_clicked`, `link_opened`               | Setup kind or text/tooltip source and optional bounded position. No link destination.                                                               |
 | `browser_handoff_action`                          | Successful done, back, reload, expand, or collapse operation.                                                                                       |
 | `message_reaction_changed`, `message_action`      | Fixed reaction/action, input method, and assistant/user role. Copy follows clipboard success.                                                       |
@@ -263,7 +263,7 @@ Answer-choice views count once per question in a sharing period, while the choic
 
 ### Surveys
 
-While **Share usage data** is on, the Nod team can show a short survey, such as how likely you are to recommend Nod. Surveys become eligible after you've sent Nod messages on at least three different UTC calendar days. That count stays on your Nod installation and isn't sent to PostHog. Questions and targeting are set in PostHog.
+While **Share usage data** is on, the Nod team can show a short survey, such as how likely you are to recommend Nod. Surveys become eligible after you've sent Nod messages on at least three different UTC calendar days. That count stays on your Nod installation and isn't sent to PostHog. Questions and targeting are set in PostHog. Each survey normally appears once: after its card has been shown, Nod saves that with your account and doesn't show it again, in the app or any browser you use with the same Nod, even if you closed it without answering. A repeating survey can return for its next round. If Nod can't save that the card was shown, the survey can appear once more the next time you open Nod.
 
 The survey asks one question at a time. Choosing a score, such as a recommendation score from 0 to 10, sends it immediately, even if you close the survey afterward. Typed text is sent only when you select **Next** or **Send**. Closing never sends unsubmitted text or withdraws answers already sent. You can close a survey without answering.
 

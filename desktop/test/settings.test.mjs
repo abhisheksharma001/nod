@@ -25,7 +25,7 @@ import { EventEmitter } from 'node:events';
 import { execFile } from 'node:child_process';
 import { createServer as createHttpsServer } from 'node:https';
 import { createServer } from 'node:net';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { getCACertificates, setDefaultCACertificates } from 'node:tls';
@@ -621,6 +621,8 @@ async function runningDesktop(
       argv,
       env: typeof environment === 'function' ? environment(dirname(storage.path)) : environment,
       resourcesPath: dirname(storage.path),
+      versions: { electron: '0.0.0' },
+      getSystemVersion: () => '0.0.0',
     },
     ipcMain: ipc,
     autoUpdater: Object.assign(new EventEmitter(), {
@@ -661,6 +663,7 @@ async function runningDesktop(
     resolve,
     fileURLToPath,
     pathToFileURL,
+    homedir,
     mkdir,
     appendFile,
     readFile: (file, ...args) =>
@@ -1436,7 +1439,7 @@ test('native first open waits for consent on disabled and returning profiles', a
 test('Windows onboarding waits for storage before unlocking credentials and exposes prerequisite recovery', async (t) => {
   const revealed = [];
   const cause = `Synthetic WSL missing: ${'x'.repeat(450)} HCS_E_HYPERV_NOT_INSTALLED`;
-  const details = `Error: ${cause}\n${'Synthetic WSL output\n'.repeat(200)}End of native error`;
+  const details = `Error: ${cause}\n${join(homedir(), 'synthetic-folder')}\n${'Synthetic WSL output\n'.repeat(200)}End of native error`;
   const f = await runningDesktop(
     t,
     async () => assert.fail('No backend can run without storage.'),
@@ -1463,11 +1466,18 @@ test('Windows onboarding waits for storage before unlocking credentials and expo
     const showLog = f.handlers.get('nod:startup-log:show');
     await assert.rejects(showLog({ ...event, senderFrame: { url: event.senderFrame.url } }));
     assert.equal(revealed.length, 0);
+    await appendFile(
+      join(f.profileRoot, 'logs', 'startup.log'),
+      'Synthetic earlier line\n'.repeat(4000),
+    );
     await showLog(event);
     assert.deepEqual(revealed, [join(f.profileRoot, 'logs', 'startup.log')]);
     const log = await readFile(revealed[0], 'utf8');
+    assert.ok(log.startsWith('Synthetic earlier line\n'));
+    assert.ok(log.length < 64 * 1024);
     assert.ok(log.includes(cause));
-    assert.ok(log.includes(details));
+    assert.ok(log.includes(details.replaceAll(homedir(), '<home>')));
+    assert.equal(log.includes(homedir()), false);
     assert.equal(f.status().error, cause);
     assert.ok(f.status().details.includes(details));
     assert.ok(f.status().details.includes('NOD_WSL_REQUIRED'));
@@ -2462,7 +2472,7 @@ test('a missing native setup renderer offers explicit recovery without hidden ke
       try {
         const launched = f.launch();
         for (let attempt = 0; !f.windows.length && attempt < 100; attempt++)
-          await new Promise(setImmediate);
+          await new Promise((resolve) => wait(resolve, 5));
         const window = f.windows[0];
         assert.ok(window);
         assert.equal(window.isVisible(), false);
@@ -5030,6 +5040,130 @@ commonName = supplied
   assert.equal(requests.length, 2);
 });
 
+test('expired system certificates do not replace a valid chain the server sends', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'nod-expired-system-ca-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const defaults = getCACertificates('default');
+  t.after(() => setDefaultCACertificates(defaults));
+  const execute = promisify(execFile);
+  const openssl = (...args) =>
+    execute('openssl', args, { cwd: directory, timeout: 10_000, windowsHide: true });
+  await writeFile(
+    join(directory, 'ca.cnf'),
+    `[req]
+distinguished_name = dn
+[dn]
+[ca]
+default_ca = local
+[local]
+database = index
+new_certs_dir = .
+serial = serial
+default_md = sha256
+default_days = 1
+unique_subject = no
+policy = policy
+[policy]
+commonName = supplied
+`,
+  );
+  await writeFile(join(directory, 'index'), '');
+  await writeFile(join(directory, 'serial'), '01\n');
+  await writeFile(
+    join(directory, 'intermediate.ext'),
+    'basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n',
+  );
+  await writeFile(
+    join(directory, 'server.ext'),
+    'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\nsubjectAltName=IP:127.0.0.1\n',
+  );
+  const keyOptions = ['-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes'];
+  await openssl(
+    'req',
+    '-x509',
+    '-sha256',
+    ...keyOptions,
+    '-keyout',
+    'root.key',
+    '-out',
+    'root.pem',
+    '-days',
+    '1',
+    '-subj',
+    '/CN=Nod test root',
+    '-config',
+    'ca.cnf',
+    '-addext',
+    'basicConstraints=critical,CA:TRUE',
+    '-addext',
+    'keyUsage=critical,keyCertSign,cRLSign',
+  );
+  for (const name of ['intermediate', 'server'])
+    await openssl(
+      'req',
+      '-new',
+      ...keyOptions,
+      '-keyout',
+      `${name}.key`,
+      '-out',
+      `${name}.csr`,
+      '-subj',
+      `/CN=Nod test ${name}`,
+      '-config',
+      'ca.cnf',
+    );
+  const sign = (issuer, request, output, dates = []) =>
+    openssl(
+      'ca',
+      '-batch',
+      '-notext',
+      '-config',
+      'ca.cnf',
+      '-cert',
+      `${issuer}.pem`,
+      '-keyfile',
+      `${issuer}.key`,
+      '-in',
+      `${request}.csr`,
+      '-out',
+      `${output}.pem`,
+      '-extfile',
+      `${request}.ext`,
+      ...dates,
+    );
+  await sign('root', 'intermediate', 'intermediate');
+  await sign('root', 'intermediate', 'stale', [
+    '-startdate',
+    '20000101000000Z',
+    '-enddate',
+    '20000102000000Z',
+  ]);
+  await sign('intermediate', 'server', 'server');
+  const [root, intermediate, stale, leaf] = await Promise.all(
+    ['root', 'intermediate', 'stale', 'server'].map((name) =>
+      readFile(join(directory, `${name}.pem`), 'utf8'),
+    ),
+  );
+  const server = createHttpsServer(
+    { key: await readFile(join(directory, 'server.key')), cert: leaf + intermediate },
+    (_request, response) => response.end('ok'),
+  );
+  t.after(() => {
+    server.closeAllConnections();
+    return new Promise((resolve) => server.close(resolve));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const url = `https://127.0.0.1:${server.address().port}`;
+  setDefaultCACertificates([...defaults, root, stale]);
+  await assert.rejects(fetch(url), (error) => error.cause?.code === 'CERT_HAS_EXPIRED');
+  setDefaultCACertificates(defaults);
+  trustSystemCertificates({
+    getCACertificates: (type) => (type === 'system' ? [root, stale] : getCACertificates(type)),
+    setDefaultCACertificates,
+  });
+  assert.equal(await (await fetch(url)).text(), 'ok');
+});
+
 test('remote setup remains visible and navigable while the encrypted server token waits for macOS storage', async (t) => {
   const output = await mkdtemp(join(tmpdir(), 'nod-native-remote-unlock-'));
   t.after(() => rm(output, { recursive: true, force: true }));
@@ -7397,6 +7531,7 @@ async function updatePreparation({
       engine: undefined,
       closingEngine: false,
       pendingPreload: undefined,
+      updateEvent: async () => {},
       loadRuntime: async (url) =>
         url.endsWith('/windows.mjs')
           ? {
@@ -8093,10 +8228,9 @@ test('ready desktop updates share Later across engine windows and reopen for a n
   assert.deepEqual(restarts, []);
 });
 
-test('in-app update restart keeps Later safe and shares one confirmation', async (t) => {
-  const choice = deferred();
-  const shown = deferred();
-  const prompts = [];
+test('in-app update restart restarts once without asking again', async (t) => {
+  const restarted = deferred();
+  const started = deferred();
   const restarts = [];
   const updater = {
     ready: undefined,
@@ -8106,18 +8240,11 @@ test('in-app update restart keeps Later safe and shares one confirmation', async
     },
     async restart() {
       restarts.push(this.ready.version);
+      started.resolve();
+      await restarted.promise;
     },
   };
-  const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'), {
-    prompt: (options) => {
-      prompts.push(options);
-      if (prompts.length === 1) {
-        shown.resolve();
-        return choice.promise;
-      }
-      return { response: 0 };
-    },
-  });
+  const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'));
   f.showEngine();
   await new Promise(setImmediate);
   const window = f.windows.at(-1);
@@ -8128,23 +8255,40 @@ test('in-app update restart keeps Later safe and shares one confirmation', async
   await f.checkUpdates(updater, false);
 
   const first = restart(event);
-  await shown.promise;
+  await started.promise;
   const second = restart(event);
-  assert.equal(prompts.length, 1);
   assert.equal(status(event).checking, true);
   assert.equal(f.updateMenu.enabled, false);
-  assert.match(prompts[0].message, /Nod 0\.5\.2 is ready/);
-  assert.deepEqual([...prompts[0].buttons], ['Restart', 'Later']);
-  assert.equal(prompts[0].defaultId, 1);
-  assert.equal(prompts[0].cancelId, 1);
-  choice.resolve({ response: 1 });
+  restarted.resolve();
   await Promise.all([first, second]);
-  assert.deepEqual(restarts, []);
-  assert.equal(status(event).readyVersion, '0.5.2');
+  assert.deepEqual(restarts, ['0.5.2']);
   assert.equal(status(event).checking, false);
+});
 
-  await restart(event);
-  assert.equal(prompts.length, 2);
+test('in-app update restart during a background check restarts without asking again', async (t) => {
+  const checked = deferred();
+  const restarts = [];
+  const updater = {
+    ready: undefined,
+    async check() {
+      await checked.promise;
+      this.ready = { version: '0.5.2' };
+      return this.ready;
+    },
+    async restart() {
+      restarts.push(this.ready.version);
+    },
+  };
+  const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'));
+  f.showEngine();
+  await new Promise(setImmediate);
+  const window = f.windows.at(-1);
+  const event = { sender: window.webContents, senderFrame: window.webContents.mainFrame };
+  const restart = f.handlers.get('nod:updates:restart');
+  const background = f.checkUpdates(updater, false);
+  const clicked = restart(event);
+  checked.resolve();
+  await Promise.all([background, clicked]);
   assert.deepEqual(restarts, ['0.5.2']);
 });
 

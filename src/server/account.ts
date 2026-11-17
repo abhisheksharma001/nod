@@ -117,6 +117,7 @@ export function createAccountSession(options: {
       const surveys =
         analytics?.enabled &&
         (await options.accounts.activeDays(owner, surveyActiveDays)) >= surveyActiveDays;
+      const seenSurveys = surveys ? await options.accounts.seenSurveys(owner) : [];
       if (accountVersion !== version || pending) continue;
       return {
         user,
@@ -133,7 +134,7 @@ export function createAccountSession(options: {
           updatesEmail: options.updatesEmail === true,
         },
         ...(analytics && {
-          analytics: analytics.enabled ? { ...analytics, surveys } : analytics,
+          analytics: analytics.enabled ? { ...analytics, surveys, seenSurveys } : analytics,
         }),
       };
     }
@@ -261,6 +262,16 @@ export function createAccountSession(options: {
         });
       reply.header('cache-control', 'no-store');
       return response();
+    });
+    app.post('/api/account/survey-seen', async (request, reply) => {
+      if (!guard(request, reply)) return;
+      const { survey } = z
+        .object({ survey: z.string().regex(/^[0-9a-f-]{36}(_\d{1,9})?$/i) })
+        .strict()
+        .parse(request.body);
+      await options.accounts.markSurveySeen(owner, survey);
+      reply.header('cache-control', 'no-store');
+      return { ok: true };
     });
     app.post('/api/account/welcome', async (request, reply) => {
       if (!guard(request, reply)) return;

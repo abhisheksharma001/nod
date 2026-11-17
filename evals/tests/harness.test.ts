@@ -1848,6 +1848,10 @@ test('scenario API calls use authenticated local transport and refuse outside ta
       async activeDays() {
         return 0;
       },
+      async seenSurveys() {
+        return [];
+      },
+      async markSurveySeen() {},
       async update(owner, input) {
         assert.equal(owner, 'synthetic-owner');
         writes++;
