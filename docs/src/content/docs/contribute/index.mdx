@@ -108,6 +108,14 @@ Each arrow means "may import". Every layer may also import `src/shared`.
 
 For how a request moves through these parts, read [Architecture](/how-it-works/architecture/).
 
+### Diagnostic data that leaves Nod
+
+Diagnostic reports and the failure and startup logs behind them are redacted in the owner's Nod runtime before they are sent to the configured feedback recipient: the Nod team by default, or an operator's collector. Redaction masks recognized names, addresses, account and device identifiers, paths, links and known secrets. It can miss details, so the owner reviews the report before sending. When triage needs a detail, add a bounded technical field such as a fixed choice, count, version, error class or status code. Don't loosen a redaction rule to keep it. Add a test that a private value stays out.
+
+Analytics events carry bounded values only, with the exceptions that [Change analytics](/contribute/analytics/) lists. Conversation traces are pseudonymised, not anonymous.
+
+The report builder is `src/server/bug-report.ts` and its redactor is `src/server/feedback-redaction.ts`.
+
 ## Coding agents
 
 Coding agents follow [AGENTS.md](https://github.com/n8n-io/nod/blob/main/AGENTS.md), and so does everyone else. It holds the rules every change follows, including the safety invariants. The same checks and review apply whether you or an agent wrote the change.

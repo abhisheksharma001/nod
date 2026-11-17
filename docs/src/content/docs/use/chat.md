@@ -114,6 +114,10 @@ The message box stays open while Nod works, so you can send another message at a
 
 The line describes the work instead of showing internal tool names. When Nod hasn't named a step, it names the app, website or kind of work that's active, or the model Nod is waiting for. It never counts seconds or guesses when Nod will finish. When Nod answers, the answer takes its place. It clears when Nod asks you something or stops, and hides while the app reconnects. A failed send clears the line and shows an error. Steps come from Nod's own short descriptions, which appear as soon as Nod starts the tool they describe, and, when your model shares a summary of its reasoning, from that summary's heading, such as "Researching Málaga travel ideas".
 
+After an operation finishes, up to four recent operations appear below the line, with the newest first. Select the line to hide or show them. The current activity stays visible. The list covers only the current work and clears when a new request starts. It uses saved activity records and needs no extra model request.
+
+![The current activity above four completed operations, beside the Nod mark and above the message box.](../../../assets/screens/chat-recent-activity.png)
+
 The line follows only the work on your messages. A task shows its progress on its own card, and a question from a task or schedule shows it on the small line above that question. While anything works, the message box says **Send another message to Nod…**. While a task works, a small dot pulses just above the top-right corner of the message box. A task that needs your answer shows a slightly larger pink dot with a question mark. Hover over a dot or focus it to see which task it is. Select it to open the task's card with a soft highlight: if the card is already on screen, the chat stays where it is; otherwise the chat scrolls to it.
 
 ### Send more while Nod works
@@ -122,9 +126,17 @@ When you send a message while Nod works, a second line says **Got your message. 
 
 ![Nod's status line reads "Comparing flight prices · skyscanner.net · 2 min", with "Got your message. I'll read it after this step." below it, after a follow-up message.](../../../assets/screens/chat-live-line.png)
 
+### Feedback during long tasks
+
+For longer tasks you request, Nod looks for a small useful part it can check before collecting everything or preparing the final output. This rule applies with any tool or source. A partial result must help you act or decide on its own and be worth an interruption. Nod weighs urgency, missing context, and recent messages. If related checks could change the result's meaning, Nod finishes those checks first.
+
+Nod sends the first result that meets these conditions as soon as it is ready, then continues the full request. It follows your delivery instructions. Later related findings arrive together. Each partial result states material limits and checked coverage.
+
+Routine activity stays in the live line. Time passing alone does not trigger another message. If no useful result is supported, Nod keeps checking. The status line continues while work remains.
+
 ### When Nod stops
 
-Work ends with an answer, a question, or a short message saying what stopped it. A schedule, or a task Nod started on its own, also tells you by name when it fails. When you only share context, such as a routine, Nod can save it without replying. Nod can send a useful, verified partial result before it finishes; the status line continues while work remains.
+Work ends with an answer, a question, or a short message saying what stopped it. A schedule, or a task Nod started on its own, also tells you by name when it fails. When you only share context, such as a routine, Nod can save it without replying.
 
 In the sidebar, the Chat item shows a moving dot while Nod works and a solid dot when it's waiting for you.
 

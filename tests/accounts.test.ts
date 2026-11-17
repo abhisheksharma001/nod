@@ -1340,7 +1340,10 @@ test('unavailable decisions avoid ledger reads and retain dynamic availability a
     { reads, writes, resolutions, requests },
     { reads: 0, writes: 0, resolutions: 0, requests: 0 },
   );
-  assert.deepEqual(await checkMail(emails, AbortSignal.abort()), Array.from({ length: 100 }));
+  assert.deepEqual(
+    await checkMail(emails, AbortSignal.abort()),
+    Array<string>(100).fill('the read was stopped before its check finished'),
+  );
   assert.equal(availabilityReads - beforeAvailability, 1);
   assert.equal(curatorRequests, 100);
 
@@ -1352,7 +1355,9 @@ test('unavailable decisions avoid ledger reads and retain dynamic availability a
     { reads: 1, writes: 1, resolutions: 1, requests: 1 },
   );
   spent = 1;
-  assert.deepEqual(await checkMail([request.input.email]), [undefined]);
+  assert.deepEqual(await checkMail([request.input.email]), [
+    'This month’s spending limit is reached.',
+  ]);
   assert.equal(curatorRequests, 100);
   assert.deepEqual(
     { reads, writes, resolutions, requests },
@@ -1439,7 +1444,11 @@ test('decision requests revalidate capability and cancellation after resolving c
       if (stop === 'configuration') configured = false;
       if (stop === 'cancel') controller.abort();
       release();
-      assert.deepEqual(await result, [undefined]);
+      assert.deepEqual(await result, [
+        stop === 'cancel'
+          ? 'the read was stopped before its check finished'
+          : 'the check model gave no valid answer',
+      ]);
       await new Promise((resolve) => setImmediate(resolve));
       assert.equal(calls, 0);
       assert.equal(fallback, 0);
@@ -1476,6 +1485,10 @@ describe('account routes', () => {
         await activity.wait?.();
         return owner === 'local-owner' ? Math.min(activity.days, limit) : 0;
       },
+      async seenSurveys() {
+        return [];
+      },
+      async markSurveySeen() {},
       async update(_owner, input) {
         calls.writes++;
         const saved = record;
@@ -3657,6 +3670,36 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
       assert.equal(owner.hasClassificationModel(true), false);
       assert.equal(await owner.resolveClassification(true), undefined);
     });
+  });
+
+  test('automatic preparation names the model it cannot price until a priced model does the work', async (t) => {
+    const f = await fixture(t);
+    const original = await f.backend.catalog('openai', 'api_key', {
+      type: 'api_key',
+      key: 'fixture-preparation-price-catalog',
+    });
+    const owner = await f.create('fixture-preparation-price', {
+      ...f.backend,
+      catalog: async () =>
+        original.map((definition) =>
+          definition.choice.id === 'gpt-6.1-sol'
+            ? { ...definition, spec: { ...definition.spec, cost: { input: 0, output: 0 } } }
+            : definition,
+        ),
+    });
+    const connectionId = await owner.addKey('openai', 'fixture-preparation-price-key');
+    const unpriced = original.find((definition) => definition.choice.id === 'gpt-6.1-sol')!;
+    assert.equal(owner.view().selection?.modelId, 'gpt-6.1-sol');
+    assert.equal(owner.unpricedPreparationModel(), unpriced.choice.name);
+    assert.equal(owner.view().unpricedPreparationModel, unpriced.choice.name);
+    const priced = original.find((definition) => definition.choice.id === 'gpt-6-luna')!;
+    await owner.setRoute('background', {
+      connectionId,
+      modelId: priced.choice.id,
+      effort: priced.choice.efforts[0]!,
+    });
+    assert.equal(owner.unpricedPreparationModel(), undefined);
+    assert.equal(owner.view().unpricedPreparationModel, undefined);
   });
 
   test('classification keeps subscription access on the approved small model', async (t) => {
@@ -6365,6 +6408,37 @@ describe('persisted setting analytics privacy', { skip: !process.env.TEST_DATABA
     await message(f.owner, 'user', currentThread, '2026-11-03T12:00:00Z');
     assert.equal(await createAccountStore(f.database).activeDays(f.owner, 3), 3);
     assert.equal(await accounts.activeDays('owner-without-messages', 3), 0);
+
+    await accounts.update(f.owner, { onboardingCompleted: true });
+    assert.deepEqual((await session()).analytics.seenSurveys, []);
+    const survey = randomUUID();
+    const seen = (key: string) =>
+      app.inject({
+        method: 'POST',
+        url: '/api/account/survey-seen',
+        headers: { origin: 'http://localhost:4399' },
+        payload: { survey: key },
+      });
+    assert.notEqual((await seen('not-a-survey')).statusCode, 200);
+    assert.notEqual((await seen(`${survey}_${'9'.repeat(10)}`)).statusCode, 200);
+    assert.equal((await seen(survey)).statusCode, 200);
+    assert.equal((await seen(survey)).statusCode, 200);
+    assert.equal((await seen(`${survey}_2`)).statusCode, 200);
+    const restarted = Fastify();
+    t.after(() => restarted.close());
+    createAccountSession({
+      accounts: createAccountStore(f.database),
+      analytics: f.analytics,
+      origin: 'http://localhost:4399',
+      localUser: { id: f.owner, name: 'Synthetic Owner', email: null, avatarUrl: null },
+    }).register(restarted);
+    const after = await restarted.inject({ method: 'GET', url: '/api/session' });
+    assert.deepEqual(after.json().analytics.seenSurveys, [survey, `${survey}_2`]);
+    await accounts.update('other-survey-owner', { onboardingCompleted: true });
+    assert.deepEqual(await accounts.seenSurveys('other-survey-owner'), []);
+    const keys = Array.from({ length: 101 }, () => randomUUID());
+    for (const key of keys) await accounts.markSurveySeen('other-survey-owner', key);
+    assert.deepEqual(await accounts.seenSurveys('other-survey-owner'), keys.slice(1));
   });
 
   test('preferences and spending expose committed bounded states across actors, owners and consent periods', async (t) => {

@@ -18,7 +18,7 @@ import {
 } from './desktop';
 import { analyticsHost, analyticsRoute, sanitizedAnalyticsUrl } from './analytics-privacy';
 import { feedbackActivity } from './feedback-activity';
-import { requestAccountVersion } from './api';
+import { api, requestAccountVersion } from './api';
 import type { AttachmentKind } from '../../shared/attachment-kind';
 import type { Presentation } from '../../shared/presentation';
 
@@ -86,7 +86,11 @@ type AnalyticsEvents = {
     input: 'text' | 'voice';
   };
   chat_stop_requested: undefined;
-  task_card_started: { kind?: 'immediate' | 'ongoing'; position: number };
+  task_card_started: {
+    kind?: 'immediate' | 'ongoing';
+    origin: 'learned' | 'common';
+    position: number;
+  };
   setup_link_clicked: { setup: 'app' | 'vault' | 'browser' };
   browser_handoff_action: { action: 'done' | 'back' | 'reload' | 'expand' | 'collapse' };
   message_reaction_changed: {
@@ -229,7 +233,11 @@ const eventProperties: Record<keyof AnalyticsEvents, Record<string, readonly unk
     input: ['text', 'voice'],
   },
   chat_stop_requested: {},
-  task_card_started: { kind: ['immediate', 'ongoing'], position: [0, 1, 2, 3, 4, 5] },
+  task_card_started: {
+    kind: ['immediate', 'ongoing'],
+    origin: ['learned', 'common'],
+    position: [0, 1, 2, 3, 4, 5],
+  },
   setup_link_clicked: { setup: ['app', 'vault', 'browser'] },
   browser_handoff_action: { action: ['done', 'back', 'reload', 'expand', 'collapse'] },
   message_reaction_changed: {
@@ -767,7 +775,9 @@ export function watchAnalyticsSurvey(listener: (survey?: AnalyticsSurvey) => voi
       posthog.getActiveMatchingSurveys((surveys) => {
         if (disposed || current !== generation || !configuration?.enabled || !configuration.surveys)
           return;
-        const survey = surveys.map(readSurvey).find(Boolean);
+        const survey = surveys
+          .map(readSurvey)
+          .find((survey) => survey && !configuration?.seenSurveys?.includes(surveyKey(survey)));
         if (survey) listener(survey);
       });
     } catch {}
@@ -779,6 +789,10 @@ export function watchAnalyticsSurvey(listener: (survey?: AnalyticsSurvey) => voi
     viewListeners.delete(check);
     for (const stop of stops) stop();
   };
+}
+
+export function surveyKey(survey: AnalyticsSurvey) {
+  return survey.iteration ? `${survey.id}_${survey.iteration}` : survey.id;
 }
 
 export function captureSurvey(
@@ -809,7 +823,14 @@ export function captureSurvey(
           ),
         }),
     });
-    if (event === 'shown') localStorage.setItem('lastSeenSurveyDate', new Date().toISOString());
+    if (event !== 'shown') return;
+    const key = surveyKey(survey);
+    configuration.seenSurveys = [...(configuration.seenSurveys ?? []), key];
+    void api('/api/account/survey-seen', {
+      method: 'POST',
+      body: JSON.stringify({ survey: key }),
+    }).catch(() => {});
+    localStorage.setItem('lastSeenSurveyDate', new Date().toISOString());
   } catch {}
 }
 

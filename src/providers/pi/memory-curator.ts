@@ -238,7 +238,11 @@ export function createPiMemoryCurator(options: {
             : reply.stopReason === 'length'
               ? ' The reply stopped at the token limit.'
               : '';
-        throw new Error(`${label} Task: ${task}. Model: ${model.provider}/${model.id}.${detail}`);
+        const status = [...(reply.errorMessage ?? '').matchAll(/\(HTTP (\d{3})\)/g)].at(-1)?.[1];
+        throw Object.assign(
+          new Error(`${label} Task: ${task}. Model: ${model.provider}/${model.id}.${detail}`),
+          status ? { providerStatus: Number(status) } : {},
+        );
       }
       return json(
         reply.content.flatMap((block) => (block.type === 'text' ? [block.text] : [])).join(''),

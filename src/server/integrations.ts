@@ -315,8 +315,18 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
       AnalyticsEvent,
       { event: 'connection_changed' }
     >['properties']['failure_reason'],
+    failure?: { step: string; error?: unknown },
   ) {
     captureConnection(options.analytics, connectionAnalytics(app), status, failureReason);
+    if (status === 'failed')
+      logFailure('app_connection_failed', failure?.error, {
+        app: slugSchema.safeParse(app).success ? app : 'custom',
+        step: failure?.step,
+        status: [Object(failure?.error).statusCode, Object(failure?.error).status].find(
+          (value) => Number.isInteger(value) && value >= 400 && value < 600,
+        ),
+        reason: failureReason,
+      });
   }
   function connectionFailure(error: unknown) {
     return serviceFailureReason(error);
@@ -1029,7 +1039,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
         ...(returnTo === 'window' || returnTo === 'desktop' ? { attempt: nonce } : {}),
       };
     } catch (error) {
-      track(slug, 'failed', connectionFailure(error));
+      track(slug, 'failed', connectionFailure(error), { step: 'start', error });
       throw error;
     } finally {
       if (session) provider.deleteSession(session.id).catch(() => {});
@@ -1082,7 +1092,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
     let abandoned = (await options.discovered?.abandonSetup(linkHash, reason)) ?? false;
     for (const row of rows)
       if ((await clearReconnect(row.id, row.callback_hash!)) !== undefined) {
-        track(row.slug, 'failed', reason);
+        track(row.slug, 'failed', reason, { step: 'sign_in' });
         abandoned = true;
       }
     return abandoned;
@@ -1206,7 +1216,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
     } catch (error) {
       const cleared = await clearReconnect(row.id, hash);
       if (attemptedId && cleared !== attemptedId) await discardReconnect(row, attemptedId);
-      track(slug, 'failed', connectionFailure(error));
+      track(slug, 'failed', connectionFailure(error), { step: 'reconnect', error });
       throw error;
     }
   }
@@ -2790,16 +2800,19 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
                   if (!result.success) {
                     outcome = 'cancelled';
                     await clearReconnect(claimed.id, hash, claimId);
-                    track(claimed.slug, 'failed', 'cancelled');
+                    track(claimed.slug, 'failed', 'cancelled', { step: 'callback' });
                   } else {
                     const resumed = await completeConnection(result, claimed, (id) => {
                       verifiedAccountId = id;
                     });
                     outcome = resumed ? 'continued' : 'connected';
                   }
-                } catch {
+                } catch (error) {
                   outcome = 'failed';
-                  track(claimed.slug, 'failed', 'verification_failed');
+                  track(claimed.slug, 'failed', 'verification_failed', {
+                    step: 'callback',
+                    error,
+                  });
                   await clearReconnect(claimed.id, hash, claimId);
                   if (verifiedAccountId) await discardReconnect(claimed, verifiedAccountId);
                 } finally {
