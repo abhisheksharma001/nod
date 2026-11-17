@@ -750,6 +750,14 @@ export function createChatSdkTransport(
         id ||= sent.id;
         ids.push(sent.id);
       }
+      const sendCaption = async () => {
+        if (caption)
+          for (const part of telegram!.chunks(input.text)) {
+            const sent = await post({ markdown: part });
+            id ||= sent.id;
+            ids.push(sent.id);
+          }
+      };
       for (const file of attachments) {
         if (unsent.includes(file)) continue;
         if (input.channelId === 'telegram' && /^audio\/(ogg|mpeg|mp4)$/.test(file.mimeType)) {
@@ -775,6 +783,11 @@ export function createChatSdkTransport(
             `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendVoice`,
             { method: 'POST', body, signal: AbortSignal.timeout(60_000), redirect: 'error' },
           );
+          if (response.status === 400) {
+            await response.body?.cancel().catch(() => {});
+            unsent.push(file);
+            continue;
+          }
           if (!response.ok) throw new Error('Voice delivery was not confirmed.');
           const sent = z
             .object({
@@ -791,12 +804,7 @@ export function createChatSdkTransport(
         try {
           bytes = await file.read();
         } catch {
-          if (caption)
-            for (const part of telegram!.chunks(input.text)) {
-              const sent = await post({ markdown: part });
-              id ||= sent.id;
-              ids.push(sent.id);
-            }
+          await sendCaption();
           unsent.push(file);
           continue;
         }
@@ -907,6 +915,10 @@ export function createChatSdkTransport(
             );
             if (!response.ok) {
               await response.body?.cancel().catch(() => {});
+              if (response.status === 400) {
+                unsent.push(file);
+                break;
+              }
               throw new Error('Message delivery was not confirmed.');
             }
             const sent = z
@@ -943,8 +955,12 @@ export function createChatSdkTransport(
             id ||= sent.id;
             ids.push(sent.id);
           },
-          () => {
-            if (caption) throw new Error('Media delivery was not confirmed.');
+          async (cause) => {
+            if (caption) {
+              if ((cause as { code?: unknown } | undefined)?.code !== 'VALIDATION_ERROR')
+                throw new Error('Media delivery was not confirmed.');
+              await sendCaption();
+            }
             unsent.push(file);
           },
         );
