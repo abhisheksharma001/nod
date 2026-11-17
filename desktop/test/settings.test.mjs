@@ -5525,6 +5525,68 @@ test('server token recovery distinguishes a locked store from unreadable ciphert
     });
 });
 
+test('remote connection verification keeps the cause of a failed connection and never shows the token or address', async (t) => {
+  const token = randomBytes(32).toString('base64url');
+  const causes = [
+    [
+      Object.assign(new TypeError('fetch failed'), { cause: { code: 'ENOTFOUND' } }),
+      'ENOTFOUND',
+      'could not be found',
+    ],
+    [
+      Object.assign(new TypeError('fetch failed'), { cause: { code: 'CERT_HAS_EXPIRED' } }),
+      'CERT_HAS_EXPIRED',
+      'certificate was not accepted',
+    ],
+    [new DOMException('The operation timed out.', 'TimeoutError'), undefined, '10 seconds'],
+    [
+      Object.assign(new TypeError('fetch failed'), { cause: { code: `Bearer ${token}` } }),
+      undefined,
+      'Check its address',
+    ],
+  ];
+  const seen = new Set();
+  for (const [cause, code, reason] of causes) {
+    const f = await runningDesktop(
+      t,
+      async () => {
+        throw cause;
+      },
+      { initialState: 'fresh' },
+    );
+    const error = await f
+      .checkRemoteConnection({ url: 'https://assistant.example.test', token })
+      .catch((failure) => failure);
+    assert.equal(typeof error?.message, 'string');
+    if (code) assert.ok(error.message.includes(code), error.message);
+    assert.ok(error.message.includes(reason), error.message);
+    assert.ok(!error.message.includes(token));
+    assert.ok(!error.message.includes('assistant.example.test'));
+    seen.add(error.message);
+    await f.close();
+  }
+  assert.equal(seen.size, causes.length);
+});
+
+test('remote connection verification names the status of a server that answers without a session', async (t) => {
+  const token = randomBytes(32).toString('base64url');
+  const seen = new Set();
+  for (const status of [404, 500, 502]) {
+    const f = await runningDesktop(t, async () => new Response('<html></html>', { status }), {
+      initialState: 'fresh',
+    });
+    const error = await f
+      .checkRemoteConnection({ url: 'https://assistant.example.test', token })
+      .catch((failure) => failure);
+    assert.equal(typeof error?.message, 'string');
+    assert.ok(error.message.includes(String(status)), error.message);
+    assert.ok(!error.message.includes(token));
+    seen.add(error.message);
+    await f.close();
+  }
+  assert.equal(seen.size, 3);
+});
+
 test('remote connection verification rejects redirects before a second server receives the token', async (t) => {
   const { createServer: createHttpServer } = await import('node:http');
   let redirected = 0;
