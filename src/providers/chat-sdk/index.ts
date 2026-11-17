@@ -150,7 +150,9 @@ class WhatsApp extends WhatsAppAdapter {
   }
 
   chunks(text: string) {
-    return splitMessage(convertEmojiPlaceholders(whatsappText(text), 'whatsapp'));
+    return splitMessage(convertEmojiPlaceholders(whatsappText(text), 'whatsapp')).filter((part) =>
+      part.trim(),
+    );
   }
 
   async typing(messageId: string) {
