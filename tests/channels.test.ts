@@ -1499,6 +1499,70 @@ test('Telegram media keeps native replies and checks the sender before any downl
   assert.equal(requests.length, 0);
 });
 
+test('WhatsApp Cloud API never posts an empty text body before a file or a failed-file notice', async (t) => {
+  const png = Buffer.from('89504e470d0a1a0a', 'hex');
+  const bodies: { type: string; text?: { body: string } }[] = [];
+  t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (!String(input).startsWith('https://graph.facebook.com/'))
+      throw new Error('Unexpected fixture provider call.');
+    if (String(input).endsWith('/media')) return Response.json({ id: 'fixture-media' });
+    bodies.push(JSON.parse(String(init?.body)));
+    return Response.json({ messages: [{ id: `wamid.fixture-${bodies.length}` }] });
+  });
+  const idle = { rows: [], rowCount: 0 };
+  const pool = {
+    query: async () => idle,
+    connect: async () => ({ query: async () => idle, release() {} }),
+    on() {},
+    end: async () => {},
+  } as unknown as pg.Pool;
+  const transport = createChatSdkTransport(pool, fixtureEnv);
+  const target = {
+    channelId: 'whatsapp',
+    accountId: '555000',
+    threadId: 'whatsapp:555000:351910000000',
+  };
+  const image = {
+    name: 'chart.png',
+    mimeType: 'image/png',
+    size: png.length,
+    read: async () => new Uint8Array(png),
+  };
+  const recording = {
+    name: 'reply.wav',
+    mimeType: 'audio/wav',
+    size: 10,
+    read: async () => new Uint8Array(10),
+  };
+  await transport.post({ ...target, text: '', attachments: [image] });
+  assert.deepEqual(
+    bodies.map((body) => body.type),
+    ['image'],
+  );
+  bodies.length = 0;
+  await assert.rejects(
+    transport.post({
+      ...target,
+      text: '',
+      attachments: [recording],
+      attachmentFailure: async () => undefined,
+    }),
+    /Channel delivery was not confirmed/,
+  );
+  assert.equal(bodies.length, 0);
+  bodies.length = 0;
+  await transport.post({
+    ...target,
+    text: '',
+    attachments: [recording],
+    attachmentFailure: async () => 'The file is in Nod.',
+  });
+  assert.deepEqual(
+    bodies.map((body) => body.text?.body),
+    ['The file is in Nod.'],
+  );
+});
+
 test('Telegram downloads stop at 20 MB whatever size the sender, Bot API or file server reports', async () => {
   const limit = 20 * 1024 * 1024;
   const message = telegramMessage.parse({
