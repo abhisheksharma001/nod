@@ -209,6 +209,7 @@ import { createVaultAccess } from './vault-access.ts';
 import { createPayments } from './payments.ts';
 import { BrowserConnectionError, createBrowserConnections } from './browser-connections.ts';
 import { cachedIcons, registerLinkOpened } from './link-previews.ts';
+import { appPages } from '../shared/app-links.ts';
 export interface ApplicationAdapters {
   analytics?: ProductAnalytics;
   onboardingEmail?: OnboardingEmailDelivery;
@@ -2114,7 +2115,7 @@ async function initializeApplication(
       modelAlternative: () => {
         const other = alternativeModel(adapters.models);
         return other
-          ? `Your ${other.label} connection is also set up: you can switch to it in Settings > Models.`
+          ? `Your ${other.label} connection is also set up: you can switch to it in ${appPages['/settings/models']}.`
           : undefined;
       },
       taskClassification: true,

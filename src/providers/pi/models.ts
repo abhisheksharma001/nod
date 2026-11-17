@@ -19,6 +19,7 @@ import { z } from 'zod';
 import { createRemoteJWKSet, customFetch, jwtVerify } from 'jose';
 import { logFailure } from '../../ports/failure-log.ts';
 import { ModelAuthError, ModelWorkspaceSelectionError } from '../../ports/models.ts';
+import { appPages } from '../../shared/app-links.ts';
 import { ElevenLabsConnectionError, readElevenLabsVoices } from '../elevenlabs/speech.ts';
 import { openAIBaseUrl, openAIRequestError } from '../openai/api.ts';
 import type {
@@ -52,6 +53,8 @@ import {
   cloudflareCredential,
   nativeCatalog,
 } from './model-catalog.ts';
+
+const reconnectChatGpt = `Reconnect your ChatGPT account in ${appPages['/settings/models']}.`;
 
 export const localModelSilenceMs = 30 * 60_000;
 export const modelFirstEventMs = 90_000;
@@ -105,8 +108,7 @@ class AnthropicBadRequest extends ModelAuthError {}
 
 function chatgptCredential(value: unknown) {
   const parsed = chatgptCredentialSchema.safeParse(value);
-  if (!parsed.success)
-    throw new ModelAuthError('Reconnect your ChatGPT account in Settings > Models.', true);
+  if (!parsed.success) throw new ModelAuthError(reconnectChatGpt, true);
   return parsed.data;
 }
 
@@ -781,7 +783,7 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
         if (response.status !== 401) return response;
         await response.body?.cancel();
         throw method === 'subscription'
-          ? new ModelAuthError('Reconnect your ChatGPT account in Settings > Models.', true)
+          ? new ModelAuthError(reconnectChatGpt, true)
           : new ModelAuthError(
               `${modelProviderNames[provider]} didn’t accept this API key. Check it and try again.`,
             );
@@ -983,9 +985,7 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
         const terminal =
           error instanceof TokenRejected && [400, 401, 403].includes(error.statusCode);
         throw new ModelAuthError(
-          terminal
-            ? 'Reconnect your ChatGPT account in Settings > Models.'
-            : 'ChatGPT is temporarily unavailable. Try again.',
+          terminal ? reconnectChatGpt : 'ChatGPT is temporarily unavailable. Try again.',
           terminal,
           { cause: error },
         );
@@ -1047,7 +1047,7 @@ export async function createPiModelRuntime(
   const provider = access.provider;
   const reconnect = async (credential?: ModelCredential) => {
     await access.needsReconnect?.(credential);
-    return new ModelAuthError('Reconnect your ChatGPT account in Settings > Models.', true);
+    return new ModelAuthError(reconnectChatGpt, true);
   };
   if (
     subscription &&

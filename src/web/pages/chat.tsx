@@ -13,6 +13,7 @@ import type {
 } from '../../shared/contracts';
 import type { SuggestedTask, TaskSuggestions } from '../../shared/onboarding';
 import type { TrustView } from '../../shared/trust';
+import { appPages } from '../../shared/app-links';
 import type { QuestionAnswer } from '../../shared/answer-choices';
 import { integrationMetadata, integrationServices } from '../../shared/integrations';
 import { moreIdeasLine } from '../../shared/sender-apps';
@@ -345,7 +346,7 @@ export function Chat({
           : 'Choose a model to start chatting'}
       </h2>
       <Button variant="outline" asChild>
-        <a href="/settings/models">Open Settings &gt; Models</a>
+        <a href="/settings/models">Open {appPages['/settings/models']}</a>
       </Button>
     </div>
   );
@@ -2519,7 +2520,7 @@ export function Chat({
                       Try again
                     </Button>
                   )}
-                  <a href="/settings/models">Settings &gt; Models</a>
+                  <a href="/settings/models">{appPages['/settings/models']}</a>
                 </span>
               </Notice>
             )}

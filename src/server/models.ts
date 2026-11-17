@@ -39,6 +39,7 @@ import {
   routeModel,
 } from '../shared/models.ts';
 import { signInPage } from '../shared/sign-in-page.ts';
+import { appPages } from '../shared/app-links.ts';
 import { modelKeyError } from '../shared/model-keys.ts';
 import {
   agentModels,
@@ -246,7 +247,7 @@ function textCompanion(row: Pick<ModelRecord, 'provider' | 'method' | 'models'>)
 
 function missingTextCompanion() {
   return new ConnectionError(
-    'This audio model needs a text model on the same connection. Refresh its models or choose another model in Settings > Models.',
+    `This audio model needs a text model on the same connection. Refresh its models or choose another model in ${appPages['/settings/models']}.`,
   );
 }
 
@@ -280,12 +281,12 @@ function attention(row: Pick<ModelRecord, 'provider' | 'method' | 'managed' | 's
   const name = `the ${modelSource(row)} connection`;
   return new ConnectionError(
     row.status === 'loading'
-      ? `Load the models for ${name} in Settings > Models.`
+      ? `Load the models for ${name} in ${appPages['/settings/models']}.`
       : row.managed
-        ? `Refresh ${name} in Settings > Models.`
+        ? `Refresh ${name} in ${appPages['/settings/models']}.`
         : row.method === 'api_key'
-          ? `Remove ${name} and add it again in Settings > Models.`
-          : `Reconnect ${name} in Settings > Models.`,
+          ? `Remove ${name} and add it again in ${appPages['/settings/models']}.`
+          : `Reconnect ${name} in ${appPages['/settings/models']}.`,
   );
 }
 
@@ -501,7 +502,7 @@ export function createModelService(options: {
         ).get(modelId);
         if (automatic && failure && Date.now() < failure.retryAt)
           throw new ConnectionError(
-            `${modelProviderNames[row.provider]} failed the last request to ${modelId} (${failure.reason}). Automatic requests to this model are paused until a request succeeds. Check this connection in Settings > Models or ask again to make a new request.`,
+            `${modelProviderNames[row.provider]} failed the last request to ${modelId} (${failure.reason}). Automatic requests to this model are paused until a request succeeds. Check this connection in ${appPages['/settings/models']} or ask again to make a new request.`,
           );
         return async (error) => {
           if (!tag || closed) return;
@@ -641,7 +642,9 @@ export function createModelService(options: {
     const selected = auxiliary ? selection && { ...selection } : choice && { ...choice };
     const row = rows.find((row) => row.id === selected?.connectionId);
     if (!row || !selected)
-      throw new ConnectionError('Open Settings > Models. Connect a service and choose a model.');
+      throw new ConnectionError(
+        `Open ${appPages['/settings/models']}. Connect a service and choose a model.`,
+      );
     if (row.status !== 'connected') throw attention(row);
     const definition =
       (auxiliary
@@ -649,7 +652,7 @@ export function createModelService(options: {
         : undefined) ?? row.models.find((model) => model.choice.id === selected.modelId);
     if (!definition || (!definition.choice.efforts.includes(selected.effort) && !auxiliary))
       throw new ConnectionError(
-        `The selected model is unavailable on this connection (${row.provider} / ${selected.modelId}). Reload its models or choose another model in Settings > Models.`,
+        `The selected model is unavailable on this connection (${row.provider} / ${selected.modelId}). Reload its models or choose another model in ${appPages['/settings/models']}.`,
       );
     const companion = definition.choice.audio ? textCompanion(row) : undefined;
     if (definition.choice.audio && !companion) throw missingTextCompanion();
@@ -706,7 +709,7 @@ export function createModelService(options: {
     const place =
       work.follows === 'task' || work.follows === 'schedule'
         ? 'choose another model for it in Scheduled'
-        : 'choose another model in Settings > Models';
+        : `choose another model in ${appPages['/settings/models']}`;
     if (row && row.status !== 'connected') {
       const reason = attention(row).message;
       return new ConnectionError(
@@ -1194,7 +1197,9 @@ export function createModelService(options: {
         origin,
       );
       if (!work)
-        throw new ConnectionError('Open Settings > Models. Connect a service and choose a model.');
+        throw new ConnectionError(
+          `Open ${appPages['/settings/models']}. Connect a service and choose a model.`,
+        );
       if (work.follows === 'chat' || work.follows === 'light') return work;
       const row = rows.find((item) => item.id === work.selection.connectionId);
       const definition = row?.models.find((model) => model.choice.id === work.selection.modelId);

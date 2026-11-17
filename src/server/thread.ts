@@ -15,6 +15,7 @@ import {
 } from '../shared/answer-choices.ts';
 import { logFailure } from './failure-log.ts';
 import { modelFailureReason, modelQuotaFailure } from '../shared/model-quota.ts';
+import { appPages } from '../shared/app-links.ts';
 import { pendingAnswerChoicesSql } from './answer-choices.ts';
 import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
@@ -1264,7 +1265,7 @@ async function failTurn(
         ? `I was interrupted before I finished${work ? ` “${work}”` : ''}. Check anything I may have started before you ask me to continue.`
         : `I couldn't finish ${work ? `“${work}”` : 'this'}. ${error}${next ? ` ${next}` : ''}`;
   const message = modelFailure
-    ? `${body}\n\n[Change the model or check its connection in Settings > Models](/settings/models).`
+    ? `${body}\n\n[Change the model or check its connection in ${appPages['/settings/models']}](/settings/models).`
     : body;
   await transaction(async (client) => {
     if ((await lockThread(client)).id !== turn.thread_id) return;

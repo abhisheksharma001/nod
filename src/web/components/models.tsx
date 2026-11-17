@@ -23,6 +23,7 @@ import type {
   WorkUsage,
 } from '../../shared/models';
 import { modelKeyError } from '../../shared/model-keys';
+import { appPages } from '../../shared/app-links';
 import {
   modelProviderInfo,
   modelProviderNames,
@@ -1309,7 +1310,7 @@ export function ModelPicker({
         model &&
         connection?.status === 'reconnect' && (
           <a className="model-needs-reconnect" href="/settings/models">
-            Reconnect in Settings &gt; Models
+            Reconnect in {appPages['/settings/models']}
           </a>
         )}
       <Dialog

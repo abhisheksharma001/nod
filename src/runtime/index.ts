@@ -1,5 +1,6 @@
 import { presentationInputSchema, type Presentation } from '../shared/presentation.ts';
 import { proactiveUpdateSchema, sourceReadSchema } from '../shared/proactivity.ts';
+import { appPages } from '../shared/app-links.ts';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
@@ -1272,7 +1273,7 @@ export function createAgentRuntime(dependencies: {
       if (modelIncomplete && status === 'succeeded')
         throw new Error(
           modelIncomplete === 'context'
-            ? 'The model response was cut off at its context limit. Try a shorter instruction or choose a model with more context in Settings > Models.'
+            ? `The model response was cut off at its context limit. Try a shorter instruction or choose a model with more context in ${appPages['/settings/models']}.`
             : 'The model response was incomplete. Say continue to try again.',
         );
       if (stopped && status === 'succeeded') throw new Error('The turn was stopped.');

@@ -643,7 +643,9 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
           await replyWithoutTurn(
             client,
             { ...identity, sourceId, threadId, sentAt, text: '' },
-            () => ({ text: 'Connect a model service and choose a model in Settings → Models.' }),
+            () => ({
+              text: `Connect a model service and choose a model in ${appPages['/settings/models']}.`,
+            }),
           );
         }, pool);
         options.refresh?.();

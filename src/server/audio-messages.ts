@@ -11,6 +11,7 @@ import { transaction } from './transaction.ts';
 import { refresh } from './events.ts';
 import { SpeechSetupError } from './speech.ts';
 import type { SubmitMessageResponse } from '../shared/contracts.ts';
+import { appPages } from '../shared/app-links.ts';
 import { classifyVerificationReply, securityCodeIn } from '../shared/verification-code.ts';
 import { questionAnswerSchema } from '../shared/answer-choices.ts';
 import { messageTextLimit, messageTooLongError } from '../shared/message-limits.ts';
@@ -176,15 +177,14 @@ export function registerAudioMessages(app: FastifyInstance, dependencies: AppDep
             replyTurnId: replyTarget?.turn_id,
           };
         }
-        if (!speech || !speech.transcriptionConfigured)
-          throw new SpeechSetupError(
-            'Set up audio in Settings → Voice & audio. Choose free voices or connect a voice service.',
-          );
+        if (!speech || !speech.transcriptionConfigured) throw new SpeechSetupError();
         if (
           !(dependencies.configuration?.() ?? configuration()).llmReady &&
           !verificationRequests.length
         )
-          throw invalid('Connect an AI provider in Settings → Models before sending a message.');
+          throw invalid(
+            `Connect an AI provider in ${appPages['/settings/models']} before sending a message.`,
+          );
         if (
           (await client.query('SELECT 1 FROM messages WHERE id=$1', [input.clientMessageId]))
             .rowCount
@@ -245,7 +245,9 @@ export function registerAudioMessages(app: FastifyInstance, dependencies: AppDep
       if (verificationRequestId)
         throw privateConflict('This verification request is no longer available.');
       if (!(dependencies.configuration?.() ?? configuration()).llmReady)
-        throw invalid('Connect an AI provider in Settings → Models before sending a message.');
+        throw invalid(
+          `Connect an AI provider in ${appPages['/settings/models']} before sending a message.`,
+        );
       signal.throwIfAborted();
       submitting = true;
       const submitted = await (dependencies.submitMessage ?? submitUserMessage)(
