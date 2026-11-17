@@ -1285,7 +1285,7 @@ test(
       assert.equal(diagnostics.statusCode, 200);
       const diagnosticReport = JSON.parse(diagnostics.json().content);
       assert.equal(diagnosticReport.coverage.contentIncluded, true);
-      const failure = diagnosticReport.logs.find(
+      const failure = diagnosticReport.failures.find(
         (entry: any) => entry.data?.event === 'request_failed',
       );
       assert.ok(failure);
@@ -1308,11 +1308,16 @@ test(
       const journal = async () =>
         (
           await Promise.all(
-            (await readdir(logDirectory))
-              .filter((name) => name.endsWith('.jsonl'))
-              .map((name) => readFile(join(logDirectory, name), 'utf8')),
+            [logDirectory, `${logDirectory}-failures`].map(async (directory) =>
+              Promise.all(
+                (await readdir(directory))
+                  .filter((name) => name.endsWith('.jsonl'))
+                  .map((name) => readFile(join(directory, name), 'utf8')),
+              ),
+            ),
           )
         )
+          .flat()
           .join('')
           .trim()
           .split('\n')

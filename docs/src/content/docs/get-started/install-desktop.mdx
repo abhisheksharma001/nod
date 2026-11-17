@@ -167,6 +167,8 @@ Newer Nod builds show an in-app notice when an update finishes downloading. It n
 
 On Windows, the restart runs the new installer in the background and opens Nod again when it's done.
 
+Nod versions before 0.7.0 on Windows can't install their own updates. Restarting to update closes Nod without installing, and the next start offers the same update again. Quit Nod from the tray icon, then download and run the latest [Windows x64 installer](https://github.com/n8n-io/nod/releases/latest/download/nod-Setup-x64.exe). It installs over the old version and keeps your profile, keys and data. Later updates install from the app.
+
 Updating a connected desktop client does not update its server. Follow [Server operations](/deploy/server-operations/) to update the server separately.
 
 ## Where your data lives

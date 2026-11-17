@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { classifyVerificationReply, securityCodeIn } from '../shared/verification-code.ts';
 import { isMessageReaction } from '../shared/emoji.ts';
 import { transaction } from './transaction.ts';
-import { logFailure } from './failure-log.ts';
+import { logFailure, logRepeatedFailure } from './failure-log.ts';
 import { languageText } from './communication.ts';
 import { ChannelMediaFailure, type ChannelMedia } from './channel-media.ts';
 import type { WorkAdmission } from './work-admission.ts';
@@ -340,9 +340,12 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
         channel.error &&
         channel.error !== channels.find((previous) => previous.id === channel.id)?.error
       )
-        logFailure('channel_connection_failed', new MessagingConnectionError(channel.error), {
-          provider: channel.id,
-        });
+        logRepeatedFailure(
+          'channel_connection_failed',
+          `${channel.id}:${channel.error}`,
+          new MessagingConnectionError(channel.error),
+          { provider: channel.id },
+        );
     channels = transport.channels.map((channel) => ({
       ...channel,
       allowedSenderIds: [...channel.allowedSenderIds],
@@ -586,12 +589,18 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
   async function acceptMessage(message: InboundMessage, channelId: string) {
     const receiveSignal = receiving.signal;
     const parsed = messageSchema.safeParse(message);
-    if (!parsed.success || parsed.data.channelId !== channelId) return;
+    const dropped = (reason: string) =>
+      logRepeatedFailure('channel_inbound_dropped', `${channelId}:${reason}`, undefined, {
+        provider: channelId,
+        reason,
+      });
+    if (!parsed.success || parsed.data.channelId !== channelId) return dropped('invalid_message');
     const { accountId, senderId, messageId, threadId, sentAt, replyToMessageId } = parsed.data;
     let { text } = parsed.data;
     const identity = { provider: channelId, account_id: accountId, sender_id: senderId };
-    if (closed || replacing || !permitted(identity) || sentAt.getTime() > Date.now() + 300000)
-      return;
+    if (closed || replacing) return;
+    if (!permitted(identity)) return dropped('not_linked');
+    if (sentAt.getTime() > Date.now() + 300000) return dropped('future_timestamp');
     let media: Awaited<ReturnType<ChannelMedia['prepare']>> | undefined;
     try {
       const sourceId = `channel:${channelId}:${accountId}:${messageId}`;
@@ -1728,7 +1737,11 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
               cause instanceof MessagingConnectionError
                 ? cause.message
                 : 'Channels could not check for new messages. Check the channel setup.';
-            logFailure('channel_poll_failed', cause);
+            logRepeatedFailure(
+              'channel_poll_failed',
+              cause instanceof Error ? cause.message : String(cause),
+              cause,
+            );
           }
           const attempt = async (step: () => Promise<unknown>) => {
             try {

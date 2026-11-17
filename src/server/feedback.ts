@@ -6,7 +6,7 @@ import type { FeedbackDelivery, FeedbackEnvelope, FeedbackFile } from '../ports/
 import { snapshotAnalytics, type CaptureAnalytics } from './analytics.ts';
 import { parseFeedbackActivity, type FeedbackActivity } from '../shared/feedback-activity.ts';
 import { feedbackTechnicalContext } from './feedback-context.ts';
-import type { FeedbackClientError } from './bug-report.ts';
+import type { FeedbackClientError, FeedbackClientState } from './bug-report.ts';
 import {
   feedbackAttachmentMimeTypes,
   feedbackLimits,
@@ -47,6 +47,8 @@ const submission = z
   })
   .strict();
 
+const count = z.number().int().min(0).max(1_000_000);
+const age = z.number().int().min(0).max(31_536_000_000);
 const hash = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
 const fail = (message: string, statusCode: number) =>
   Object.assign(new Error(message), { statusCode });
@@ -93,6 +95,7 @@ export async function registerFeedback(
       activity: FeedbackActivity[],
       errors: FeedbackClientError[],
       errorsAvailable: boolean,
+      client?: FeedbackClientState,
     ): Promise<string>;
     analytics?: CaptureAnalytics;
   },
@@ -170,6 +173,25 @@ export async function registerFeedback(
           )
           .max(10)
           .optional(),
+        client: z
+          .object({
+            online: z.boolean(),
+            visibility: z.enum(['visible', 'hidden']),
+            stream: z.enum(['open', 'connecting', 'closed', 'unknown']),
+            lastEventAgeMs: age.nullable(),
+            streamReconnects: count,
+            savedMessages: count.nullable(),
+            renderedMessages: count.nullable(),
+            pendingTurn: z.boolean().nullable(),
+            viewport: z.object({ width: count, height: count }).strict(),
+            locale: z.string().regex(/^[A-Za-z0-9-]{1,35}$/),
+            timeZone: z.string().regex(/^[A-Za-z0-9_+\/-]{1,64}$/),
+            clockOffsetMs: z.number().int().min(-1e12).max(1e12).nullable(),
+            uptimeMs: age,
+          })
+          .partial()
+          .strict()
+          .optional(),
       })
       .strict()
       .parse(request.body ?? {});
@@ -177,6 +199,7 @@ export async function registerFeedback(
       parseFeedbackActivity(input.activity).map((row) => ({ ...row, source: 'app' })),
       input.errors ?? [],
       input.errorsAvailable ?? input.errors !== undefined,
+      input.client,
     );
     if (Buffer.byteLength(content) > feedbackLimits.reportBytes)
       throw fail('The diagnostic report is too large.', 413);

@@ -131,21 +131,32 @@ function Working({
   writing?: boolean;
   quiet?: boolean;
 }) {
-  const found = writing ? undefined : items.find((item) => !item.background && !item.taskId);
+  const found = items.find((item) => !item.background && !item.taskId);
   const chat = found?.doing === 'queued' ? undefined : found;
-  const thinking = Boolean(found) || (sending && !writing);
+  const thinking = !writing && (Boolean(found) || sending);
   const receipt = items.some((item) => !item.background && item.received)
     ? 'Got your message. I’ll read it after this step.'
     : null;
-  if (!thinking && !label && !receipt) return null;
+  if (!thinking && !label && !receipt && !found) return null;
   return (
-    <div className="thinking" role="status">
+    <div className="thinking" hidden={!thinking && !label && !receipt}>
       <NodGlyph size={28} mode="thinking" />
       <div className="working-details">
-        <span className="working-text">
-          {thinking ? <LiveLine item={chat} quiet={quiet} /> : (label ?? receipt)}
-        </span>
-        {thinking && receipt && <span className="working-receipt">{receipt}</span>}
+        <div className="working-text">
+          <div hidden={!thinking}>
+            <LiveLine item={chat} quiet={quiet && thinking} />
+          </div>
+          {!thinking && (
+            <span className="live-line-current" role="status">
+              {label ?? receipt}
+            </span>
+          )}
+        </div>
+        {thinking && receipt && (
+          <span className="working-receipt" role="status">
+            {receipt}
+          </span>
+        )}
       </div>
     </div>
   );
@@ -2260,6 +2271,7 @@ export function Chat({
                           ...(task.kind
                             ? { kind: task.kind === 'ongoing' ? 'ongoing' : 'immediate' }
                             : {}),
+                          origin: task.origin === 'common' ? 'common' : 'learned',
                           position,
                         });
                         void send(task.title, [], null, 'task_card');

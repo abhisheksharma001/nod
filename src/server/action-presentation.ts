@@ -238,6 +238,7 @@ export function approvalContent(
 }
 
 const tools: Record<string, string> = {
+  codemode: 'Ran code',
   bash: 'Ran a command',
   read: 'Read a file',
   write: 'Wrote a file',

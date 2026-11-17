@@ -13,6 +13,7 @@ import type {
   MessagingWebhookResult,
 } from '../../ports/messaging.ts';
 import { telegramSecret, telegramUserId } from '../../ports/channel-settings.ts';
+import { logRepeatedFailure } from '../../ports/failure-log.ts';
 import { MessagingConnectionError } from '../../ports/messaging.ts';
 import { telegramMessage, telegramPairing, telegramAttachments } from './telegram.ts';
 import { telegramText, whatsappText } from './format.ts';
@@ -335,6 +336,11 @@ export function createChatSdkTransport(
     status,
     body: { error: message },
   });
+  const dropped = (provider: string, reason: string) =>
+    logRepeatedFailure('channel_inbound_dropped', `${provider}:${reason}`, undefined, {
+      provider,
+      reason,
+    });
   const accepted = (
     messages: InboundMessage[] = [],
     reactions: InboundReaction[] = [],
@@ -538,16 +544,24 @@ export function createChatSdkTransport(
           );
         }
         const parsed = telegramMessage.safeParse(update.success ? update.data.message : undefined);
-        if (!parsed.success || String(parsed.data.from.id) !== String(parsed.data.chat.id))
+        if (!parsed.success || String(parsed.data.from.id) !== String(parsed.data.chat.id)) {
+          if (update.success && update.data.message !== undefined)
+            dropped('telegram', 'unsupported_message');
           return accepted();
+        }
         if (
           env.TELEGRAM_ALLOWED_USER_ID &&
           String(parsed.data.from.id) !== env.TELEGRAM_ALLOWED_USER_ID
-        )
+        ) {
+          dropped('telegram', 'unknown_sender');
           return accepted();
+        }
         const attachments = telegramAttachments(parsed.data, env.TELEGRAM_BOT_TOKEN!, mediaRequest);
         const text = parsed.data.text || parsed.data.caption || '';
-        if (!text && !attachments.length) return accepted();
+        if (!text && !attachments.length) {
+          dropped('telegram', 'unsupported_type');
+          return accepted();
+        }
         const start = /^\/start(?:\s+(\S+))?$/.exec(parsed.data.text);
         if (env.TELEGRAM_ALLOWED_USER_ID && start) return accepted();
         const replied = parsed.data.reply_to_message;
@@ -608,7 +622,16 @@ export function createChatSdkTransport(
                 continue;
               }
               const parsed = whatsappMessage.safeParse(raw);
-              if (!parsed.success) continue;
+              if (!parsed.success) {
+                dropped(
+                  'whatsapp',
+                  typeof (raw as { id?: unknown } | null)?.id === 'string' &&
+                    (raw as { id: string }).id
+                    ? 'unsupported_type'
+                    : 'missing_id',
+                );
+                continue;
+              }
               const message = whatsapp.parseMessage({
                 message: parsed.data,
                 phoneNumberId: accountId,

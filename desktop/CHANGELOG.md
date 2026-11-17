@@ -2,6 +2,45 @@
 
 Releases from before the rename to Nod are the `desktop-v*` [GitHub releases](https://github.com/n8n-io/nod/releases).
 
+## 0.8.3 - 2026-11-17
+
+### Fixes
+
+- **proactivity:** Don't start automatic preparation on a model without a price. [#990](https://github.com/n8n-io/nod/pull/990) (357f34d)
+- **pi:** Remove duplicate context budgeting. [commit](https://github.com/n8n-io/nod/commit/3017a9448fc96cc1bf95f60eb370c143e79f53f6) (3017a94)
+- **browser:** Pace handoff frames to display. [commit](https://github.com/n8n-io/nod/commit/6cebf4f0941cdae2f2f40f7cdbf61a4720944ec7) (6cebf4f)
+- **apps:** Start the email check time limit when the check runs. [#976](https://github.com/n8n-io/nod/pull/976) (990285a)
+- **agent:** Balance feedback during long tasks. [#975](https://github.com/n8n-io/nod/pull/975) (47cfee3)
+- **workspace:** Recover after an uncertain command and keep long self-hosted commands open. [#972](https://github.com/n8n-io/nod/pull/972) (64dd140)
+- **channels:** Accept the owner's WhatsApp messages sent from a private ID. [#974](https://github.com/n8n-io/nod/pull/974) (48970da)
+- **browser:** Open a profile locked by a replaced browser container. [#973](https://github.com/n8n-io/nod/pull/973) (78d9fb6)
+- **desktop:** Skip expired system certificates. [#971](https://github.com/n8n-io/nod/pull/971) (f43c22e)
+- **desktop:** Restart from the update notice without asking again. [#970](https://github.com/n8n-io/nod/pull/970) (f89047f)
+- **pi:** Send tool schemas that match JSON Schema draft 2020-12. [#968](https://github.com/n8n-io/nod/pull/968) (c892150)
+- **apps:** Sign connection service requests again when the computer clock is off. [#967](https://github.com/n8n-io/nod/pull/967) (c4816b1)
+
+### Performance
+
+- **ci:** Share PR setup and stage platform release checks. [#980](https://github.com/n8n-io/nod/pull/980) (7c65518)
+
+<details>
+<summary>Maintenance (2 changes)</summary>
+
+- **pi:** Pin that a long turn extends each request unchanged until Pi compacts. [#991](https://github.com/n8n-io/nod/pull/991) (adc3c06)
+- **channels:** Pin the Telegram download size limits. [commit](https://github.com/n8n-io/nod/commit/f5e288ca0117276058329069714cec49a26319c6) (f5e288c)
+
+</details>
+
+[Full changelog](https://github.com/n8n-io/nod/compare/nod-v0.8.2...adc3c0603d4847603df3fe2c0b5e701af6a2c07c)
+
+<details>
+<summary>Build details</summary>
+
+Source: `adc3c0603d4847603df3fe2c0b5e701af6a2c07c`
+Previous release: `nod-v0.8.2`
+
+</details>
+
 ## 0.8.2 - 2026-11-16
 
 ### Features

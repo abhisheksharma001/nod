@@ -40,6 +40,8 @@ Linux bundles include the runtime pack. The build allows at most two parts, each
 
 Desktop builds include the server source, built web files, production dependencies, required runtime files, and licenses. The server runs TypeScript through `tsx`.
 
+Mac release jobs install optional dependencies for their target CPU and ARM64. Intel jobs use x64 Node through Rosetta on Apple silicon runners. Bun selects its native ARM64 binary there, so both CPU variants must be available during installation. The packaged app still uses its target CPU.
+
 Builds exclude frontend source, duplicate public files, lockfiles, development package settings, source maps, and type declarations. Dependency tests, examples, build scripts, and unused TypeScript sources are also excluded. Files that a package declares as runtime entry points stay in the bundle. Speech source archives stay with their licenses.
 
 Packaged windows disable DevTools. The production menu excludes developer tools and force reload. It keeps standard reload, zoom, fullscreen, and onboarding replay. Source runs keep the development controls.
@@ -307,6 +309,8 @@ This is an ad-hoc signed local app, not a release. It reuses the cached workspac
 ## Build a Linux Flatpak
 
 The Linux app is a Flatpak preview with the runtime pack inside it. **Build Linux desktop** builds and checks the x64 package. The desktop release workflow calls it and includes its files in the release. You can also run it separately from **Actions** to get the `desktop-linux-x64` artifact. On pull requests, this check runs only for `desktop/flatpak/**`, `desktop/scripts/*linux*.mjs`, and `desktop/test/*linux*.test.mjs`. Shared runtime and build files use standard CI. Run the package workflow from **Actions** when those changes need a Linux package check.
+
+CI installs Flatpak and `flatpak-builder` from the Ubuntu package archive. It does not need an extra package source. The manifest installs Meson libraries in `/app/lib` so QEMU can find its local dependencies.
 
 CI installs the bundle and checks its server imports and native image library inside Flatpak. It does not verify a complete chat, secure storage, desktop integration, or KVM startup. Check those on a Linux desktop before wider distribution. Linux ARM builds are not published.
 

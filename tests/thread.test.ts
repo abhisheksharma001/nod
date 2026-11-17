@@ -7,7 +7,7 @@ import {
 } from '../src/shared/answer-choices.ts';
 import assert from 'node:assert/strict';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -11442,13 +11442,18 @@ test(
       CREATE TABLE app_connections(id uuid,owner_id text,slug text,account_id text,account_active boolean,revoked boolean,callback_expires timestamptz,triggers_enabled boolean,watch_failures integer,inbox_failed boolean,inbox_reconnect_required boolean,account_checked_at timestamptz,inbox_checked_at timestamptz,created_at timestamptz DEFAULT now());
       CREATE TABLE browser_connections(id uuid,owner_id text,state text,checked_at timestamptz,created_at timestamptz DEFAULT now());
       CREATE TABLE discovered_connections(id uuid,owner_id text,reconnect_required boolean,replaced_at timestamptz,paths jsonb,created_at timestamptz DEFAULT now());
-      CREATE TABLE model_connections(id uuid,owner_id text,provider text,method text,status text,managed boolean,created_at timestamptz DEFAULT now());
+      CREATE TABLE model_connections(id uuid,owner_id text,provider text,method text,status text,managed boolean,models jsonb,request_failures jsonb,created_at timestamptz DEFAULT now());
+      CREATE TABLE model_settings(owner_id text,selection jsonb,routes jsonb);
+      CREATE TABLE preferences(owner_id text,notification_rule text,time_zone text,quiet_start text,quiet_end text,quiet_hours_enabled boolean,locale text,hour_cycle text,rules text,speech_reply text,proactive_paused boolean,local_files_enabled boolean);
+      CREATE TABLE spending_limits(owner_id text,monthly_usd double precision,task_usd double precision,preparation_usd double precision);
+      CREATE TABLE channel_settings(owner_id text,provider text,enabled boolean,summary jsonb,updated_at timestamptz DEFAULT now());
       CREATE TABLE integration_events(id text,owner_id text,slug text,state text,created_at timestamptz DEFAULT now());
       CREATE TABLE schedules(id uuid,owner_id text,kind text,enabled boolean,delivery_channel text,next_run_at timestamptz,created_at timestamptz DEFAULT now());
       CREATE TABLE schedule_runs(id uuid,owner_id text,schedule_id uuid,turn_id uuid,created_at timestamptz DEFAULT now());
       CREATE TABLE channel_inbox(source_id text,owner_id text,provider text,state text,turn_id uuid,created_at timestamptz DEFAULT now());
       CREATE TABLE channel_outbox(source_id text,state text,reason text,updated_at timestamptz DEFAULT now());
     `);
+    let modelConnection = '';
     const ownerId = randomUUID();
     const otherOwner = randomUUID();
     const turnId = randomUUID();
@@ -11588,8 +11593,31 @@ test(
         ],
       );
       await f.pool.query(
-        `INSERT INTO model_connections(id,owner_id,provider,method,status,managed) VALUES($1,$2,$3,'api_key','reconnect',false)`,
-        [randomUUID(), owner, privateText],
+        `INSERT INTO model_connections(id,owner_id,provider,method,status,managed,models,request_failures) VALUES($1,$2,$3,'api_key','reconnect',false,$4,'{}')`,
+        [
+          (modelConnection = randomUUID()),
+          owner,
+          privateText,
+          JSON.stringify([
+            { id: 'qwen2.5-coder:7b', name: privateText, contextWindow: 8192, efforts: ['low'] },
+            { id: 'models/Marta Vidal/private.gguf', contextWindow: 4096 },
+            { id: 'C:/Users/owner/private.gguf', contextWindow: 4096 },
+            { id: 'customer-jane/private-model', contextWindow: 4096 },
+          ]),
+        ],
+      );
+      await f.pool.query(`INSERT INTO model_settings VALUES($1,$2,'{"background":"light"}')`, [
+        owner,
+        { connectionId: modelConnection, modelId: 'qwen2.5-coder:7b', effort: 'low' },
+      ]);
+      await f.pool.query(
+        `INSERT INTO preferences VALUES($1,$2,'Europe/Lisbon','22:00','08:00',true,'pt-PT','auto',$2,'auto',true,false)`,
+        [owner, privateText],
+      );
+      await f.pool.query(`INSERT INTO spending_limits VALUES($1,200,5,5)`, [owner]);
+      await f.pool.query(
+        `INSERT INTO channel_settings(owner_id,provider,enabled,summary) VALUES($1,'whatsapp',true,$2)`,
+        [owner, { accountName: privateText, linkMode: 'self-chat', connectionState: 'logged_out' }],
       );
       await f.pool.query(
         `INSERT INTO integration_events(id,owner_id,slug,state) VALUES($1,$2,'gmail','processing')`,
@@ -11626,11 +11654,33 @@ test(
       ownerId,
       sanitize: redactor.value,
     });
+    const failureJournal = await createFeedbackLog({
+      dataRoot: logRoot,
+      ownerId,
+      name: 'failures',
+      sanitize: redactor.value,
+    });
     t.after(async () => {
       await journal.close();
+      await failureJournal.close();
       await rm(logRoot, { recursive: true, force: true });
     });
+    await mkdir(join(logRoot, 'logs'));
+    await writeFile(
+      join(logRoot, 'logs', 'startup.log'),
+      `${new Date(Date.now() - 5000).toISOString()} update check result=offered version=9.9.9 for Marta Vidal\n`,
+    );
     const scope = { turnId, sessionId, runId: childRun, parentRunId: mainRun, callId };
+    for (let index = 0; index < 3; index++)
+      failureJournal.record(
+        'failure',
+        {
+          event: 'browser_bridge_failed',
+          error: new Error('bridge exited'),
+          context: { reason: 'exit', exitCode: 137, count: 2 },
+        },
+        scope,
+      );
     journal.record(
       'tool_start',
       {
@@ -11683,6 +11733,11 @@ test(
         },
       ],
       logs: () => journal.snapshot(),
+      failures: () => failureJournal.snapshot(),
+      dataRoot: logRoot,
+      trustModel: 'llm',
+      client: { stream: 'closed' as const, savedMessages: 4, renderedMessages: 3 },
+      environment: { NOD_OS_VERSION: '15.1.0', NOD_ELECTRON_VERSION: privateText },
       errors: [
         {
           type: 'render' as const,
@@ -11717,8 +11772,9 @@ test(
       'future-message',
     ])
       assert.ok(!encoded.includes(omitted), omitted);
-    assert.doesNotMatch(encoded, /\d{4}-\d{2}-\d{2}T/);
     const report = JSON.parse(encoded);
+    assert.doesNotMatch(encoded.replace(report.generatedAt, ''), /\d{4}-\d{2}-\d{2}T/);
+    assert.ok(Math.abs(Date.parse(report.generatedAt) - Date.now()) < 60_000);
     assert.equal(report.format, 'nod-feedback-report-v3');
     assert.equal(report.coverage.contentIncluded, true);
     assert.equal(report.coverage.redaction, 'best-effort');
@@ -11781,14 +11837,53 @@ test(
     );
     assert.equal(report.modelUsage.length, 1);
     assert.equal(report.modelUsage[0].runId, child.runId);
-    assert.equal(report.logs.length, 3);
+    assert.equal(report.logs.length, 2);
     assert.equal(report.logs[0].runId, child.runId);
     assert.equal(report.logs[0].parentRunId, child.parentRunId);
     assert.equal(report.logs[0].callId, report.logs[1].callId);
     assert.equal(report.logs[0].data.tool, 'apps');
     assert.equal(report.logs[0].data.input.query, 'Find the failed workflow');
     assert.equal(report.logs[1].data.output.statusCode, 503);
-    assert.match(report.logs[2].data.error.message, /Gmail fetch failed with HTTP 503/);
+    assert.equal(report.failures.length, 2);
+    const requestFailure = report.failures.find((row: any) => row.data.event === 'request_failed');
+    const bridgeFailure = report.failures.find(
+      (row: any) => row.data.event === 'browser_bridge_failed',
+    );
+    assert.match(requestFailure.data.error.message, /Gmail fetch failed with HTTP 503/);
+    assert.equal(requestFailure.count, 1);
+    assert.equal(bridgeFailure.data.context.exitCode, 137);
+    assert.equal(bridgeFailure.count, 6);
+    assert.equal(bridgeFailure.runId, child.runId);
+    assert.equal(report.startupLog.length, 1);
+    assert.match(report.startupLog[0].line, /^update check result=offered version=9\.9\.9/);
+    assert.ok(report.startupLog[0].ageMs >= 5000);
+    assert.equal(report.system.osVersion, '15.1.0');
+    assert.equal(report.system.electron, null);
+    assert.ok(report.system.memoryMb > 0);
+    assert.deepEqual(report.client, { stream: 'closed', savedMessages: 4, renderedMessages: 3 });
+    assert.deepEqual(report.modelSettings, [
+      {
+        selection: {
+          connection: report.modelConnections[0].id,
+          model: 'qwen2.5-coder:7b',
+          effort: 'low',
+        },
+        schedule: null,
+        background: 'light',
+      },
+    ]);
+    assert.deepEqual(report.modelConnections[0].models, [
+      { id: 'qwen2.5-coder:7b', contextWindow: 8192, images: false, efforts: ['low'] },
+      { id: null, contextWindow: 4096, images: false, efforts: [] },
+      { id: null, contextWindow: 4096, images: false, efforts: [] },
+      { id: null, contextWindow: 4096, images: false, efforts: [] },
+    ]);
+    assert.equal(report.modelUsageSummary[0].requests, 1);
+    assert.equal(report.settings[0].timeZone, 'Europe/Lisbon');
+    assert.equal(report.settings[0].notificationRuleSet, true);
+    assert.equal(report.settings[0].monthlyLimitUsd, 200);
+    assert.equal(report.channelSettings[0].linkMode, 'self-chat');
+    assert.equal(report.channelSettings[0].connectionState, 'logged_out');
     assert.equal(report.clientErrors.length, 1);
     assert.match(report.clientErrors[0].data.message, /Could not open account/);
     for (const input of [
@@ -11807,7 +11902,12 @@ test(
     assert.equal(report.modelUsage[0].durationMs, 4321);
     assert.equal(report.modelUsage[0].costUsd, 0.01234);
     assert.equal(report.modelUsage[0].estimateUsd, 0.04567);
-    assert.deepEqual(report.runtime, { provider: 'other', modelFamily: 'custom' });
+    assert.deepEqual(report.runtime, {
+      provider: 'other',
+      modelFamily: 'custom',
+      model: null,
+      trustModel: 'llm',
+    });
     assert.equal(report.environment.appVersion, '1.2.3');
     assert.equal(report.environment.appRelease, null);
     assert.equal(report.environment.platform, null);
@@ -11880,6 +11980,10 @@ test(
       assert.equal(fallback.coverage.redaction, 'unavailable');
       assert.equal(fallback.coverage.sections.clientErrors.status, 'unavailable');
       assert.equal(fallback.coverage.sections.logs.status, 'unavailable');
+      assert.equal(fallback.coverage.sections.failures.status, 'unavailable');
+      assert.equal(fallback.coverage.sections.startupLog.status, 'unavailable');
+      assert.deepEqual(fallback.failures, []);
+      assert.deepEqual(fallback.startupLog, []);
       assert.equal(readLogs, false);
       assert.deepEqual(fallback.clientErrors, []);
       assert.deepEqual(fallback.logs, []);
@@ -12348,7 +12452,7 @@ test(
         CREATE TABLE tasks(id uuid PRIMARY KEY, owner_id text NOT NULL, session_id uuid, title text, now_text text,
           message_id uuid, created_at timestamptz DEFAULT now());
         CREATE TABLE turn_events(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), turn_id uuid, type text, summary text DEFAULT '',
-          site text, call_id uuid, created_at timestamptz DEFAULT now());
+          site text, call_id uuid, run_id uuid, created_at timestamptz DEFAULT now());
         CREATE TABLE messages(id uuid PRIMARY KEY, owner_id text, turn_id uuid, role text, created_at timestamptz DEFAULT now())`);
       const { createActivity } = await import('../src/server/activity.ts');
       const owner = 'activity-fixture-owner';
@@ -12451,6 +12555,59 @@ test(
       item = await live();
       assert.equal(item.step, null);
       assert.ok(item.tool);
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary,site) VALUES($1,'tool_complete','apps','Gmail'),($1,'tool_complete','files','Local files')",
+        [chat],
+      );
+      const recentActions = (await live()).recent;
+      assert.ok(
+        recentActions?.some(
+          (entry) => entry.summary === 'Used a connected app' && entry.site === 'Gmail',
+        ),
+      );
+      assert.ok(
+        recentActions?.some(
+          (entry) => entry.summary === 'Handled local files' && entry.site === 'Local files',
+        ),
+      );
+      const mainRun = randomUUID();
+      const helperRun = randomUUID();
+      const recentCall = randomUUID();
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary,run_id) VALUES($1,'step','Checking the synthetic report',$2)",
+        [chat, mainRun],
+      );
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary,run_id) VALUES($1,'step','Checking a separate helper source',$2)",
+        [chat, helperRun],
+      );
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary,run_id,call_id) VALUES($1,'tool_start','read',$2,$3)",
+        [chat, mainRun, recentCall],
+      );
+      const completed = await pool.query<{ id: string }>(
+        "INSERT INTO turn_events(turn_id,type,summary,run_id,call_id) VALUES($1,'tool_complete','read',$2,$3) RETURNING id",
+        [chat, mainRun, recentCall],
+      );
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary) VALUES($1,'tool_failed','Synthetic failed operation'),($1,'tool_complete','set status')",
+        [chat],
+      );
+      item = await live();
+      assert.equal(item.recent?.length, 4);
+      assert.deepEqual(item.recent?.[0], {
+        id: completed.rows[0]!.id,
+        summary: 'Checking the synthetic report',
+        site: null,
+      });
+      assert.equal(
+        item.recent?.some((entry) => entry.summary.includes('failed')),
+        false,
+      );
+      assert.equal(
+        item.recent?.some((entry) => entry.summary === 'set status'),
+        false,
+      );
       const taskSession = randomUUID();
       const taskTurn = randomUUID();
       const observerTurn = randomUUID();
@@ -12468,6 +12625,32 @@ test(
       assert.equal(
         items.some((entry) => entry.turnId === observerTurn),
         false,
+      );
+      const foreignThread = randomUUID();
+      const foreignTurn = randomUUID();
+      await pool.query("INSERT INTO threads(id,owner_id) VALUES($1,'other-activity-owner')", [
+        foreignThread,
+      ]);
+      await pool.query(
+        "INSERT INTO turns(id,owner_id,thread_id,session_id,source,status,started_at) VALUES($1,'other-activity-owner',$2,$2,'user','running',now())",
+        [foreignTurn, foreignThread],
+      );
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary) VALUES($1,'tool_complete','Synthetic task operation'),($2,'tool_complete','Synthetic foreign operation')",
+        [taskTurn, foreignTurn],
+      );
+      const scoped = await activity.read();
+      assert.equal(
+        scoped.some((entry) => entry.turnId === foreignTurn),
+        false,
+      );
+      assert.equal(
+        scoped.find((entry) => entry.turnId === chat)?.recent?.[0]?.id,
+        completed.rows[0]!.id,
+      );
+      assert.equal(
+        scoped.find((entry) => entry.turnId === taskTurn)?.recent?.[0]?.summary,
+        'Synthetic task operation',
       );
     } finally {
       await pool.end();
@@ -12507,7 +12690,7 @@ test(
         CREATE TABLE tasks(id uuid PRIMARY KEY, owner_id text NOT NULL, session_id uuid, title text, now_text text,
           message_id uuid, created_at timestamptz DEFAULT now());
         CREATE TABLE turn_events(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), turn_id uuid, type text, summary text DEFAULT '',
-          site text, call_id uuid, created_at timestamptz DEFAULT now());
+          site text, call_id uuid, run_id uuid, created_at timestamptz DEFAULT now());
         CREATE TABLE messages(id uuid PRIMARY KEY, owner_id text, turn_id uuid, role text, created_at timestamptz DEFAULT now())`);
       const threadId = randomUUID();
       const scheduled = randomUUID();
