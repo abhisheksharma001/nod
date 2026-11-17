@@ -1499,6 +1499,110 @@ test('Telegram media keeps native replies and checks the sender before any downl
   assert.equal(requests.length, 0);
 });
 
+test('Telegram refusing a file with a 400 still delivers the reply and names the file, while an unclear failure stays unconfirmed', async () => {
+  const sent: { method: string; text?: string }[] = [];
+  let failure: { method: string; status: number } | undefined;
+  const respond = async (input: string | URL | Request, init?: RequestInit) => {
+    const method = String(input).split('/').at(-1)!;
+    const body = typeof init?.body === 'string' ? JSON.parse(init.body) : {};
+    sent.push({ method, text: body.text });
+    if (failure?.method === method)
+      return Response.json(
+        { ok: false, error_code: failure.status, description: 'Bad Request: fixture refusal' },
+        { status: failure.status },
+      );
+    return Response.json({
+      ok: true,
+      result: { message_id: sent.length + 100, date: 1, chat: { id: 123456, type: 'private' } },
+    });
+  };
+  const original = globalThis.fetch;
+  globalThis.fetch = respond as typeof fetch;
+  try {
+    const state = {
+      query: async () => ({ rows: [], rowCount: 0 }),
+      connect: async () => ({ query: async () => ({ rows: [], rowCount: 0 }), release() {} }),
+      on() {},
+      end: async () => {},
+    };
+    const transport = createChatSdkTransport(state as unknown as pg.Pool, fixtureEnv, {
+      fetch: respond,
+    });
+    const file = (name: string, mimeType: string, content: string | Buffer) => ({
+      name,
+      mimeType,
+      size: Buffer.from(content).length,
+      read: async () => new Uint8Array(Buffer.from(content)),
+    });
+    const contact =
+      'BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Synthetic Contact\r\nTEL:+34600000000\r\nEND:VCARD';
+    const cases = [
+      ['sendPhoto', file('page.png', 'image/png', Buffer.from('89504e470d0a1a0a', 'hex'))],
+      ['sendVoice', file('reply.ogg', 'audio/ogg', 'OggS fixture voice')],
+      ['sendContact', file('contact.vcf', 'text/vcard', contact)],
+    ] as const;
+    for (const [method, attachment] of cases) {
+      for (const status of [400, 502]) {
+        failure = { method, status };
+        sent.length = 0;
+        const notices: string[][] = [];
+        const post = transport.post({
+          channelId: 'telegram',
+          accountId: '987',
+          threadId: 'telegram:123456',
+          text: 'Here is the answer.',
+          attachments: [attachment],
+          async attachmentFailure(names) {
+            notices.push(names);
+            return `The file ${names[0]} is in Nod.`;
+          },
+        });
+        if (status === 400) {
+          const result = await post;
+          const messages = sent.filter((call) => call.method === 'sendMessage');
+          assert.ok(
+            messages.some((call) => call.text?.includes('Here is the answer')),
+            method,
+          );
+          assert.ok(
+            messages.some((call) => call.text?.includes('is in Nod')),
+            method,
+          );
+          assert.deepEqual(notices, [[attachment.name]], method);
+          assert.equal(result.ids?.length, messages.length, method);
+        } else {
+          await assert.rejects(post, /delivery was not confirmed/, method);
+          assert.deepEqual(notices, [], method);
+          assert.ok(
+            sent.every((call) => call.method !== 'sendMessage' || !call.text?.includes('in Nod')),
+            method,
+          );
+        }
+      }
+    }
+    failure = undefined;
+    sent.length = 0;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith('/sendPhoto')) throw new TypeError('fetch failed');
+      return respond(input, init);
+    }) as typeof fetch;
+    await assert.rejects(
+      transport.post({
+        channelId: 'telegram',
+        accountId: '987',
+        threadId: 'telegram:123456',
+        text: 'Here is the answer.',
+        attachments: [cases[0][1]],
+        attachmentFailure: async () => 'The file is in Nod.',
+      }),
+      /delivery was not confirmed/,
+    );
+    assert.ok(sent.every((call) => call.method !== 'sendMessage'));
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
 test('Telegram downloads stop at 20 MB whatever size the sender, Bot API or file server reports', async () => {
   const limit = 20 * 1024 * 1024;
   const message = telegramMessage.parse({
