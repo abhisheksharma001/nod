@@ -644,6 +644,8 @@ export function createDefaultAdapters(
             mode,
             allowedNumber: configured.WHATSAPP_ALLOWED_NUMBER,
             store: createChannelSessionStore({ pool, ownerId, keyStore }),
+            onDrop: (drop) =>
+              logFailure('channel_message_dropped', null, { provider: 'whatsapp', ...drop }),
           }),
         );
       },
@@ -1249,17 +1251,21 @@ async function initializeApplication(
     trash: adapters.trash,
     available: Boolean(adapters.trash),
   });
-  const preparationPaused = async () => {
+  const preparationPause = async () => {
     const prefs = await speechPreferences.get();
-    return prefs.proactivePaused || isQuietTime(prefs) || (await ledger.preparationLimit()).reached;
+    if (prefs.proactivePaused) return 'automatic preparation is paused';
+    if (isQuietTime(prefs)) return 'it is quiet hours';
+    if ((await ledger.preparationLimit()).reached)
+      return 'the monthly preparation allowance is reached';
   };
   const integrations = await createIntegrations(pool, {
     localFiles,
     mailCheck: async (...args) => {
-      if (await preparationPaused()) return args[0].map(() => undefined);
+      const pause = await preparationPause();
+      if (pause) return args[0].map(() => `background email checks wait because ${pause}`);
       return ledger.withPreparation(randomUUID(), () => mailCheck(...args));
     },
-    paused: preparationPaused,
+    paused: async () => Boolean(await preparationPause()),
     analytics: captureAnalytics,
     analyticsConsent,
     admission,

@@ -5992,6 +5992,170 @@ test('Anthropic continues a rebased Pi session with incomplete assistant blocks'
   assert.ok(sent.includes('redacted_thinking'));
 });
 
+test('a connected tool schema outside draft 2020-12 neither fails nor sticks to later Anthropic turns', async (t) => {
+  const { createServer } = await import('node:http');
+  const { Compile } = await import('typebox/compile');
+  const { Meta } = await import('typebox/schema');
+  const draft = Compile(Meta['https://json-schema.org/draft/2020-12/schema'] as never);
+  const replies: Array<Record<string, unknown>> = [
+    { type: 'tool_use', id: 'toolu_search', name: 'nod_tool_search', input: { query: 'board' } },
+    { type: 'text', text: 'Loaded.' },
+    { type: 'text', text: 'Second turn.' },
+  ];
+  const sent: Array<Record<string, any>> = [];
+  const schemas = (value: unknown): Array<Record<string, unknown>> =>
+    Array.isArray(value)
+      ? value.flatMap(schemas)
+      : value && typeof value === 'object'
+        ? Object.entries(value).flatMap(([key, item]) =>
+            key === 'input_schema' ? [item as Record<string, unknown>] : schemas(item),
+          )
+        : [];
+  const server = createServer((request, response) => {
+    const parts: Buffer[] = [];
+    request.on('data', (part) => parts.push(part));
+    request.on('end', () => {
+      const body = JSON.parse(Buffer.concat(parts).toString());
+      sent.push(body);
+      if (!schemas(body).every((schema) => draft.Check(schema))) {
+        response.writeHead(400, { 'content-type': 'application/json' });
+        response.end(
+          JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'invalid_request_error',
+              message:
+                'messages.3.content.0.tool.definition.input_schema: JSON schema is invalid. It must match JSON Schema draft 2020-12 (https://json-schema.org/draft/2020-12).',
+            },
+          }),
+        );
+        return;
+      }
+      const block = replies.shift()!;
+      const events = [
+        {
+          type: 'message_start',
+          message: {
+            id: 'synthetic-schema',
+            type: 'message',
+            role: 'assistant',
+            model: 'fixture-anthropic',
+            content: [],
+            stop_reason: null,
+            stop_sequence: null,
+            usage: { input_tokens: 10, output_tokens: 0 },
+          },
+        },
+        {
+          type: 'content_block_start',
+          index: 0,
+          content_block:
+            block.type === 'tool_use' ? { ...block, input: {} } : { ...block, text: '' },
+        },
+        {
+          type: 'content_block_delta',
+          index: 0,
+          delta:
+            block.type === 'tool_use'
+              ? { type: 'input_json_delta', partial_json: JSON.stringify(block.input) }
+              : { type: 'text_delta', text: block.text },
+        },
+        { type: 'content_block_stop', index: 0 },
+        {
+          type: 'message_delta',
+          delta: {
+            stop_reason: block.type === 'tool_use' ? 'tool_use' : 'end_turn',
+            stop_sequence: null,
+          },
+          usage: { output_tokens: 2 },
+        },
+        { type: 'message_stop' },
+      ];
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      response.end(
+        events
+          .map((event) => 'event: ' + event.type + '\ndata: ' + JSON.stringify(event) + '\n\n')
+          .join(''),
+      );
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const url = 'http://127.0.0.1:' + (server.address() as import('node:net').AddressInfo).port;
+  const access = smallContextAccess('compatible', 'fixture-anthropic', 200_000);
+  access.provider = 'anthropic';
+  access.read = async () => ({ type: 'api_key', key: 'synthetic-key' });
+  access.definition.spec = {
+    ...access.definition.spec,
+    provider: 'anthropic',
+    api: 'anthropic-messages',
+    baseUrl: url,
+    compat: { supportsMidConvoSystemMessages: true, supportsMidConvoToolChanges: true },
+  };
+  const directory = await mkdtemp(join(tmpdir(), 'nod-anthropic-schema-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const agent = createPiAgent({
+    provider: 'anthropic',
+    sessionRoot: directory,
+    resolve: async () => access,
+  });
+  t.after(() => agent.dispose());
+  const execution = fakeExecution(randomUUID());
+  const observed: AgentEvent[] = [];
+  const open = () =>
+    agent.open({
+      ...execution,
+      restricted: true,
+      systemPrompt: 'Use synthetic tools.',
+      workspace: recordingWorkspace().workspace,
+      runTool: async (_name, _params, run) => run(),
+      tools: [
+        {
+          name: 'mcp__synthetic__board_edit',
+          description: 'Synthetic board tool.',
+          deferred: { namespace: 'synthetic', description: 'Synthetic board server.' },
+          parameters: {
+            type: 'object',
+            properties: {
+              board: { type: 'string', minLength: 1 },
+              point: { type: 'array', items: [{ type: 'number' }, { type: 'number' }] },
+              scale: { type: 'number', minimum: 0, exclusiveMinimum: true },
+            },
+            required: ['board'],
+          } as never,
+          execute: async () => ({ content: [{ type: 'text', text: 'Synthetic result.' }] }),
+        },
+      ],
+      shouldStop: () => false,
+      onEvent: (event) => observed.push(event),
+    });
+  for (const prompt of ['Open the synthetic board.', 'Continue.']) {
+    const session = await open();
+    await session.prompt(prompt, []);
+    await session.dispose();
+  }
+  assert.deepEqual(
+    observed.flatMap((event) => (event.type === 'error' ? [event] : [])),
+    [],
+  );
+  assert.deepEqual(
+    observed.flatMap((event) => (event.type === 'final' ? [event.text] : [])),
+    ['Loaded.', 'Second turn.'],
+  );
+  const added = schemas(sent.at(-1)!.messages).find(
+    (schema) => (schema.properties as Record<string, unknown> | undefined)?.board,
+  );
+  assert.deepEqual(added, {
+    type: 'object',
+    properties: {
+      board: { type: 'string', minLength: 1 },
+      point: { type: 'array' },
+      scale: { type: 'number', minimum: 0 },
+    },
+    required: ['board'],
+  });
+});
+
 test('full 32k Pi sessions distinguish context exhaustion from output truncation on continue', async (t) => {
   const { createServer } = await import('node:http');
   const { createPiModelBackend } = await import('../src/providers/pi/models.ts');

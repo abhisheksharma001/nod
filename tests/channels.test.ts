@@ -17,7 +17,10 @@ import { locksTable } from '../src/server/locks.ts';
 import { createChatSdkTransport } from '../src/providers/chat-sdk/index.ts';
 import { MessagingAttachmentError, type MessagingTransport } from '../src/ports/messaging.ts';
 import { telegramAttachments, telegramMessage } from '../src/providers/chat-sdk/telegram.ts';
-import { createWhatsAppLinkedTransport } from '../src/providers/chat-sdk/whatsapp.ts';
+import {
+  createWhatsAppLinkedTransport,
+  type WhatsAppDrop,
+} from '../src/providers/chat-sdk/whatsapp.ts';
 import { combineMessagingTransports } from '../src/providers/chat-sdk/combined.ts';
 import { createChannelSessionStore } from '../src/server/channel-session.ts';
 import { createChannelMedia } from '../src/server/channel-media.ts';
@@ -668,6 +671,7 @@ test(
             quoted: unknown;
           }[] = [];
           const collected: InboundMessage[] = [];
+          const dropped: WhatsAppDrop[] = [];
           const reacted: string[] = [];
           const presence: string[][] = [];
           let downloads = 0;
@@ -685,6 +689,7 @@ test(
           const accountId = `linked:${own}`;
           const jid = `${owner}@s.whatsapp.net`;
           const store = createChannelSessionStore({ pool, ownerId: `fixture-${mode}`, keyStore });
+          let lidLookups = 0;
           const createSocket: Factory = (config) => {
             if (failConnect)
               throw Object.assign(new Error('synthetic-private-connect-error'), {
@@ -697,8 +702,14 @@ test(
               user: { id: `${own}:1@s.whatsapp.net`, lid: '55555555@lid', name: 'Fixture' },
               signalRepository: {
                 lidMapping: {
-                  getPNForLID: async (lid: string) =>
-                    ['55555555@lid', '66666666@lid'].includes(lid) ? jid : null,
+                  getPNForLID: async (lid: string) => {
+                    if (lid === '99999999@lid') throw new Error('Synthetic mapping failure.');
+                    return ['55555555@lid', '66666666@lid'].includes(lid) ? jid : null;
+                  },
+                  getLIDForPN: async (pn: string) => {
+                    if (++lidLookups === 2) throw new Error('Synthetic lookup failure.');
+                    return pn === jid ? '77777777@lid' : null;
+                  },
                 },
               },
               end: () => {},
@@ -759,6 +770,7 @@ test(
               },
               createSocket,
               download,
+              onDrop: (drop) => dropped.push(drop),
             });
           let transport = open();
           try {
@@ -819,6 +831,9 @@ test(
                   },
                 },
                 envelope('lid', '55555555@lid'),
+                envelope('unmapped-lid', '77777777@lid'),
+                envelope('unmapped-intruder', '88888888@lid', false),
+                envelope('unmapped-stranger', '99999999@lid', false),
                 ...(mode === 'self-chat'
                   ? [
                       {
@@ -850,8 +865,22 @@ test(
             );
             assert.deepEqual(
               collected.map((message) => message.messageId),
-              ['owner', 'image', 'quoted', 'lid'],
+              mode === 'bot'
+                ? ['owner', 'image', 'quoted', 'lid', 'unmapped-lid']
+                : ['owner', 'image', 'quoted', 'lid'],
             );
+            if (mode === 'bot') assert.equal(collected[4].threadId, '77777777@lid');
+            assert.deepEqual(
+              dropped.filter((drop) => drop.addressing === 'lid'),
+              mode === 'bot'
+                ? [
+                    { reason: 'lid_lookup_failed', mode: 'bot', addressing: 'lid', suppressed: 0 },
+                    { reason: 'sender_unmatched', mode: 'bot', addressing: 'lid', suppressed: 0 },
+                  ]
+                : [{ reason: 'self_chat_mismatch', mode: 'own', addressing: 'lid', suppressed: 0 }],
+            );
+            assert.ok(dropped.some((drop) => drop.reason === 'resend_ignored'));
+            assert.doesNotMatch(JSON.stringify(dropped), /\d{5,}|@/);
             assert.equal(collected[2].replyToMessageId, 'task-prompt');
             assert.deepEqual(reacted, ['task-prompt']);
             assert.equal(downloads, 0);
@@ -936,6 +965,10 @@ test(
               collected.push(message);
             });
             const shared = collected.slice(-3);
+            assert.equal(
+              new Set(dropped.map((drop) => `${drop.reason}:${drop.addressing}`)).size,
+              dropped.length,
+            );
             assert.deepEqual(
               shared.map((message) => message.attachments![0].source),
               ['sticker', 'location', 'contact'],

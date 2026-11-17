@@ -1340,7 +1340,10 @@ test('unavailable decisions avoid ledger reads and retain dynamic availability a
     { reads, writes, resolutions, requests },
     { reads: 0, writes: 0, resolutions: 0, requests: 0 },
   );
-  assert.deepEqual(await checkMail(emails, AbortSignal.abort()), Array.from({ length: 100 }));
+  assert.deepEqual(
+    await checkMail(emails, AbortSignal.abort()),
+    Array<string>(100).fill('the read was stopped before its check finished'),
+  );
   assert.equal(availabilityReads - beforeAvailability, 1);
   assert.equal(curatorRequests, 100);
 
@@ -1352,7 +1355,9 @@ test('unavailable decisions avoid ledger reads and retain dynamic availability a
     { reads: 1, writes: 1, resolutions: 1, requests: 1 },
   );
   spent = 1;
-  assert.deepEqual(await checkMail([request.input.email]), [undefined]);
+  assert.deepEqual(await checkMail([request.input.email]), [
+    'This month’s spending limit is reached.',
+  ]);
   assert.equal(curatorRequests, 100);
   assert.deepEqual(
     { reads, writes, resolutions, requests },
@@ -1439,7 +1444,11 @@ test('decision requests revalidate capability and cancellation after resolving c
       if (stop === 'configuration') configured = false;
       if (stop === 'cancel') controller.abort();
       release();
-      assert.deepEqual(await result, [undefined]);
+      assert.deepEqual(await result, [
+        stop === 'cancel'
+          ? 'the read was stopped before its check finished'
+          : 'the check model gave no valid answer',
+      ]);
       await new Promise((resolve) => setImmediate(resolve));
       assert.equal(calls, 0);
       assert.equal(fallback, 0);

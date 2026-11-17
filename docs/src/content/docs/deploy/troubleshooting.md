@@ -117,6 +117,10 @@ Quit Nod and open it again. If the error continues, restart Windows. Keep your a
 
 To start over, select **Remove all data…** in the **Nod** menu. Nod deletes your profile and private computer, then restarts and opens setup. See [Remove Nod](/get-started/install-desktop/#remove-nod) for what it keeps.
 
+### Windows keeps offering the same update
+
+Nod versions before 0.7.0 on Windows can't install their own updates. Quit Nod from the tray icon, then run the latest installer as described in [Update Nod](/get-started/install-desktop/#update-nod). It keeps your profile, keys and data. Don't uninstall Nod or delete its folders first.
+
 ### Windows says WSL is missing
 
 Select **Install WSL** in Nod, approve the administrator request, restart the PC and open Nod again. A device policy can block WSL installation.

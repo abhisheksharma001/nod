@@ -213,6 +213,8 @@ Pi's `codemode` tool runs model-written JavaScript in a QuickJS sandbox with no 
 
 Each tool of a connected MCP server becomes its own Pi tool, named `mcp__<server>__<tool>`, with the server's own description and input schema. These tools are deferred: the model loads the ones it needs with `tool_search` or calls them from codemode, so a server with dozens of tools doesn't fill every request. Each server's own guide to its tools reaches Pi inside an `untrusted_tool_result` block, as data that never grants permission.
 
+Anthropic rejects a whole request when one tool schema doesn't match JSON Schema draft 2020-12. Some servers still use older forms, such as a list of schemas in `items` or `exclusiveMinimum: true`. Before each model request, Nod removes each keyword that doesn't match draft 2020-12 from the schemas of every tool Pi declares, including tools loaded earlier in the conversation. The rest of each schema stays as the server wrote it. The MCP server still checks its own input.
+
 Nod keeps one MCP connection per account and address for a minute after its last call, caches each server's tool list for ten minutes and waits up to ten minutes for one call.
 
 When a known tool list expires, a new turn uses the last successful list while Nod refreshes it. It does not wait for that refresh. The first load still waits for the server. Explicit tool searches wait for a current list. Each turn checks the connected accounts again, and each tool call checks its account binding and permission before it runs.

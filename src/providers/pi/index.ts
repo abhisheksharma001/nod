@@ -57,6 +57,7 @@ import { agentModels } from '../../shared/model-defaults.ts';
 import type { ModelSelection } from '../../shared/models.ts';
 import { createSandbox, workspaceOutputs } from './sandbox.ts';
 import { untrustedBlock } from '../../shared/untrusted.ts';
+import { draft2020Schema } from '../../shared/json-schema.ts';
 import { isPublicAddress, publicLookup } from '../agent-browser/network.ts';
 
 function isFinalAnswer(signature: string | undefined) {
@@ -354,6 +355,22 @@ function ownerContextCopies(ownerContext: string | undefined) {
       );
     });
   };
+}
+
+function draft2020Tools(pi: ExtensionAPI) {
+  pi.on('context_with_system', ({ messages }) => ({
+    messages: messages.map((message) =>
+      message.role === 'system' && message.toolsAdded
+        ? {
+            ...message,
+            toolsAdded: message.toolsAdded.map((tool) => ({
+              ...tool,
+              parameters: draft2020Schema(tool.parameters) as typeof tool.parameters,
+            })),
+          }
+        : message,
+    ),
+  }));
 }
 
 function recentImages(pi: ExtensionAPI) {
@@ -745,6 +762,7 @@ export function createPiAgent(options: {
               ]
             : []),
           recentImages,
+          draft2020Tools,
           audioContext(manager, readsNativeAudio(model) && Boolean(input.readAudio)),
           threadPromptCache(input.threadId),
           ...(keepCache || scheduleCache
