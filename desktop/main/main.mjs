@@ -1621,6 +1621,20 @@ function showConnectionSettings() {
   return showSettings('server', true);
 }
 
+function remoteConnectionFailure(error) {
+  const code = [error?.cause?.code, error?.code].find(
+    (value) => typeof value === 'string' && /^[A-Z][A-Z0-9_]{1,63}$/.test(value),
+  );
+  const prefix = 'Could not reach your server';
+  if (error?.name === 'TimeoutError')
+    return `${prefix}: no answer in 10 seconds. Check the address and that the server is running.`;
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN')
+    return `${prefix}: the address could not be found (${code}). Check the address.`;
+  if (code && /CERT|SELF_SIGNED|UNABLE_TO_VERIFY/.test(code))
+    return `${prefix}: its certificate was not accepted (${code}). Check its HTTPS certificate.`;
+  return `${prefix}${code ? ` (${code})` : ''}. Check its address and HTTPS certificate.`;
+}
+
 async function checkRemoteConnection(connection) {
   const url = serverOrigin(connection.url);
   if (typeof connection.token !== 'string' || !/^[A-Za-z0-9_-]{43,}$/.test(connection.token))
@@ -1633,17 +1647,18 @@ async function checkRemoteConnection(connection) {
       redirect: 'error',
       signal: AbortSignal.timeout(10000),
     });
-  } catch {
-    throw new Error('Could not reach your server. Check its address and HTTPS certificate.');
+  } catch (error) {
+    throw new Error(remoteConnectionFailure(error));
   }
   if (response.status === 401 || response.status === 403)
     throw new Error('Your server rejected this token. Check its address and authentication token.');
+  if (!response.ok)
+    throw new Error(`This address did not respond as a Nod server (HTTP ${response.status}).`);
   let account;
   try {
     account = await response.json();
   } catch {}
   if (
-    !response.ok ||
     !account ||
     typeof account.user?.id !== 'string' ||
     !account.user.id ||
