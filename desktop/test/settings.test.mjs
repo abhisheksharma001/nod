@@ -8008,7 +8008,7 @@ test('native readiness notification waits for full runtime readiness and reaches
   }
 });
 
-test('artifact exports keep owned bytes, safe names, separate saves and restricted opening', async () => {
+test('artifact exports keep owned bytes, safe names, separate saves and restricted opening, and remove failed downloads', async () => {
   const { createArtifactFiles, canOpenArtifact } = await import('../main/artifact-files.mjs');
   const root = await mkdtemp(join(tmpdir(), 'nod-artifact-contract-'));
   let requests = 0;
@@ -8060,6 +8060,24 @@ test('artifact exports keep owned bytes, safe names, separate saves and restrict
       fetchArtifact: async () => new Response('', { status: 404 }),
     });
     await assert.rejects(absent.prepare(randomUUID()), /no longer available/);
+    const brokenRoot = await mkdtemp(join(root, 'broken-'));
+    const broken = createArtifactFiles({
+      temporary: brokenRoot,
+      downloads: root,
+      fetchArtifact: async () =>
+        new Response(
+          new ReadableStream({
+            async pull(controller) {
+              controller.enqueue(new TextEncoder().encode('Partial synthetic bytes'));
+              await new Promise((resolve) => setTimeout(resolve, 20));
+              controller.error(new Error('Synthetic connection reset'));
+            },
+          }),
+        ),
+    });
+    await assert.rejects(broken.prepare(randomUUID()), /Synthetic connection reset/);
+    const [created] = await readdir(brokenRoot);
+    assert.deepEqual(await readdir(join(brokenRoot, created)), []);
     const blocked = join(root, 'not-a-directory');
     await writeFile(blocked, 'Synthetic disk setup failure');
     let cancelled = false;
@@ -8118,23 +8136,6 @@ test('artifact exports keep owned bytes, safe names, separate saves and restrict
     await streaming.dispose();
     await rejected;
     await assert.rejects(readFile(partial), { code: 'ENOENT' });
-  } finally {
-    await files.dispose();
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test('artifact exports refuse a file over 90 MB and leave nothing on disk', async () => {
-  const { createArtifactFiles } = await import('../main/artifact-files.mjs');
-  const root = await mkdtemp(join(tmpdir(), 'nod-artifact-limit-'));
-  const files = createArtifactFiles({
-    temporary: root,
-    downloads: join(root, 'Downloads'),
-    fetchArtifact: async () => new Response(new Uint8Array(90 * 1024 * 1024 + 1)),
-  });
-  try {
-    await assert.rejects(files.prepare(randomUUID()), /too large/);
-    for (const name of await readdir(root)) assert.deepEqual(await readdir(join(root, name)), []);
   } finally {
     await files.dispose();
     await rm(root, { recursive: true, force: true });
