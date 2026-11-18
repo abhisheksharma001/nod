@@ -8059,6 +8059,84 @@ test('chat shows pending sends and active work before a model step', async () =>
   assert.equal(result.exitCode, 0, result.stdout + result.stderr);
 });
 
+test('chat keeps the model recovery notice when Try again fails', async () => {
+  const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+    timeoutMs: 20_000,
+    input: String.raw`
+      import assert from 'node:assert/strict';
+      import { JSDOM } from 'jsdom';
+      const dom = new JSDOM('<!doctype html><div id="root"></div>', {
+        url: 'https://nod.fixture.invalid', pretendToBeVisual: true,
+      });
+      Object.assign(globalThis, {
+        window: dom.window, document: dom.window.document,
+        IS_REACT_ACT_ENVIRONMENT: true, localStorage: dom.window.localStorage,
+        getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
+        requestAnimationFrame: dom.window.requestAnimationFrame.bind(dom.window),
+        cancelAnimationFrame: dom.window.cancelAnimationFrame.bind(dom.window),
+      });
+      for (const name of ['Node', 'NodeFilter', 'Element', 'HTMLElement', 'HTMLInputElement',
+        'HTMLButtonElement', 'MutationObserver', 'Event', 'KeyboardEvent', 'CustomEvent', 'DOMParser'])
+        globalThis[name] = dom.window[name];
+      Object.defineProperty(globalThis, 'navigator', { configurable: true, value: dom.window.navigator });
+      window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
+      HTMLElement.prototype.scrollTo = () => {};
+      HTMLElement.prototype.scrollIntoView = () => {};
+      const sends = [];
+      globalThis.fetch = async (path, options = {}) => {
+        if (path === '/api/apps') return Response.json([]);
+        if (path === '/api/trust') return Response.json({});
+        if (path === '/api/speech') return Response.json({ transcription: true });
+        if (path === '/api/onboarding/introduction') return Response.json({ messageId: null });
+        assert.equal(path, '/api/messages');
+        sends.push(JSON.parse(options.body));
+        return Response.json({ error: 'Synthetic unavailable request' }, { status: 503 });
+      };
+      const { createElement, act } = await import('react');
+      const { createRoot } = await import('react-dom/client');
+      const { Chat } = await import('./src/web/pages/chat.tsx');
+      const root = createRoot(document.getElementById('root'));
+      const state = {
+        threadId: 'synthetic-thread', turns: [], activity: [], tasks: [],
+        verificationRequests: [], configuration: { llmReady: true },
+        messages: [
+          { id: 'synthetic-request', role: 'user', text: 'Synthetic request', attachments: [],
+            turnId: 'synthetic-turn', createdAt: '2026-10-26T12:00:00Z' },
+          { id: 'synthetic-failure', role: 'assistant', text: 'Synthetic failure', attachments: [],
+            turnId: 'synthetic-turn', streamId: 'model-failure:synthetic-turn',
+            createdAt: '2026-10-26T12:00:01Z' },
+        ],
+      };
+      const tryAgain = () => Array.from(document.querySelectorAll('button'))
+        .find(button => button.textContent.trim() === 'Try again');
+      const settle = async check => {
+        for (let i = 0; i < 100 && !check(); i++)
+          await act(async () => new Promise(resolve => setTimeout(resolve, 10)));
+        assert.ok(check(), 'Expected the retry to settle');
+      };
+      try {
+        await act(async () => root.render(createElement(Chat, {
+          ownerId: 'synthetic-owner', state, streams: {}, refresh: async () => {},
+        })));
+        assert.ok(tryAgain());
+        await act(async () => tryAgain().click());
+        await settle(() => sends.length === 1);
+        await act(async () => new Promise(resolve => setTimeout(resolve, 50)));
+        assert.equal(sends[0].text, 'Synthetic request');
+        assert.ok(document.body.textContent.includes('Synthetic unavailable request'));
+        assert.ok(tryAgain(), 'Try again should stay after a failed retry');
+        assert.equal(tryAgain().disabled, false);
+        await act(async () => tryAgain().click());
+        await settle(() => sends.length === 2);
+      } finally {
+        await act(async () => root.unmount());
+        dom.window.close();
+      }
+    `,
+  });
+  assert.equal(result.exitCode, 0, result.stdout + result.stderr);
+});
+
 test('analytics follow visible Settings sections, Apps tabs and the Scheduled page', async () => {
   const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
     timeoutMs: 20_000,
