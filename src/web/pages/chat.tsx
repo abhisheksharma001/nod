@@ -1230,8 +1230,12 @@ export function Chat({
             effort: selection.effort,
           }),
         });
-      if (failedRequest) await send(failedRequest, [], null);
+      if (failedRequest) {
+        const result = await send(failedRequest, [], null);
+        if (!result.sent) setRecovered(undefined);
+      }
     } catch (error) {
+      setRecovered(undefined);
       setError(errorMessage(error));
     } finally {
       setRecovering(false);
