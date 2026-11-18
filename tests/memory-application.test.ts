@@ -896,6 +896,32 @@ test('memory notes keep their line breaks from every writer while other control 
     ),
     { applied: [], rejected: ['quote'] },
   );
+  for (const [said, quoted] of [
+    ['I\u2019m allergic to peanuts', "I'm allergic to peanuts"],
+    ["I'm allergic to peanuts", 'I\u2019m allergic to peanuts'],
+    ['Call it \u201cthe shed\u201d', 'Call it "the shed"'],
+  ])
+    assert.deepEqual(
+      applyOps(
+        emptyTree(),
+        [add('Allergic to peanuts', quoted)],
+        [{ id: ids[1], text: said }],
+        '2026-02-01T00:00:00.000Z',
+        'stated',
+      ).rejected,
+      [],
+      said,
+    );
+  assert.deepEqual(
+    applyOps(
+      emptyTree(),
+      [add('Allergic to peanuts', "I'm allergic to cashews")],
+      [{ id: ids[1], text: 'I\u2019m allergic to peanuts' }],
+      '2026-02-01T00:00:00.000Z',
+      'stated',
+    ).rejected,
+    ['quote'],
+  );
   assert.deepEqual(
     applyOps(
       emptyTree(),
