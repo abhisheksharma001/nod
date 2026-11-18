@@ -1947,6 +1947,18 @@ test('documentation search ranks sections, bounds reads and cannot read files ou
   assert.equal(calls, 0);
 });
 
+test('documentation search finds words at the edges of list items and quoted paragraphs', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'nod-documentation-blocks-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(
+    join(root, 'guide.md'),
+    '---\ntitle: Guide\n---\n## Steps\n\n- Install the app\n- Zebra mode enables quickly\n\n> First quoted paragraph ends here\n>\n> Walrus starts the second\n\nRe**set** works.',
+  );
+  const docs = createDocumentation(root);
+  for (const word of ['app', 'zebra', 'here', 'walrus', 'reset'])
+    assert.equal((await docs.search(word))[0]?.id, 'guide#steps', word);
+});
+
 test('text chat uses an untrusted image description, keeps owner text and counts initial and steered image spend', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'nod-image-input-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
