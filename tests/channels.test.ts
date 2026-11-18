@@ -6059,3 +6059,52 @@ test(
     );
   },
 );
+
+test('Telegram keeps a long code block a code block when the reply is split', async () => {
+  const lines = Array.from(
+    { length: 200 },
+    (_, index) => `def __init__(self): return *args  # line ${index}`,
+  );
+  const sent: string[] = [];
+  const empty = { rows: [], rowCount: 0 };
+  const pool = {
+    query: async () => empty,
+    connect: async () => ({ query: async () => empty, release() {} }),
+    on() {},
+    end: async () => {},
+  } as unknown as pg.Pool;
+  const fakeFetch: typeof fetch = async (input, init) => {
+    const method = String(input).split('/').at(-1)!;
+    if (method === 'getMe')
+      return Response.json({
+        ok: true,
+        result: { id: 987, is_bot: true, first_name: 'Fixture', username: 'fixture_bot' },
+      });
+    sent.push(JSON.parse(String(init?.body)).text);
+    return Response.json({
+      ok: true,
+      result: { message_id: 500, date: 1, chat: { id: 123456, type: 'private' } },
+    });
+  };
+  const transport = createChatSdkTransport(pool, fixtureEnv, { fetch: fakeFetch });
+  const original = globalThis.fetch;
+  globalThis.fetch = fakeFetch;
+  try {
+    await transport.post({
+      channelId: 'telegram',
+      accountId: '987',
+      threadId: 'telegram:123456',
+      text: `Here:\n\n\`\`\`ts\n${lines.join('\n')}\n\`\`\``,
+    });
+  } finally {
+    globalThis.fetch = original;
+  }
+  assert.ok(sent.length > 1);
+  const bodies = sent.map((text) => {
+    assert.ok(text.length <= 4096);
+    const body = /```ts\n([\s\S]*)\n```$/.exec(text);
+    assert.ok(body, text.slice(0, 80));
+    return body[1];
+  });
+  assert.deepEqual(bodies.join('\n').split('\n'), lines);
+});
