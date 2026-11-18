@@ -269,15 +269,26 @@ const whatsappEnvelope = z.object({
   ),
 });
 
+function openFence(text: string) {
+  let tag: string | undefined;
+  for (const line of text.split('\n')) {
+    if (tag === undefined) {
+      const match = /^ {0,3}```([^`]*)$/.exec(line);
+      if (match) tag = match[1].trim().split(/\s/)[0].slice(0, 20);
+    } else if (/^ {0,3}```\s*$/.test(line)) tag = undefined;
+  }
+  return tag;
+}
+
 function chunks(text: string, limit = telegramTextLimit) {
   const parts: string[] = [];
   let rest = text;
   const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
-  while (rest.length > limit) {
-    const slice = rest.slice(0, limit);
+  const cutAt = (size: number) => {
+    const slice = rest.slice(0, size);
     let cut = slice.lastIndexOf('\n\n');
-    if (cut < limit / 2) cut = slice.lastIndexOf('\n');
-    if (cut < limit / 2) cut = limit;
+    if (cut < size / 2) cut = slice.lastIndexOf('\n');
+    if (cut < size / 2) cut = size;
     let boundary = 0;
     for (const { index, segment } of graphemes.segment(rest)) {
       if (index + segment.length > cut) break;
@@ -286,8 +297,21 @@ function chunks(text: string, limit = telegramTextLimit) {
     cut = boundary || cut;
     const last = rest.charCodeAt(cut - 1);
     if (last >= 0xd800 && last <= 0xdbff) cut--;
-    parts.push(rest.slice(0, cut).trimEnd());
-    rest = rest.slice(cut).trimStart();
+    return cut;
+  };
+  while (rest.length > limit) {
+    let cut = cutAt(limit);
+    let tag = openFence(rest.slice(0, cut));
+    if (tag !== undefined) {
+      cut = cutAt(limit - 4);
+      tag = openFence(rest.slice(0, cut));
+    }
+    const part = rest.slice(0, cut).trimEnd();
+    parts.push(tag === undefined ? part : `${part}\n\`\`\``);
+    rest =
+      tag === undefined
+        ? rest.slice(cut).trimStart()
+        : `\`\`\`${tag}\n${rest.slice(cut).replace(/^\n+/, '')}`;
   }
   return rest ? [...parts, rest] : parts;
 }
