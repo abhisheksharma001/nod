@@ -39,12 +39,14 @@ test('speech settings explicitly refresh account voices and keep other voices us
   let key = 'fixture-private-elevenlabs-key';
   let calls = 0;
   let unavailable = false;
+  let rejected = false;
   const provider = createElevenLabsSpeechProvider({
     apiKey: async () => key,
     configured: () => true,
     fetch: async (input) => {
       assert.equal(new URL(String(input)).pathname, '/v2/voices');
       calls++;
+      if (rejected) return new Response('fixture-private-elevenlabs-key', { status: 401 });
       return unavailable
         ? new Response('fixture-private-elevenlabs-key', { status: 503 })
         : Response.json({
@@ -118,6 +120,22 @@ test('speech settings explicitly refresh account voices and keep other voices us
   assert.equal(healthyPreview.statusCode, 200);
   assert.equal(healthyPreview.body, 'synthetic preview');
   assert.equal(calls, 3);
+  rejected = true;
+  const reason = await provider.refreshVoices!(undefined, true).then(
+    () => assert.fail('The provider accepted a rejected key.'),
+    (error: Error) => error.message,
+  );
+  assert.equal(calls, 4);
+  const denied = await app.inject({
+    method: 'POST',
+    url: '/api/speech/voices/refresh',
+    payload: {},
+  });
+  assert.equal(denied.statusCode, 200);
+  assert.equal(calls, 5);
+  assert.equal(denied.json().voicesError, reason);
+  assert.notEqual(denied.json().voicesError, failed.json().voicesError);
+  assert.doesNotMatch(denied.body, /fixture-(private|rotated)-elevenlabs-key/);
 });
 
 test('speech previews reject unavailable voices, serialize generation and release cancelled requests', async (t) => {
