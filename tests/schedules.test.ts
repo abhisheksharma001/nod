@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import Fastify from 'fastify';
 import pg from 'pg';
-import type { Job } from 'pg-boss';
+import { PgBoss, type Job } from 'pg-boss';
 import { z } from 'zod';
 import type { InboundMessage, MessagingTransport } from '../src/ports/messaging.ts';
 import type {
@@ -12,6 +12,7 @@ import type {
   ScheduleRun,
   TaskDetail,
 } from '../src/shared/contracts.ts';
+import { createSchedules } from '../src/server/schedules.ts';
 import {
   captureOwnerInstructions,
   mergeOwnerInstructions,
@@ -2378,4 +2379,29 @@ test('waiting scheduled runs open their pending question without starting anothe
   assert.deepEqual(mutations, expectedMutations);
   assert.deepEqual(asked, []);
   assert.deepEqual(focused, [{ messageId: questionId }, { messageId: resumedQuestionId }]);
+});
+
+test('schedules reject time zones the rest of the app cannot format', () => {
+  const schedules = createSchedules({
+    pool: {} as never,
+    ownerId: 'local-development',
+    scheduler: new PgBoss('postgres://nod:nod@127.0.0.1:1/nod'),
+    enqueueTurn: (async () => {}) as never,
+    refresh() {},
+  });
+  const create = (timeZone: string) =>
+    schedules.validateCreate({
+      title: 'Morning brief',
+      prompt: 'Summarise my day.',
+      kind: 'recurring',
+      cron: '0 9 * * *',
+      timeZone,
+    });
+  for (const timeZone of ['UTC+5', 'UTC+05:30', 'Local', 'system'])
+    assert.throws(
+      () => create(timeZone),
+      { message: 'Choose a valid time zone.', statusCode: 400 },
+      timeZone,
+    );
+  for (const timeZone of ['Europe/Lisbon', 'UTC']) assert.doesNotThrow(() => create(timeZone));
 });
