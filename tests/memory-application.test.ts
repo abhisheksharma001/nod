@@ -1019,6 +1019,21 @@ test('repair archives expired, stale and duplicate entries, keeps distinct numbe
   assert.equal(repair(tree, now), 0);
 });
 
+test('repair keeps notes that differ only in Devanagari vowel signs but merges Latin accent twins', () => {
+  const tree = treeOf(
+    entry({ slug: 'son', text: 'उसका बेटा स्कूल जाता है' }),
+    entry({ slug: 'daughter', text: 'उसकी बेटी स्कूल जाती है' }),
+    entry({ slug: 'cafe', text: 'Likes the café on the corner.' }),
+    entry({ slug: 'cafe-plain', text: 'Likes the cafe on the corner.' }),
+  );
+  assert.equal(repair(tree, new Date('2026-06-01T00:00:00.000Z')), 1);
+  assert.deepEqual(tree.entries.map((item) => item.slug).sort(), ['cafe', 'daughter', 'son']);
+  assert.deepEqual(
+    tree.archive.map((item) => [item.slug, item.reason]),
+    [['cafe-plain', 'duplicate']],
+  );
+});
+
 test('style learning sends only the owner’s own sent text and keeps one replaceable entry', async (t) => {
   const requests: Parameters<MemoryCurator['curate']>[0][] = [];
   let reply: unknown = {
