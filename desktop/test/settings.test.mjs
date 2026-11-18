@@ -917,7 +917,10 @@ async function runningDesktop(
         this.bounds = { ...bounds };
       }
       setBackgroundColor() {}
-      setTitleBarOverlay() {}
+      setTitleBarOverlay(overlay) {
+        if (!this.options.titleBarOverlay) throw new Error('Titlebar overlay is not enabled');
+        this.overlay = overlay;
+      }
       destroy() {
         this.destroyed = true;
         this.visible = false;
@@ -3972,6 +3975,8 @@ test('native settings reject foreign windows, subframes, AI credentials, and web
     paymentURL,
   );
   assert.equal(window.webContents.openWindow({ url: 'file:///synthetic' }).action, 'deny');
+  const popup = new window.constructor({ show: false });
+  window.webContents.emit('did-create-window', popup);
   const event = { sender: window.webContents, senderFrame: frame };
   const invoke = (channel, target, ...args) =>
     Promise.resolve().then(() => f.handlers.get(channel)(target, ...args));
@@ -4015,6 +4020,9 @@ test('native settings reject foreign windows, subframes, AI credentials, and web
   assert.equal(serialized.includes(vaultCiphertext), false);
   await save({ theme: 'dark', launchAtLogin: true });
   assert.equal((await f.storage.store.get()).launchAtLogin, true);
+  assert.ok(window.overlay);
+  assert.equal(popup.overlay, undefined);
+  assert.ok(popup.sent.some(([channel]) => channel === 'nod:preferences'));
   await invoke('nod:preferences:theme', event, 'light');
   assert.equal((await f.storage.store.get()).theme, 'light');
   await invoke('nod:external', event, 'https://example.test/');
