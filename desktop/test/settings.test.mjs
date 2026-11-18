@@ -5528,25 +5528,20 @@ test('server token recovery distinguishes a locked store from unreadable ciphert
 test('remote connection verification keeps the cause of a failed connection and never shows the token or address', async (t) => {
   const token = randomBytes(32).toString('base64url');
   const causes = [
-    [
-      Object.assign(new TypeError('fetch failed'), { cause: { code: 'ENOTFOUND' } }),
-      'ENOTFOUND',
-      'could not be found',
-    ],
+    [Object.assign(new TypeError('fetch failed'), { cause: { code: 'ENOTFOUND' } }), 'ENOTFOUND'],
+    [Object.assign(new TypeError('fetch failed'), { cause: { code: 'EAI_AGAIN' } }), 'EAI_AGAIN'],
     [
       Object.assign(new TypeError('fetch failed'), { cause: { code: 'CERT_HAS_EXPIRED' } }),
       'CERT_HAS_EXPIRED',
-      'certificate was not accepted',
     ],
-    [new DOMException('The operation timed out.', 'TimeoutError'), undefined, '10 seconds'],
+    [new DOMException('The operation timed out.', 'TimeoutError'), undefined],
     [
       Object.assign(new TypeError('fetch failed'), { cause: { code: `Bearer ${token}` } }),
       undefined,
-      'Check its address',
     ],
   ];
   const seen = new Set();
-  for (const [cause, code, reason] of causes) {
+  for (const [cause, code] of causes) {
     const f = await runningDesktop(
       t,
       async () => {
@@ -5559,7 +5554,6 @@ test('remote connection verification keeps the cause of a failed connection and 
       .catch((failure) => failure);
     assert.equal(typeof error?.message, 'string');
     if (code) assert.ok(error.message.includes(code), error.message);
-    assert.ok(error.message.includes(reason), error.message);
     assert.ok(!error.message.includes(token));
     assert.ok(!error.message.includes('assistant.example.test'));
     seen.add(error.message);

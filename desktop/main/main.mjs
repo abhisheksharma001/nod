@@ -1628,8 +1628,10 @@ function remoteConnectionFailure(error) {
   const prefix = 'Could not reach your server';
   if (error?.name === 'TimeoutError')
     return `${prefix}: no answer in 10 seconds. Check the address and that the server is running.`;
-  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN')
+  if (code === 'ENOTFOUND')
     return `${prefix}: the address could not be found (${code}). Check the address.`;
+  if (code === 'EAI_AGAIN')
+    return `${prefix}: the address could not be looked up right now (${code}). Try again, or check your network and DNS.`;
   if (code && /CERT|SELF_SIGNED|UNABLE_TO_VERIFY/.test(code))
     return `${prefix}: its certificate was not accepted (${code}). Check its HTTPS certificate.`;
   return `${prefix}${code ? ` (${code})` : ''}. Check its address and HTTPS certificate.`;
