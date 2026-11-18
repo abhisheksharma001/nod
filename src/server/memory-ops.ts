@@ -19,6 +19,8 @@ import {
   type Tree,
 } from './memory-tree.ts';
 
+const marks = (value: string) => value.replace(/[“”«»„]/g, '"').replace(/[‘’‚]/g, "'");
+
 const ordinals = z.array(z.number().int().min(1).max(40)).min(1);
 
 const reflectOp = z.discriminatedUnion('op', [
@@ -82,7 +84,7 @@ export function applyOps(
     ...ops.filter(({ op }) => op === 'add'),
   ]) {
     const cited = op.m.flatMap((n) => messages[n - 1] ?? []);
-    const quoted = cited.filter((m) => fold(m.text).includes(fold(op.quote)));
+    const quoted = cited.filter((m) => fold(marks(m.text)).includes(fold(marks(op.quote))));
     if (cited.length !== op.m.length || !quoted.length || !fold(op.quote).trim()) {
       rejected.push('quote');
       continue;
