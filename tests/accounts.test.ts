@@ -275,6 +275,39 @@ test('About accepts multiple choices and records only confirmed sharing', async 
   await clickChoice(profileScopes, 'work');
   await clickChoice(workRoles, 'agency');
   await clickChoice(workRoles, 'engineering');
+  const openOther = [
+    ...dom.window.document.querySelectorAll<HTMLButtonElement>('.ob-chips .ob-chip'),
+  ].find((button) => button.textContent?.trim() === 'Something else');
+  assert.ok(openOther);
+  await act(async () => openOther.click());
+  const other = dom.window.document.querySelector<HTMLInputElement>(
+    'input[aria-label="Something else"]',
+  );
+  assert.ok(other);
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, 'value')?.set?.call(
+      other,
+      'にほんご',
+    );
+    other.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+  });
+  await act(async () => {
+    other.dispatchEvent(
+      new dom.window.KeyboardEvent('keydown', {
+        key: 'Enter',
+        keyCode: 229,
+        isComposing: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+  });
+  assert.equal(readStored<{ current: string }>('about')?.current, 'roles');
+  await act(async () =>
+    dom.window.document
+      .querySelector<HTMLButtonElement>('button[aria-label="Clear something else"]')!
+      .click(),
+  );
   await primary();
   await clickChoice(profileWhoFor, 'clients');
   await clickChoice(profileCompanySizes, '2_10');
