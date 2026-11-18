@@ -25,6 +25,7 @@ import { waitingTurnSql } from './turn-chain.ts';
 import type { WorkConsumers } from './work-admission.ts';
 import type { CaptureAnalytics } from './analytics.ts';
 import { logFailure } from './failure-log.ts';
+import { ianaTimeZone } from './preferences.ts';
 import { lockKey } from './locks.ts';
 import {
   mergeOwnerInstructions,
@@ -224,6 +225,7 @@ export function createSchedules(dependencies: ScheduleDependencies) {
   ) => (shared ? operation(shared) : cancellationTransaction(operation, pool));
 
   function validateTiming(input: z.infer<typeof timingSchema>, enabled: boolean) {
+    if (!ianaTimeZone(input.timeZone)) throw invalid('Choose a valid time zone.');
     try {
       scheduler.previewSchedule('0 0 * * *', { tz: input.timeZone, count: 1 });
     } catch {
