@@ -133,7 +133,7 @@ function senderApps(addresses: string[], own: string[]) {
   return found;
 }
 
-function masked(text: string) {
+export function masked(text: string) {
   return text
     .replace(/https?:\/\/\S+/g, '[link]')
     .replace(/[A-Z0-9._%+-]+@[A-Z0-9-]+(?:\.[A-Z0-9-]+)*\.[A-Z]{2,}/gi, '[email]')
