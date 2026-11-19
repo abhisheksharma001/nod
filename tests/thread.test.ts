@@ -14523,6 +14523,10 @@ test('the onboarding brief masks each link and keeps the fields after it', async
   assert.deepEqual(JSON.parse(masked(JSON.stringify({ items: [event, event] }))), {
     items: [event, event].map((item) => ({ ...item, htmlLink: '[link]' })),
   });
+  const textResult = { data: { text: JSON.stringify({ items: [event, event] }) } };
+  assert.deepEqual(JSON.parse(masked(JSON.stringify(textResult))), {
+    data: { text: { items: [event, event].map((item) => ({ ...item, htmlLink: '[link]' })) } },
+  });
   const quoted = { note: 'Open https://files.example.test/a"b?token=zzz then reply', next: 'kept' };
   const brief = masked(JSON.stringify(quoted));
   assert.deepEqual(JSON.parse(brief), { note: 'Open [link] then reply', next: 'kept' });
