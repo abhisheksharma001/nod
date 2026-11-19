@@ -184,6 +184,14 @@ export async function initializeDatabase() {
     ALTER TABLE preferences ADD COLUMN IF NOT EXISTS computer_keep_out text[] NOT NULL DEFAULT '{}';
     CREATE INDEX IF NOT EXISTS messages_owner_time ON messages(owner_id,created_at);
     CREATE INDEX IF NOT EXISTS messages_thread_time ON messages(thread_id,created_at);
+    CREATE TABLE IF NOT EXISTS draft_instructions (
+      id uuid PRIMARY KEY, owner_id text NOT NULL, thread_id uuid NOT NULL REFERENCES threads(id),
+      turn_id uuid NOT NULL REFERENCES turns(id), task_id uuid, connection_id uuid NOT NULL,
+      binding text NOT NULL, draft_id text, source_ids uuid[] NOT NULL,
+      target jsonb NOT NULL, complete boolean NOT NULL DEFAULT false,
+      created_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS draft_instructions_scope ON draft_instructions(owner_id,thread_id,connection_id);
     CREATE INDEX IF NOT EXISTS messages_turn_time ON messages(turn_id,created_at);
     CREATE INDEX IF NOT EXISTS messages_attachments ON messages USING gin (attachments jsonb_path_ops);
     CREATE INDEX IF NOT EXISTS messages_text_search ON messages USING gin (to_tsvector('english',text));

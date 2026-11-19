@@ -622,7 +622,8 @@ test(
           id: 'fixture', configured: true,
           curate: async ({ input }) => input.purpose === 'confirmation'
             ? { text: 'Create this schedule?', action: 'Create schedule' }
-            : input.purpose === 'confirmation_review' ? { valid: true } : { run: false },
+            : input.purpose === 'confirmation_review' ? { valid: true }
+            : input.purpose === 'review_requirement' ? { review: 'clear' } : { run: false },
         };
         const transport = createChatSdkTransport(pool, { TELEGRAM_ENABLED: 'true', TELEGRAM_BOT_TOKEN: '987:fixture-not-live', TELEGRAM_ALLOWED_USER_ID: '123456', TELEGRAM_WEBHOOK_SECRET_TOKEN: 'fixture-webhook-secret-32-characters' });
         let application;

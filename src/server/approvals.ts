@@ -722,7 +722,10 @@ export async function createApprovals(
         const presentation = await describe(
           {
             turn: { ...turn },
-            ...(replacesInstruction && instructionChange ? { channel: existing.channel } : {}),
+            ...((replacesInstruction && instructionChange) ||
+            (details && JSON.parse(details).completeMessageReview === true)
+              ? { channel: existing.channel }
+              : {}),
             action,
             args: JSON.parse(encoded),
             ...(details || (replacesInstruction && instructionChange)
@@ -806,7 +809,7 @@ export async function createApprovals(
       return { cached: false as const, approval, question, source: inspected.source };
     };
     const proposal =
-      options.expectedChatRevision !== undefined
+      options.expectedChatRevision !== undefined || options.validate !== undefined
         ? await transaction(
             async (client) => {
               if ((await lockThread(client)).id !== turn.threadId)

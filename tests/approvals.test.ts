@@ -55,6 +55,9 @@ import { MessageText } from '../src/web/components/message.tsx';
 import { createE2eCurators } from '../scripts/e2e-curators.ts';
 import { createIntegrationFixture } from '../scripts/e2e-fixtures.ts';
 import { createPiMemoryCurator } from '../src/providers/pi/memory-curator.ts';
+import { createDecisionModel } from '../src/providers/decisions.ts';
+import { appTools, appToolArgs } from '../src/server/app-reads.ts';
+import { captureOwnerInstructions } from '../src/server/owner-instructions.ts';
 import { createIntegrations } from '../src/server/integrations.ts';
 import { createChatSdkTransport } from '../src/providers/chat-sdk/index.ts';
 
@@ -307,6 +310,67 @@ test('an ordinary message format failure makes no claim about an action', async 
       return true;
     },
   );
+});
+
+test('a complete email approval refuses a hidden sender identity', async () => {
+  let calls = 0;
+  const communication = createCommunication({
+    pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
+    ownerId: 'synthetic-owner',
+    review: async (_instructions, input) => {
+      calls++;
+      return Object(input).purpose === 'confirmation_review'
+        ? { valid: true }
+        : { text: 'Send this synthetic email?', action: 'Send email' };
+    },
+  });
+  const proposal = {
+    turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
+    channel: 'web',
+    action: 'GMAIL_SEND_EMAIL',
+    args: {
+      recipient_email: 'recipient@example.test',
+      subject: 'Synthetic sender check',
+      body: 'Synthetic message.',
+    },
+    details: {
+      completeMessageReview: true,
+      account: { name: 'Gmail', identity: 'sender@example.test' },
+    },
+  };
+  const visible = await communication.describe(proposal);
+  assert.ok(visible.question.includes('sender@example.test'));
+  assert.equal(calls, 2);
+  calls = 0;
+  proposal.details.account.identity = `ghp_${'synthetic'.repeat(4)}@example.test`;
+  await assert.rejects(communication.describe(proposal), /hidden values|sender/);
+  assert.equal(calls, 0);
+});
+
+test('a complete email approval refuses an empty recipient', async () => {
+  const communication = createCommunication({
+    pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
+    ownerId: 'synthetic-owner',
+    review: async (_instructions, input) =>
+      Object(input).purpose === 'confirmation_review'
+        ? { valid: true }
+        : { text: 'Send this synthetic email?', action: 'Send email' },
+  });
+  for (const key of ['recipient_email', 'to'])
+    for (const value of ['', '   ', [], ['', ' ']])
+      await assert.rejects(
+        communication.describe({
+          turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
+          channel: 'web',
+          action: 'GMAIL_SEND_EMAIL',
+          args: { [key]: value, subject: 'Synthetic recipient check', body: 'Synthetic message.' },
+          details: {
+            completeMessageReview: true,
+            account: { name: 'Gmail', identity: 'sender@example.test' },
+          },
+        }),
+        /cannot identify the message recipient/,
+      );
 });
 
 test('local file confirmation reviews the visible path and rejects a different path', async (t) => {
@@ -2334,6 +2398,8 @@ test(
       const tasks = createTasks({ pool: db.pool, ownerId });
       await tasks.initialize();
       tasks.registerRoutes(app);
+      const { createTriage } = await import('../src/server/triage.ts');
+      createTriage({ signal: async () => {}, due: async () => {} }).registerRoutes(app);
       app.get('/api/fixture-error', async () => {
         throw new Error('fixture-private-key');
       });
@@ -2372,6 +2438,7 @@ test(
         pool: db.pool,
         ownerId,
         review: async (instructions, input) => {
+          if (Object(input).purpose === 'review_requirement') return { review: 'clear' };
           if ('expiredConfirmation' in input && 'reply' in input)
             return {
               retiredReply:
@@ -2481,7 +2548,8 @@ test(
         verdict: Awaited<ReturnType<typeof trust.check>>,
         expected: Record<string, unknown>,
       ) => {
-        const { chatRevision, instructionRevision, ...result } = verdict;
+        const { chatRevision, instructionRevision, validate, ...result } = verdict;
+        assert.equal(typeof validate, 'function');
         assert.deepEqual(result, expected);
       };
       const email = (to: string) => ({
@@ -3270,19 +3338,37 @@ test(
           const entered = deferred();
           const release = deferred();
           let preferenceReads = 0;
+          const intercept = async (
+            run: (...args: Parameters<typeof db.pool.query>) => ReturnType<typeof db.pool.query>,
+            args: Parameters<typeof db.pool.query>,
+          ) => {
+            if (
+              typeof args[0] === 'string' &&
+              args[0].includes('SELECT notification_rule,rules') &&
+              ++preferenceReads === 2
+            ) {
+              entered.resolve();
+              await release.promise;
+            }
+            return run(...args);
+          };
           const pool = new Proxy(db.pool, {
             get(target, property) {
               if (property === 'query')
-                return async (...args: Parameters<typeof db.pool.query>) => {
-                  if (
-                    typeof args[0] === 'string' &&
-                    args[0].includes('SELECT notification_rule,rules') &&
-                    ++preferenceReads === 2
-                  ) {
-                    entered.resolve();
-                    await release.promise;
-                  }
-                  return target.query(...args);
+                return (...args: Parameters<typeof db.pool.query>) =>
+                  intercept(target.query.bind(target), args);
+              if (property === 'connect')
+                return async () => {
+                  const client = await target.connect();
+                  return new Proxy(client, {
+                    get(connection, key) {
+                      if (key === 'query')
+                        return (...args: Parameters<typeof db.pool.query>) =>
+                          intercept(connection.query.bind(connection), args);
+                      const value = Reflect.get(connection, key);
+                      return typeof value === 'function' ? value.bind(connection) : value;
+                    },
+                  });
                 };
               const value = Reflect.get(target, property);
               return typeof value === 'function' ? value.bind(target) : value;
@@ -3291,7 +3377,10 @@ test(
           const checking = createTrust({
             pool,
             ownerId,
-            review: async (_instructions, input) => ({ run: true, because: cite(input) }),
+            review: async (_instructions, input) =>
+              Object(input).purpose === 'review_requirement'
+                ? { review: 'clear' }
+                : { run: true, because: cite(input) },
           });
           const args = email('ana@example.test');
           const before = calls.length;
@@ -3313,6 +3402,587 @@ test(
           await finish(turn.turnId, 'cancelled');
         },
       );
+      await t.test(
+        'an old implicit draft reply retains restrictions without granting permission',
+        async () => {
+          const original = `Draft the synthetic email. Show it before sending. ${randomUUID()}`;
+          const channel = `synthetic-anchor-${randomUUID()}`;
+          const earlier = await begin(original, { channel });
+          const assistantId = randomUUID();
+          await db.pool.query(
+            "INSERT INTO messages(id,owner_id,thread_id,turn_id,role,text) VALUES($1,$2,$3,$4,'assistant','Synthetic old draft.')",
+            [assistantId, ownerId, earlier.threadId, earlier.turnId],
+          );
+          await finish(earlier.turnId, 'succeeded');
+          const correction = 'Change the ending, then send it.';
+          const current = await begin(correction, { channel });
+          await db.pool.query(
+            'UPDATE messages m SET turn_id=u.id FROM turns u WHERE u.id=ANY($1::uuid[]) AND m.id=u.message_id',
+            [[earlier.turnId, current.turnId]],
+          );
+          await db.pool.query(
+            "UPDATE messages SET created_at=created_at-interval '2 days' WHERE turn_id=$1",
+            [earlier.turnId],
+          );
+          const capture = () =>
+            captureOwnerInstructions(
+              db.pool,
+              ownerId,
+              current.threadId,
+              [],
+              null,
+              new Date(Date.now() - 86_400_000),
+              current.turnId,
+            );
+          try {
+            const check = async () => {
+              const retained = (await capture())?.evidence.messages.find(
+                (message) => message.text === original,
+              );
+              assert.ok(retained);
+              assert.equal(retained.canAuthorize, false);
+            };
+            await check();
+            const checker = createTrust({
+              pool: db.pool,
+              ownerId,
+              review: async (_instructions, input) =>
+                Object(input).purpose === 'review_requirement'
+                  ? {
+                      review: Object(input).userMessages.some(
+                        (message: { text: string }) => message.text === original,
+                      )
+                        ? 'required'
+                        : 'clear',
+                    }
+                  : { run: true, because: correction },
+            });
+            await assert.rejects(
+              checker.check(current, 'NOD_browser', {
+                page: 'https://mail.example.test/compose',
+                control: { name: 'Send' },
+              }),
+              /complete message/,
+            );
+            await db.pool.query('UPDATE messages SET reply_to_message_id=$2 WHERE turn_id=$1', [
+              current.turnId,
+              assistantId,
+            ]);
+            await check();
+          } finally {
+            await finish(current.turnId, 'cancelled');
+          }
+        },
+      );
+
+      await t.test(
+        'a clear typed review permits only a current ordinary confirmation',
+        async () => {
+          const { jevPolicy } = await import('../src/server/trust-jev-policy.ts');
+          const originalRules = (
+            await db.pool.query('SELECT rules FROM preferences WHERE owner_id=$1', [ownerId])
+          ).rows[0].rules;
+          for (const mode of ['decision', 'Jev'])
+            for (const changeRules of [false, true]) {
+              const turn = await begin('Set the synthetic monthly limit to 100 dollars.');
+              const before = calls.length;
+              const checker = createTrust({
+                pool: db.pool,
+                ownerId,
+                review: async () => assert.fail('The decision check cannot switch to an LLM.'),
+                decisions: {
+                  check: async (request) => {
+                    if (changeRules)
+                      await db.pool.query('UPDATE preferences SET rules=$2 WHERE owner_id=$1', [
+                        ownerId,
+                        'Ask before changing the synthetic spending limit.',
+                      ]);
+                    if (mode === 'Jev') {
+                      request.forModel?.({ provider: 'typesafe', model: 'jev-1.14.0' });
+                      return {
+                        choice: 'message:0',
+                        probability: 1,
+                        model: {
+                          provider: 'typesafe',
+                          requested: 'jev-1.14.0',
+                          served: 'jev-1.14.0',
+                        },
+                        additional: Object.fromEntries(
+                          Object.keys(jevPolicy.features).map((name) => [
+                            name,
+                            { choice: false, probability: 1 },
+                          ]),
+                        ),
+                      };
+                    }
+                    return {
+                      trust: 'message:0',
+                      choice: 'message:0',
+                      probability: 1,
+                      additional: { messageReview: { choice: false, probability: 1 } },
+                    };
+                  },
+                },
+              });
+              try {
+                const proposed = async () => {
+                  const args = { monthlyUsd: 100 };
+                  const verdict = await checker.check(turn, 'NOD_limits_update', args);
+                  assert.equal(verdict.confirm, true);
+                  return approved.request(turn, 'NOD_limits_update', args, {
+                    allowed: false,
+                    expectedChatRevision: verdict.chatRevision,
+                    validate: verdict.validate,
+                  });
+                };
+                if (changeRules) {
+                  await assert.rejects(proposed(), /owner instructions.*changed/);
+                  assert.equal(await proposal(turn.turnId), undefined);
+                } else {
+                  await proposed();
+                  assert.equal((await proposal(turn.turnId)).status, 'pending');
+                }
+                assert.equal(calls.length, before);
+              } finally {
+                await db.pool.query('UPDATE preferences SET rules=$2 WHERE owner_id=$1', [
+                  ownerId,
+                  originalRules,
+                ]);
+                await db.pool.query("UPDATE approvals SET status='expired' WHERE turn_id=$1", [
+                  turn.turnId,
+                ]);
+                await finish(turn.turnId, 'cancelled');
+              }
+            }
+        },
+      );
+
+      await t.test(
+        'an unverified Perplexity model cannot create a generic send approval',
+        async () => {
+          const expected = 'perplexity/pplx-decider-v1.2-20261016';
+          const [tool] = appTools(
+            {
+              tools: {
+                GMAIL_SEND_EMAIL: {
+                  description: 'Send a synthetic message.',
+                  inputSchema: {
+                    type: 'object',
+                    properties: { recipient_email: { type: 'string' } },
+                    additionalProperties: false,
+                  },
+                },
+              },
+            },
+            'synthetic-connection',
+          );
+          const readArgs = appToolArgs(
+            tool,
+            { recipient_email: 'recipient@example.test' },
+            'synthetic-connection',
+          );
+          for (const served of [expected, 'perplexity/pplx-decider-v1.3', undefined]) {
+            const turn = await begin('Prepare the synthetic message and show it before sending.');
+            const before = calls.length;
+            let checks = 0;
+            const checker = createTrust({
+              pool: db.pool,
+              ownerId,
+              review: async () => assert.fail('The decision check cannot switch to an LLM.'),
+              decisions: createDecisionModel({
+                resolve: async () => ({
+                  provider: 'openrouter',
+                  key: 'synthetic-decision-key',
+                  model: 'perplexity/pplx-decider-v1.2',
+                }),
+                fetch: async (_url, init) => {
+                  checks++;
+                  const request = JSON.parse(String(init?.body));
+                  return Response.json({
+                    model: served,
+                    answers: Object.fromEntries(
+                      Object.entries(request.questions).map(([name, value]) => {
+                        const question = value as { criteria: Record<string, string> };
+                        const choice = name === 'trust' ? 'ask' : String(name === 'readOnly');
+                        return [
+                          name,
+                          {
+                            type: 'choice',
+                            choice,
+                            probabilities: Object.fromEntries(
+                              Object.keys(question.criteria).map((key) => [
+                                key,
+                                Number(key === choice),
+                              ]),
+                            ),
+                          },
+                        ];
+                      }),
+                    ),
+                    usage: { input_tokens: 100 },
+                  });
+                },
+              }),
+            });
+            try {
+              const proposed = async () => {
+                const args = {
+                  page: 'https://mail.example.test/compose',
+                  control: { name: 'Send' },
+                };
+                const verdict = await checker.check(turn, 'NOD_browser', args);
+                assert.equal(verdict.confirm, true);
+                return approved.request(turn, 'NOD_browser', args, {
+                  allowed: false,
+                  expectedChatRevision: verdict.chatRevision,
+                  validate: verdict.validate,
+                });
+              };
+              if (served === expected) {
+                await proposed();
+                assert.equal((await proposal(turn.turnId)).status, 'pending');
+              } else {
+                await assert.rejects(
+                  proposed(),
+                  (error) =>
+                    Object(error).code === 'decision_model_mismatch' &&
+                    String(error).includes(expected),
+                );
+                assert.equal(await proposal(turn.turnId), undefined);
+              }
+              assert.equal(
+                await checker.readOnly(
+                  tool.action,
+                  readArgs,
+                  { description: tool.description, inputSchema: tool.schema },
+                  AbortSignal.timeout(1000),
+                ),
+                served === expected,
+              );
+              assert.equal(checks, 2);
+              assert.equal(calls.length, before);
+            } finally {
+              await db.pool.query("UPDATE approvals SET status='expired' WHERE turn_id=$1", [
+                turn.turnId,
+              ]);
+              await finish(turn.turnId, 'cancelled');
+            }
+          }
+        },
+      );
+
+      await t.test(
+        'a failed message review cannot create an unsupported generic confirmation',
+        async () => {
+          for (const mode of ['selection', 'refusal', 'Jev rule', 'Jev unknown effect']) {
+            for (const action of [
+              'GMAIL_SEND_EMAIL',
+              mode === 'Jev unknown effect' ? 'CONNECTED_MCP_CALL' : 'NOD_browser',
+            ]) {
+              const turn = await begin(`Show the synthetic draft before sending ${randomUUID()}.`);
+              const failure = Object.assign(
+                new Error('Synthetic review selection is unavailable.'),
+                { status: 503 },
+              );
+              const review: import('../src/ports/decisions.ts').ModelReview = async () =>
+                assert.fail('This review is unavailable.');
+              if (mode === 'selection')
+                review.select = async () => {
+                  throw failure;
+                };
+              const checker = createTrust({
+                pool: db.pool,
+                ownerId,
+                review,
+                ...(mode === 'refusal'
+                  ? { decisions: { check: async () => ({ refused: true }) } }
+                  : mode.startsWith('Jev')
+                    ? {
+                        decisions: {
+                          check: async (request) => {
+                            const wire = request.forModel!({
+                              provider: 'typesafe',
+                              model: 'jev-1.14.0',
+                            });
+                            return {
+                              choice:
+                                mode === 'Jev rule'
+                                  ? 'rule'
+                                  : wire.question.choices.find((entry) =>
+                                      String(entry.value).startsWith('message:'),
+                                    )!.value,
+                              probability: 1,
+                              model: {
+                                provider: 'typesafe',
+                                requested: 'jev-1.14.0',
+                                served: 'jev-1.14.0',
+                              },
+                              additional: Object.fromEntries(
+                                (wire.additionalQuestions ?? []).map(({ name }) => [
+                                  name,
+                                  {
+                                    choice:
+                                      name === 'effect' ? 'unknown' : name === 'message_review',
+                                    probability: 0.99,
+                                  },
+                                ]),
+                              ),
+                            };
+                          },
+                        },
+                      }
+                    : {}),
+              });
+              const before = calls.length;
+              const rules = (
+                await db.pool.query('SELECT rules FROM preferences WHERE owner_id=$1', [ownerId])
+              ).rows[0].rules;
+              if (mode === 'Jev rule')
+                await db.pool.query('UPDATE preferences SET rules=$2 WHERE owner_id=$1', [
+                  ownerId,
+                  'Show email drafts before sending.',
+                ]);
+              try {
+                if (action === 'GMAIL_SEND_EMAIL')
+                  assert.equal(
+                    (await checker.check(turn, action, email('review-failure@example.test')))
+                      .confirm,
+                    true,
+                  );
+                else
+                  await assert.rejects(
+                    checker.check(turn, action, {
+                      page: 'https://mail.example.test/compose',
+                      control: { name: 'Send' },
+                    }),
+                    (error) =>
+                      mode === 'selection'
+                        ? error === failure && Object(error).status === 503
+                        : /complete message/.test(String(error)),
+                  );
+                assert.equal(calls.length, before);
+                assert.equal(await proposal(turn.turnId), undefined);
+              } finally {
+                await db.pool.query('UPDATE preferences SET rules=$2 WHERE owner_id=$1', [
+                  ownerId,
+                  rules,
+                ]);
+              }
+              await finish(turn.turnId, 'cancelled');
+            }
+          }
+        },
+      );
+
+      await t.test(
+        'a cleared review cannot survive an owner edit while permission fails',
+        async () => {
+          const turn = await begin('Show this synthetic draft before sending.');
+          const originalRules = (
+            await db.pool.query('SELECT rules FROM preferences WHERE owner_id=$1', [ownerId])
+          ).rows[0].rules;
+          const checker = createTrust({
+            pool: db.pool,
+            ownerId,
+            review: async (_instructions, input) => {
+              if (Object(input).purpose === 'review_requirement') return { review: 'clear' };
+              await db.pool.query('UPDATE preferences SET rules=$2 WHERE owner_id=$1', [
+                ownerId,
+                'Show the complete message before sending.',
+              ]);
+              throw Object.assign(new Error('Synthetic permission service failed.'), {
+                status: 502,
+              });
+            },
+          });
+          const before = calls.length;
+          try {
+            await assert.rejects(
+              checker.check(turn, 'NOD_browser', {
+                page: 'https://mail.example.test/compose',
+                control: { name: 'Send' },
+              }),
+              /owner instructions.*changed/,
+            );
+            assert.equal(calls.length, before);
+            assert.equal(await proposal(turn.turnId), undefined);
+          } finally {
+            await db.pool.query('UPDATE preferences SET rules=$2 WHERE owner_id=$1', [
+              ownerId,
+              originalRules,
+            ]);
+            await finish(turn.turnId, 'cancelled');
+          }
+        },
+      );
+
+      await t.test(
+        'a cleared review is checked again when a generic question is saved',
+        async () => {
+          const turn = await begin('Show the synthetic draft before sending it.');
+          const connectionId = randomUUID();
+          const draftId = randomUUID();
+          const source = (
+            await db.pool.query("SELECT id FROM messages WHERE turn_id=$1 AND role='user'", [
+              turn.turnId,
+            ])
+          ).rows[0];
+          await db.pool.query(
+            "INSERT INTO app_connections(id,owner_id,slug,account_id,provider_id,account_active,watch_revision) VALUES($1,$2,'gmail','synthetic-scope-account','fixture',true,0)",
+            [connectionId, ownerId],
+          );
+          await db.pool.query(
+            `INSERT INTO draft_instructions(id,owner_id,thread_id,turn_id,connection_id,binding,source_ids,draft_id,target,complete)
+          VALUES($1,$2,$3,$4,$5,$6,$7,'synthetic-scope-draft',$8,true)`,
+            [
+              draftId,
+              ownerId,
+              turn.threadId,
+              turn.turnId,
+              connectionId,
+              JSON.stringify(['synthetic-scope-account', 'fixture', null, 0]),
+              [source.id],
+              { recipient_email: 'scope-review@example.test' },
+            ],
+          );
+          const checker = createTrust({
+            pool: db.pool,
+            ownerId,
+            review: async (_instructions, input) => {
+              if (Object(input).purpose === 'review_requirement') return { review: 'clear' };
+              throw new Error('Synthetic permission request failed after a complete clear review.');
+            },
+          });
+          const args = { page: 'https://mail.example.test/compose', control: { name: 'Send' } };
+          const before = calls.length;
+          try {
+            const verdict = await checker.check(turn, 'NOD_browser', args);
+            assert.equal(verdict.confirm, true);
+            await assert.rejects(
+              approved.request(turn, 'NOD_browser', args, {
+                allowed: false,
+                expectedChatRevision: verdict.chatRevision,
+                validate: verdict.validate,
+                prepareConfirmation: async () => {
+                  await db.pool.query(
+                    'UPDATE draft_instructions SET source_ids=ARRAY[]::uuid[] WHERE id=$1',
+                    [draftId],
+                  );
+                  return {};
+                },
+              }),
+              /draft sources changed/,
+            );
+            assert.equal(calls.length, before);
+            assert.equal(await proposal(turn.turnId), undefined);
+          } finally {
+            await db.pool.query('DELETE FROM draft_instructions WHERE id=$1', [draftId]);
+            await db.pool.query('DELETE FROM app_connections WHERE id=$1', [connectionId]);
+            await finish(turn.turnId, 'cancelled');
+          }
+        },
+      );
+
+      await t.test(
+        'the first owner rule write waits for a proposal that checked default rules',
+        async () => {
+          const original = (
+            await db.pool.query('SELECT * FROM preferences WHERE owner_id=$1', [ownerId])
+          ).rows[0];
+          const turn = await begin('Review this synthetic message before sending.');
+          await db.pool.query('DELETE FROM preferences WHERE owner_id=$1', [ownerId]);
+          const checker = createTrust({
+            pool: db.pool,
+            ownerId,
+            review: async (_instructions, input) => {
+              if (Object(input).purpose === 'review_requirement') return { review: 'clear' };
+              throw new Error('Synthetic permission request failed after a clear review.');
+            },
+          });
+          const entered = deferred();
+          const release = deferred();
+          let outcome: Promise<unknown> | undefined;
+          let update: ReturnType<typeof request> | undefined;
+          let updated = false;
+          let validationPid: number | undefined;
+          const before = calls.length;
+          try {
+            const args = { page: 'https://mail.example.test/compose', control: { name: 'Send' } };
+            const verdict = await checker.check(turn, 'NOD_browser', args);
+            await db.pool.query('DELETE FROM preferences WHERE owner_id=$1', [ownerId]);
+            outcome = approved.request(turn, 'NOD_browser', args, {
+              allowed: false,
+              expectedChatRevision: verdict.chatRevision,
+              validate: (client) =>
+                verdict.validate(
+                  new Proxy(client, {
+                    get(connection, key) {
+                      if (key === 'query')
+                        return async (...args: Parameters<typeof connection.query>) => {
+                          const result = await connection.query(...args);
+                          if (
+                            typeof args[0] === 'string' &&
+                            args[0].includes('SELECT notification_rule,rules') &&
+                            args[0].includes('FOR SHARE')
+                          ) {
+                            validationPid = (
+                              await connection.query('SELECT pg_backend_pid() AS pid')
+                            ).rows[0].pid;
+                            entered.resolve();
+                            await release.promise;
+                          }
+                          return result;
+                        };
+                      const value = Reflect.get(connection, key);
+                      return typeof value === 'function' ? value.bind(connection) : value;
+                    },
+                  }),
+                ),
+            });
+            await entered.promise;
+            update = request('PATCH', '/api/preferences', {
+              rules: 'Show the complete current message before sending.',
+            }).then((response) => {
+              updated = true;
+              return response;
+            });
+            let blocked = false;
+            for (let attempt = 0; attempt < 100 && !updated && !blocked; attempt++) {
+              blocked =
+                (
+                  await db.pool.query(
+                    `SELECT 1 FROM pg_stat_activity WHERE datname=current_database()
+                   AND query LIKE 'INSERT INTO preferences(owner_id,notification_rule,%'
+                   AND $1=ANY(pg_blocking_pids(pid))`,
+                    [validationPid],
+                  )
+                ).rowCount! > 0;
+              if (!blocked && !updated) await new Promise((resolve) => setTimeout(resolve, 10));
+            }
+            assert.equal(blocked, true);
+            assert.equal(updated, false);
+            assert.equal(calls.length, before);
+            release.resolve();
+            await outcome;
+            const response = await update;
+            assert.equal(response.statusCode, 200, response.body);
+            assert.equal((await proposal(turn.turnId)).status, 'pending');
+            assert.equal(calls.length, before);
+          } finally {
+            release.resolve();
+            await outcome?.catch(() => {});
+            await update;
+            await finish(turn.turnId, 'cancelled');
+            await db.pool.query('DELETE FROM preferences WHERE owner_id=$1', [ownerId]);
+            if (original)
+              await db.pool.query(
+                'INSERT INTO preferences SELECT * FROM jsonb_populate_record(NULL::preferences,$1::jsonb)',
+                [JSON.stringify(original)],
+              );
+          }
+        },
+      );
+
       await t.test(
         'onboarding reads require a strict decision and retain owner rules without message authority',
         async () => {
@@ -4425,6 +5095,7 @@ test(
               pool: db.pool,
               ownerId,
               review: async (_instructions, input) => {
+                if (Object(input).purpose === 'review_requirement') return { review: 'clear' };
                 inputs.push(input);
                 return { run: false };
               },
@@ -4460,7 +5131,7 @@ test(
                   path: '/Users/ana/Documents/board/todo.md',
                 }),
               );
-            await checker.check(
+            const update = checker.check(
               owner,
               'NOD_schedule_update',
               { title: 'Synthetic renamed board' },
@@ -4472,6 +5143,8 @@ test(
                 evidence: authority,
               },
             );
+            if (mode === 'llm') await update;
+            else await assert.rejects(update, /complete message/);
           }
           for (const input of inputs.filter((value) => value.scheduledInstructions)) {
             assert.equal(input.scheduledInstructions[0].canAuthorize, false);

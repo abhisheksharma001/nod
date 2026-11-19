@@ -602,6 +602,13 @@ export function createLedger({
       get configured() {
         return base.configured;
       },
+      ...(base.select
+        ? {
+            async select(signal?: AbortSignal) {
+              return curator(await base.select!(signal));
+            },
+          }
+        : {}),
       curate: async (request, signal, report) => {
         if (await limitReached()) throw new Error(spendingLimitReached);
         request = {

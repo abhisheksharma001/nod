@@ -6677,7 +6677,10 @@ test(
               const oldGrant = await createTrust({
                 pool: db.pool,
                 ownerId,
-                review: async () => ({ run: true, because: prompt }),
+                review: async (_instructions, input) =>
+                  Object(input).purpose === 'review_requirement'
+                    ? { review: 'clear' }
+                    : { run: true, because: prompt },
               }).check(
                 { threadId: creator.threadId, turnId: fresh.turnId },
                 'SYNTHETIC_SEND_REPORT',

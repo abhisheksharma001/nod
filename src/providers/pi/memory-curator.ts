@@ -129,12 +129,24 @@ export function createPiMemoryCurator(options: {
       requestFacts: undefined,
     };
   }
-  return {
+  const curator: MemoryCurator = {
     get id() {
       return options.provider;
     },
     get configured() {
       return options.configured?.() ?? Boolean(options.apiKey);
+    },
+    async select(signal) {
+      signal?.throwIfAborted();
+      if (!curator.configured || !options.resolve) return curator;
+      const access = await options.resolve();
+      signal?.throwIfAborted();
+      if (!access) throw new Error('The selected model is unavailable.');
+      return createPiMemoryCurator({
+        ...options,
+        provider: access.provider,
+        resolve: async () => access,
+      });
     },
     async curate(
       { task, instructions, input, responseSchema, images, automatic = true },
@@ -326,4 +338,5 @@ export function createPiMemoryCurator(options: {
       );
     },
   };
+  return curator;
 }

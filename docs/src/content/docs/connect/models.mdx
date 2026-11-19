@@ -278,6 +278,8 @@ Nod can use a decision model to check action permission, read confirmation repli
 
 ### Select the action checker
 
+For Perplexity Decider 1.2, Nod checks that the provider and requested model match its selection. The response must also identify version `perplexity/pplx-decider-v1.2-20261016`. These checks must pass before Nod uses an answer for action permission, an app read check or a confirmation reply. A missing or different value fails the check.
+
 Set `NOD_TRUST_MODEL` in the server configuration, then [apply the change](/deploy/configuration/#how-settings-work).
 
 | Value      | Action permission, strict app reads, and confirmation replies             |

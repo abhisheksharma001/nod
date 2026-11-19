@@ -150,6 +150,8 @@ test(
           configured: true,
           curate: async ({ task, input }, signal) => {
             if (task === 'review') reviews.push(JSON.stringify(input));
+            if (task === 'review' && Object(input).purpose === 'review_requirement')
+              return { review: 'clear' };
             if (task === 'remember') {
               rememberInputs.push(JSON.stringify(input));
               await whilePreparing?.(signal);

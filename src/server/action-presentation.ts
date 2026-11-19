@@ -356,6 +356,7 @@ function plainText(html: string) {
 export function approvalContent(
   action: string,
   args: unknown,
+  bodyInQuestion = false,
 ): { fields?: Array<{ label: string; value: string }>; body?: string; bodyCut?: true } {
   if (
     /^(NOD_|CONNECTED_|mcp__)/.test(action) ||
@@ -370,6 +371,7 @@ export function approvalContent(
     return value ? [{ label, value }] : [];
   });
   if (!fields.length) return {};
+  if (bodyInQuestion) return { fields };
   const raw = bodyKeys
     .map((key) => input[key])
     .find((value) => typeof value === 'string' && value.trim());
