@@ -165,6 +165,8 @@ export const locate = (tree: Tree, target: string) =>
   tree.entries.find((entry) => pathOf(entry) === target);
 export const fold = (value: string) =>
   value.normalize('NFD').replace(/\p{M}/gu, '').replace(/\s+/g, ' ').toLowerCase();
+export const foldQuote = (value: string) =>
+  fold(value.replace(/[“”«»„‟]/g, '"').replace(/[‘’‚‛‹›]/g, "'"));
 const segmenter = new Intl.Segmenter(undefined, { granularity: 'word' });
 const cjk = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 const tokens = (value: string) =>

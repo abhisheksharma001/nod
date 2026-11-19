@@ -5,7 +5,7 @@ import {
   areaEntries,
   fits,
   factSchema,
-  fold,
+  foldQuote,
   freeSlug,
   line,
   lines,
@@ -18,8 +18,6 @@ import {
   type Entry,
   type Tree,
 } from './memory-tree.ts';
-
-const marks = (value: string) => value.replace(/[“”«»„]/g, '"').replace(/[‘’‚]/g, "'");
 
 const ordinals = z.array(z.number().int().min(1).max(40)).min(1);
 
@@ -84,8 +82,8 @@ export function applyOps(
     ...ops.filter(({ op }) => op === 'add'),
   ]) {
     const cited = op.m.flatMap((n) => messages[n - 1] ?? []);
-    const quoted = cited.filter((m) => fold(marks(m.text)).includes(fold(marks(op.quote))));
-    if (cited.length !== op.m.length || !quoted.length || !fold(op.quote).trim()) {
+    const quoted = cited.filter((m) => foldQuote(m.text).includes(foldQuote(op.quote)));
+    if (cited.length !== op.m.length || !quoted.length || !foldQuote(op.quote).trim()) {
       rejected.push('quote');
       continue;
     }
