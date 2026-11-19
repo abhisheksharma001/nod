@@ -405,6 +405,10 @@ test(
         supported.sources.map(({ id, text }) => ({ id, text })),
         [{ id: await sourceOf(punctuationTurn), text: support }],
       );
+      assert.equal(
+        (await view()).notes.find((entry) => entry.path === supported.path)?.sources[0].quote,
+        support,
+      );
       await assertSilent(punctuationTurn);
 
       const skill = (args: Record<string, unknown>, rejected = false): Step => ({
@@ -961,10 +965,12 @@ test('memory notes keep their line breaks from every writer while other control 
       note.sources.map(({ id, text }) => ({ id, text })),
       [{ id: ids[1], text: quoted }],
     );
+    assert.equal((await supported.view()).notes[0].sources[0].quote, quoted);
     source = 'A different synthetic message.';
     const changed = await supported.read({ path: 'preferences/email-signoff' });
     assert.ok('sources' in changed);
     assert.equal(changed.sources[0].text, null);
+    assert.equal((await supported.view()).notes[0].sources[0].quote, undefined);
   }
   for (const [said, quoted, m] of [
     ['I\u2019m allergic to peanuts', "I'm allergic to cashews", [1]],

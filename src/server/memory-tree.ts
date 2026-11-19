@@ -400,7 +400,7 @@ export function view(
   const sources = (entry: Entry) =>
     entry.sources.map((id) => {
       const found = source(id);
-      return entry.quote && found.text && fold(found.text).includes(fold(entry.quote))
+      return entry.quote && found.text && foldQuote(found.text).includes(foldQuote(entry.quote))
         ? { ...found, quote: entry.quote }
         : found;
     });
