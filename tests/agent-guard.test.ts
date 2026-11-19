@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import type { Pool } from 'pg';
 import { Compile } from 'typebox/compile';
+import { validateToolArguments } from '@earendil-works/pi-ai';
 import { unified } from 'unified';
 import remarkParse from 'remark-parse';
 import {
@@ -1803,6 +1804,76 @@ test('an unchecked mail body stays private and the result names how many were wi
   assert.match(unavailable.contentWithheld.message, /Mail checks are unavailable\./);
   const checked = await privateEmailResult(thread.data.messages[0], async () => [false]);
   assert.deepEqual(checked, thread.data.messages[0]);
+});
+
+test('skill actions keep their required fields and refuse fields from other actions', async () => {
+  const managed: Array<{ action: string; args: unknown }> = [];
+  await fixture(
+    async (tools) => {
+      const skill = tools.get('skills')!;
+      const valid: Array<Record<string, string>> = [
+        { action: 'list' },
+        { action: 'read', name: 'schedules-and-watches' },
+        {
+          action: 'save',
+          name: 'synthetic-procedure',
+          description: 'A verified synthetic procedure.',
+          body: 'Read the synthetic record.',
+        },
+        {
+          action: 'patch',
+          name: 'synthetic-procedure',
+          old: 'Read the synthetic record.',
+          new: 'Read the revised synthetic record.',
+        },
+      ];
+      for (const args of valid)
+        await skill.execute(
+          validateToolArguments(skill, {
+            type: 'toolCall',
+            id: randomUUID(),
+            name: skill.name,
+            arguments: args,
+          }),
+        );
+      assert.deepEqual(
+        managed.map(({ action }) => action),
+        ['skill_save', 'skill_patch'],
+      );
+      const invalid = [
+        {},
+        { action: 'schedule_create', args: {} },
+        ...valid.flatMap((args, index) => [
+          ...Object.keys(args).map((key) =>
+            Object.fromEntries(Object.entries(args).filter(([name]) => name !== key)),
+          ),
+          { ...args, extra: true },
+          { ...args, action: valid[(index + 1) % valid.length]!.action },
+        ]),
+      ];
+      for (const args of invalid) {
+        let parsed;
+        try {
+          parsed = validateToolArguments(skill, {
+            type: 'toolCall',
+            id: randomUUID(),
+            name: skill.name,
+            arguments: args,
+          });
+        } catch {
+          continue;
+        }
+        await assert.rejects(skill.execute(parsed), /Invalid skills input/);
+      }
+      assert.equal(managed.length, 2);
+    },
+    {
+      manage: async (action, args) => {
+        managed.push({ action, args });
+        return { saved: true };
+      },
+    },
+  );
 });
 
 test('skill reads cannot escape the trusted library or load workspace instructions', async () => {

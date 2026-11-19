@@ -310,6 +310,15 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
       serverJson('/api/v1/models'),
     ]);
     const ollama = z.object({ version: z.string() }).safeParse(version).success;
+    const running = ollama ? await serverJson('/api/ps') : undefined;
+    const loadedModels = entries(
+      z.object({ models: z.array(z.unknown()) }).safeParse(running).data?.models ?? [],
+      z.object({
+        name: z.string().min(1).max(200).optional(),
+        model: z.string().min(1).max(200).optional(),
+        context_length: z.number().int().positive(),
+      }),
+    );
     const studioModels = entries(
       z.object({ models: z.array(z.unknown()) }).safeParse(studio).data?.models ?? [],
       lmStudioModelSchema,
@@ -335,12 +344,20 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
               ? ollamaModel(shown.data)
               : undefined;
           if (known?.usable === false) return [];
-          const contextWindow =
+          const reportedContext =
             known?.contextWindow ??
             entry.context_length ??
             entry.context_window ??
             entry.max_model_len ??
             128_000;
+          const contextWindow = Math.min(
+            reportedContext,
+            ...(studioModel
+              ? []
+              : loadedModels
+                  .filter((model) => model.name === entry.id || model.model === entry.id)
+                  .map((model) => model.context_length)),
+          );
           return [
             definition({
               id: entry.id,
@@ -1271,6 +1288,8 @@ export async function createPiModelRuntime(
                 }
                 throw error;
               });
+              phase = 'response';
+              status = response.status;
               return usage ? usage.response(response) : response;
             },
           }

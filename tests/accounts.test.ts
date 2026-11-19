@@ -22,6 +22,8 @@ import {
   type DecisionConnection,
 } from '../src/providers/decisions.ts';
 import { createMailCheck } from '../src/server/mail-check.ts';
+import { privateEmailResult } from '../src/server/integration-result.ts';
+import { withFailureLog } from '../src/ports/failure-log.ts';
 import type { DecisionQuestion } from '../src/ports/decisions.ts';
 import { createModelTraces } from '../src/server/traces.ts';
 import type { ModelTrace } from '../src/ports/traces.ts';
@@ -38,6 +40,344 @@ import {
   createTextRedactor,
   redactSecretText,
 } from '../src/server/redaction.ts';
+
+test('decision failures retain bounded HTTP and response details', async (t) => {
+  const question: DecisionQuestion = {
+    name: 'access',
+    choices: [
+      { value: false, description: 'Ordinary mail.' },
+      { value: true, description: 'Access secret.' },
+    ],
+  };
+  const canary = 'synthetic-private-value@example.test/private-response';
+  for (const provider of ['openrouter', 'typesafe'] as const)
+    for (const status of [401, 403, 429, 503])
+      await t.test(`${provider} HTTP ${status}`, async () => {
+        const usage: ProviderUsageEvent[] = [];
+        let calls = 0;
+        let cancelled = false;
+        const model = createDecisionModel({
+          resolve: async () => ({ provider, key: canary }),
+          fetch: async () => {
+            calls++;
+            return new Response(
+              new ReadableStream({
+                start(controller) {
+                  controller.enqueue(new TextEncoder().encode(canary));
+                },
+                cancel() {
+                  cancelled = true;
+                  return new Promise(() => {});
+                },
+              }),
+              { status, statusText: canary },
+            );
+          },
+        });
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await assert.rejects(
+            Promise.race([
+              model.check(
+                { instructions: 'Check synthetic mail.', input: {}, question },
+                undefined,
+                (event) => usage.push(event),
+              ),
+              new Promise((_resolve, reject) => {
+                timer = setTimeout(
+                  () => reject(new Error('The HTTP failure waited for its body.')),
+                  500,
+                );
+              }),
+            ]),
+            (error: Error & { code?: string; status?: number }) => {
+              assert.equal(error.code, 'decision_http');
+              assert.equal(error.status, status);
+              assert.equal(error.cause, undefined);
+              assert.ok(!error.message.includes(canary));
+              return true;
+            },
+          );
+        } finally {
+          clearTimeout(timer);
+        }
+        assert.equal(calls, 1);
+        assert.equal(cancelled, true);
+        assert.equal(usage.length, 1);
+        assert.equal(usage[0].status, 'failed');
+      });
+  const cases = [
+    [
+      'transport',
+      'decision_transport',
+      () => {
+        throw Object.assign(new Error(canary), { cause: canary, code: canary });
+      },
+    ],
+    [
+      'response body',
+      'decision_response',
+      () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.error(new Error(canary));
+            },
+          }),
+          { status: 200 },
+        ),
+    ],
+    ['JSON', 'decision_json', () => new Response(`{"private":"${canary}"`, { status: 200 })],
+    [
+      'missing answer',
+      'decision_validation',
+      () => Response.json({ answers: {}, usage: { input_tokens: 1 } }),
+    ],
+    [
+      'unknown choice',
+      'decision_validation',
+      () =>
+        Response.json({
+          answers: { access: { type: 'choice', choice: canary } },
+          usage: { input_tokens: 1 },
+        }),
+    ],
+    [
+      'invalid probabilities',
+      'decision_validation',
+      () =>
+        Response.json({
+          answers: {
+            access: { type: 'choice', choice: 'false', probabilities: { false: -1, true: 2 } },
+          },
+          usage: { input_tokens: 1 },
+        }),
+    ],
+    [
+      'invalid usage',
+      'decision_validation',
+      () =>
+        Response.json({
+          answers: { access: { type: 'choice', choice: false } },
+          usage: { input_tokens: -1 },
+        }),
+    ],
+  ] as const;
+  for (const [name, code, response] of cases)
+    await t.test(name, async () => {
+      const model = createDecisionModel({
+        resolve: async () => ({ provider: 'openrouter', key: canary }),
+        fetch: async () => response(),
+      });
+      await assert.rejects(
+        model.check({
+          instructions: 'Check synthetic mail.',
+          input: {},
+          question: { ...question, minProbability: 0.99 },
+        }),
+        (error: Error & { code?: string; status?: number; issues?: unknown }) => {
+          assert.equal(error.code, code);
+          assert.equal(error.status, code === 'decision_transport' ? undefined : 200);
+          assert.equal(error.cause, undefined);
+          assert.equal(error.issues, undefined);
+          assert.ok(
+            !JSON.stringify(
+              Object.getOwnPropertyNames(error).map(
+                (key) => (error as unknown as Record<string, unknown>)[key],
+              ),
+            ).includes(canary),
+          );
+          return true;
+        },
+      );
+    });
+  const valid = createDecisionModel({
+    resolve: async () => ({ provider: 'openrouter', key: canary }),
+    fetch: async () =>
+      Response.json({
+        answers: {
+          access: { type: 'choice', choice: 'false', probabilities: { false: 0.999, true: 0.001 } },
+        },
+        usage: { input_tokens: 1 },
+      }),
+  });
+  const accepted = await valid.check({
+    instructions: 'Check synthetic mail.',
+    input: {},
+    question: { ...question, minProbability: 0.99 },
+  });
+  assert.equal(Object(accepted).access, false);
+});
+
+test('mail withholding and failure logs expose only known phases and valid HTTP statuses', async () => {
+  const canary = 'synthetic-private-body-and-provider-value';
+  const failures: Array<Record<string, unknown>> = [];
+  const checks = [
+    ['decision_http', 503, 'request failed (HTTP 503)'],
+    ['decision_response', 200, 'response could not be read (HTTP 200)'],
+    ['decision_json', 200, 'returned invalid JSON (HTTP 200)'],
+    ['decision_validation', 200, 'returned an invalid response (HTTP 200)'],
+    ['decision_transport', undefined, 'connection failed'],
+    [canary, 429, 'request failed (HTTP 429)'],
+    ...[NaN, Infinity, 99, 600, 200.5, '503'].map((status) => [canary, status, 'request failed']),
+  ];
+  for (const [code, status, expected] of checks) {
+    let requests = 0;
+    const check = createMailCheck({
+      curator: {
+        id: 'unused',
+        configured: false,
+        async curate() {
+          assert.fail('No fallback is allowed.');
+        },
+      },
+      decisions: {
+        async check() {
+          requests++;
+          throw Object.assign(new Error(canary), { code, status, cause: canary, issues: [canary] });
+        },
+      },
+    });
+    const result = await withFailureLog(
+      (event, error) => {
+        const value = error as Error & { code?: unknown; status?: unknown; issues?: unknown };
+        assert.equal(value.cause, undefined);
+        assert.equal(value.issues, undefined);
+        failures.push({
+          event,
+          name: value.name,
+          message: value.message,
+          code: value.code,
+          status: value.status,
+        });
+      },
+      () =>
+        privateEmailResult(
+          {
+            messages: [
+              { id: 'synthetic-mail', from: 'sender@example.test', subject: canary, body: canary },
+            ],
+          },
+          check,
+        ),
+    );
+    const encoded = JSON.stringify(result);
+    assert.ok(encoded.includes(String(expected)), encoded);
+    assert.ok(!encoded.includes(canary));
+    assert.equal(requests, 1);
+  }
+  assert.equal(failures.length, checks.length);
+  assert.ok(!JSON.stringify(failures).includes(canary));
+  assert.deepEqual(
+    failures.map((failure) => failure.status),
+    [503, 200, 200, 200, undefined, 429, ...Array(6).fill(undefined)],
+  );
+  assert.ok(failures.every((failure) => failure.event === 'mail_check_failed'));
+});
+
+test('mail checks retain the native curator HTTP status without provider content', async (t) => {
+  const { createServer } = await import('node:http');
+  const { createPiMemoryCurator } = await import('../src/providers/pi/memory-curator.ts');
+  const canary = 'synthetic-private-provider-body';
+  let calls = 0;
+  const server = createServer(async (request, response) => {
+    let text = '';
+    for await (const chunk of request) text += chunk;
+    const body = JSON.parse(text);
+    assert.equal(request.url, '/v1/chat/completions');
+    assert.equal(body.model, 'fixture-mail-check');
+    assert.equal(body.response_format, undefined);
+    calls++;
+    response.writeHead(403, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ error: { message: canary } }));
+  });
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const baseUrl = `http://127.0.0.1:${address.port}/v1`;
+  const curator = createPiMemoryCurator({
+    provider: 'compatible',
+    configured: () => true,
+    resolve: async () => ({
+      provider: 'compatible',
+      method: 'api_key',
+      effort: 'off',
+      definition: {
+        choice: {
+          id: 'fixture-mail-check',
+          name: 'Synthetic mail',
+          images: false,
+          efforts: ['off'],
+          contextWindow: 128000,
+        },
+        spec: {
+          id: 'fixture-mail-check',
+          name: 'Synthetic mail',
+          provider: 'compatible',
+          api: 'openai-completions',
+          baseUrl,
+          reasoning: false,
+          input: ['text'],
+          contextWindow: 128000,
+          maxTokens: 8192,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        },
+      },
+      read: async () => ({ type: 'endpoint', url: baseUrl, key: 'fixture-native-mail-key' }),
+    }),
+  });
+  const failures: unknown[] = [];
+  const result = await withFailureLog(
+    (event, error) => failures.push({ event, ...Object(error) }),
+    () =>
+      privateEmailResult(
+        { from: 'sender@example.test', subject: canary, body: canary },
+        createMailCheck({ curator }),
+      ),
+  );
+  assert.equal(calls, 1);
+  assert.match(JSON.stringify(result), /HTTP 403/);
+  assert.ok(!JSON.stringify(result).includes(canary));
+  assert.deepEqual(failures, [
+    { event: 'mail_check_failed', code: 'mail_check_request', status: 403 },
+  ]);
+});
+
+test('invalid decision settings fail before reserving a budget or sending a request', async () => {
+  let reservations = 0;
+  let requests = 0;
+  const usage: ProviderUsageEvent[] = [];
+  const model = createDecisionModel({
+    resolve: async () => ({ provider: 'openai', key: 'fixture-key', region: 'invalid' as never }),
+    reserve: async () => {
+      reservations++;
+      return async () => {};
+    },
+    fetch: async () => {
+      requests++;
+      assert.fail('An invalid connection must not send a request.');
+    },
+  });
+  await assert.rejects(
+    model.check(
+      {
+        instructions: 'Check synthetic mail.',
+        input: {},
+        question: { name: 'access', choices: [{ value: false, description: 'Ordinary mail.' }] },
+      },
+      undefined,
+      (event) => usage.push(event),
+    ),
+    /Choose an OpenAI API region/,
+  );
+  assert.equal(reservations, 0);
+  assert.equal(requests, 0);
+  assert.equal(usage.length, 0);
+});
 
 test('decision reservations release only requests that did not reach dispatch', async () => {
   for (const phase of ['before dispatch', 'provider error', 'transport error']) {
@@ -173,7 +513,9 @@ test('OpenAI decision failures keep the region and provider reason without expos
       input: {},
       question: { name: 'answer', choices: [{ value: false, description: 'Ask.' }] },
     }),
-    (error: Error) => {
+    (error: Error & { status?: number; code?: string }) => {
+      assert.equal(error.status, 401);
+      assert.equal(error.code, 'decision_http');
       assert.match(error.message, /401/);
       assert.match(error.message, /project geography EU/);
       assert.ok(!error.message.includes(key));

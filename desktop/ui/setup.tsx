@@ -339,7 +339,12 @@ function Startup() {
   }, []);
 
   useEffect(() => {
-    if (welcomeStep !== 'waiting' || !status.engineReady || !currentWelcome.current) return;
+    if (
+      welcomeStep !== 'waiting' ||
+      !status.engineReady ||
+      currentWelcome.current?.continued !== false
+    )
+      return;
     void saveWelcome({ ...currentWelcome.current, continued: true }).catch(() => {});
   }, [welcomeStep, status.engineReady]);
 

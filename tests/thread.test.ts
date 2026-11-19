@@ -12960,6 +12960,56 @@ test(
       `${new Date(Date.now() - 5000).toISOString()} update check result=offered version=9.9.9 for Marta Vidal\n`,
     );
     const scope = { turnId, sessionId, runId: childRun, parentRunId: mainRun, callId };
+    const { createDecisionModel } = await import('../src/providers/decisions.ts');
+    const { createMailCheck } = await import('../src/server/mail-check.ts');
+    const { privateEmailResult } = await import('../src/server/integration-result.ts');
+    const { withFailureLog } = await import('../src/ports/failure-log.ts');
+    for (const response of [
+      () => Response.json({ error: { message: privateText, code: privateText } }, { status: 503 }),
+      () => new Response(`{"private":${JSON.stringify(privateText)}`, { status: 200 }),
+      () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.error(new Error(privateText));
+            },
+          }),
+          { status: 200 },
+        ),
+    ]) {
+      const model = createDecisionModel({
+        resolve: async () => ({ provider: 'openrouter', key: privateText }),
+        fetch: async () => response(),
+      });
+      const check = createMailCheck({
+        decisions: model,
+        curator: {
+          id: 'unused',
+          configured: false,
+          async curate() {
+            assert.fail('A failed decision must not use another model.');
+          },
+        },
+      });
+      const result = await withFailureLog(
+        (event, error) => failureJournal.record('failure', { event, error }, scope),
+        () =>
+          privateEmailResult(
+            {
+              messages: [
+                {
+                  id: 'synthetic-mail',
+                  from: 'sender@example.test',
+                  subject: privateText,
+                  body: privateText,
+                },
+              ],
+            },
+            check,
+          ),
+      );
+      assert.ok(privateValues.every((value) => !JSON.stringify(result).includes(value)));
+    }
     for (let index = 0; index < 3; index++)
       failureJournal.record(
         'failure',
@@ -13133,7 +13183,20 @@ test(
     assert.equal(report.logs[0].data.tool, 'apps');
     assert.equal(report.logs[0].data.input.query, 'Find the failed workflow');
     assert.equal(report.logs[1].data.output.statusCode, 503);
-    assert.equal(report.failures.length, 2);
+    assert.equal(report.failures.length, 5);
+    const mailFailures = report.failures.filter(
+      (row: any) => row.data.event === 'mail_check_failed',
+    );
+    assert.equal(mailFailures.length, 3);
+    assert.deepEqual(
+      mailFailures.map((row: any) => [row.data.error.code, row.data.error.status]).sort(),
+      [
+        ['decision_http', 503],
+        ['decision_json', 200],
+        ['decision_response', 200],
+      ],
+    );
+    assert.ok(mailFailures.every((row: any) => row.runId === child.runId && row.count === 1));
     const requestFailure = report.failures.find((row: any) => row.data.event === 'request_failed');
     const bridgeFailure = report.failures.find(
       (row: any) => row.data.event === 'browser_bridge_failed',

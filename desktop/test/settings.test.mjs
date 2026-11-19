@@ -1879,6 +1879,23 @@ test('local selection shows startup progress and hands off to app onboarding bef
         continued: true,
       });
       await settle(() => calls.length === (scenario === 'retry' ? 3 : 2));
+      if (scenario === 'waiting') {
+        runtime.resolve({ phase: 'preparing', engineReady: true, runtime: { phase: 'preparing' } });
+        await new Promise((accept) => setTimeout(accept, 20));
+        publish({
+          phase: 'starting',
+          engineReady: false,
+          runtime: { phase: 'preparing', stage: 'workspace' },
+        });
+        await new Promise((accept) => setTimeout(accept, 20));
+        publish({
+          phase: 'preparing',
+          engineReady: true,
+          runtime: { phase: 'preparing', stage: 'workspace' },
+        });
+        await new Promise((accept) => setTimeout(accept, 50));
+        assert.equal(choices.length, 2, 'A restarted engine must not submit Welcome again.');
+      }
       assert.equal(emailRendered, false);
       runtime.resolve({ phase: 'ready', engineReady: true, runtime: { phase: 'ready' } });
       await new Promise((accept) => setTimeout(accept, 20));

@@ -340,7 +340,7 @@ These calls are billed through the connection that runs them. GPT Decisions is p
 
 In a source install or self-hosted server, set `TYPESAFE_API_KEY` in `.env` to use Jev directly (`jev-1.13.0`) for these checks. The key selects TypeSafe regardless of your chat connection. Remove it to use the connection rules above, then [apply the configuration change](/deploy/configuration/#how-settings-work). The key stays on the server and is not added to **Models**.
 
-A failed decision request does not switch providers or approve anything: a failed account-access email check hides that email's content. See [Approvals and the trust check](/trust/approvals/).
+If an email check fails, Nod keeps its subject and content private. The reason can say that the connection failed or the service returned an error. It can also say that Nod could not read or check the answer. It includes the HTTP status when one is available. If no specific cause is available, Nod says that the check failed. These details contain no email content or provider error body. A failed check cannot approve an action or use another provider. See [Approvals and the trust check](/trust/approvals/).
 
 :::note[Voice without another account]
 Open **Settings → Voice & audio**. Open **Voice** to compare samples, or choose **Automatic** to match voices to the conversation language. Provider connections and free voice downloads are in the same chooser. Use [free local voices, OpenRouter sign-in, or an ElevenLabs or OpenAI API key](/use/chat/#send-an-audio-message) without changing your connected chat model. OpenAI speech requires API access, separate from a ChatGPT plan.

@@ -7887,6 +7887,193 @@ test('chat resumes history after a failed focus check and cancels pending focus 
   assert.equal(result.exitCode, 0, result.stdout + result.stderr);
 });
 
+test('chat state reads make progress during refresh events and reject late replies after reset', async () => {
+  const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+    timeoutMs: 20_000,
+    input: String.raw`
+      import assert from 'node:assert/strict';
+      import { JSDOM } from 'jsdom';
+      const dom = new JSDOM('<!doctype html><div id="root"></div>', {
+        url: 'https://nod.fixture.invalid', pretendToBeVisual: true,
+      });
+      Object.assign(globalThis, {
+        window: dom.window, document: dom.window.document,
+        IS_REACT_ACT_ENVIRONMENT: true, localStorage: dom.window.localStorage,
+        getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
+        requestAnimationFrame: dom.window.requestAnimationFrame.bind(dom.window),
+        cancelAnimationFrame: dom.window.cancelAnimationFrame.bind(dom.window),
+      });
+      for (const name of ['Node', 'NodeFilter', 'Element', 'HTMLElement', 'HTMLInputElement',
+        'HTMLButtonElement', 'MutationObserver', 'Event', 'KeyboardEvent', 'CustomEvent', 'DOMParser'])
+        globalThis[name] = dom.window[name];
+      Object.defineProperty(globalThis, 'navigator', { configurable: true, value: dom.window.navigator });
+      window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
+      HTMLElement.prototype.scrollTo = () => {};
+      HTMLElement.prototype.scrollIntoView = () => {};
+      const sources = [];
+      globalThis.EventSource = class {
+        static CLOSED = 2;
+        readyState = 1;
+        constructor() { sources.push(this); }
+        close() { this.readyState = 2; }
+      };
+      const reads = [];
+      let ownerId = 'synthetic-owner';
+      let expireRead = false;
+      const deadlines = [];
+      AbortSignal.timeout = () => {
+        const controller = new AbortController();
+        deadlines.push(controller);
+        return controller.signal;
+      };
+      const threadId = '00000000-0000-4000-8000-000000000901';
+      const nextThreadId = '00000000-0000-4000-8000-000000000902';
+      const message = (id, text) => ({ id, role: 'assistant', text, attachments: [],
+        turnId: null, createdAt: '2026-11-19T12:00:00Z' });
+      const state = (messages, current = threadId) => ({
+        threadId: current, turns: [], activity: [], tasks: [],
+        verificationRequests: [], configuration: { llmReady: true }, messages,
+      });
+      globalThis.fetch = async (path, options = {}) => {
+        if (path === '/api/session') return Response.json({
+          user: { id: ownerId, name: 'Synthetic', email: null, avatarUrl: null },
+          settings: { theme: 'system', onboardingCompleted: true, usageData: false, traces: false },
+          capabilities: { developer: false, traces: false },
+        });
+        if (path === '/api/state') return new Promise((resolve, reject) => {
+          reads.push({ resolve, signal: options.signal });
+          if (expireRead) options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+        });
+        if (path === '/api/conversation/reset') return Response.json({ ok: true, threadId: nextThreadId });
+        if (path === '/api/apps') return Response.json([]);
+        if (path === '/api/trust') return Response.json({});
+        if (path === '/api/speech') return Response.json({ transcription: true });
+        if (path === '/api/onboarding/introduction') return Response.json({ messageId: null });
+        throw new Error('Unexpected request: ' + path);
+      };
+      const { createElement, act, StrictMode } = await import('react');
+      const { createRoot } = await import('react-dom/client');
+      const { sessionStore } = await import('./src/web/lib/session.ts');
+      const { useAppState } = await import('./src/web/hooks/use-app-state.ts');
+      const { Chat } = await import('./src/web/pages/chat.tsx');
+      await sessionStore.refresh();
+      let app;
+      function Screen() {
+        app = useAppState(ownerId);
+        return app.state ? createElement(Chat, {
+          ownerId, state: app.state, streams: app.streams,
+          refresh: app.refresh, resetConversation: app.resetConversation,
+        }) : createElement('p', null, 'Loading');
+      }
+      let root = createRoot(document.getElementById('root'));
+      const event = data => sources.at(-1).onmessage({ data: JSON.stringify(data) });
+      const complete = (read, value) => act(async () => read.resolve(Response.json(value)));
+      try {
+        await act(async () => root.render(createElement(Screen)));
+        const first = reads[0];
+        await act(async () => sources[0].onopen());
+        for (let index = 0; index < 20; index++)
+          await act(async () => event({ type: 'refresh' }));
+        const saved = message('saved-reply', 'Synthetic saved reply');
+        await complete(first, state([saved]));
+        assert.ok(document.querySelector('[data-message-id="saved-reply"]'),
+          'The completed state read must show its saved reply during repeated updates.');
+        assert.equal(first.signal.aborted, false);
+        assert.equal(reads.length, 2);
+        let refreshed = false;
+        const awaitedRefresh = app.refresh().then(() => { refreshed = true; });
+        assert.equal(refreshed, false);
+        const activity = [{ turnId: 'synthetic-work', taskId: null, title: null,
+          step: null, site: null, since: '2026-11-19T12:00:00Z' }];
+        await act(async () => event({ type: 'activity', items: activity }));
+        const approval = { ...message('pending-approval', 'Synthetic pending change'),
+          approval: { id: 'synthetic-approval', state: 'pending', title: 'Save change', app: 'Nod', slug: 'nod' } };
+        await complete(reads[1], state([saved, message('newer-reply', 'Synthetic newer reply'), approval]));
+        assert.ok(document.querySelector('[data-message-id="newer-reply"]'));
+        assert.ok(document.querySelector('[data-message-id="pending-approval"] button'));
+        assert.deepEqual(app.state.activity, activity);
+        assert.equal(refreshed, false);
+        await complete(reads.at(-1), state([saved, message('awaited-reply', 'Synthetic awaited reply'), approval]));
+        await awaitedRefresh;
+        assert.equal(refreshed, true);
+        assert.ok(document.querySelector('[data-message-id="awaited-reply"]'));
+        await act(async () => event({ type: 'refresh' }));
+        const failed = reads.at(-1);
+        await act(async () => event({ type: 'refresh' }));
+        await act(async () => failed.resolve(Response.json({ error: 'Synthetic state read failed' }, { status: 503 })));
+        assert.match(app.error, /Synthetic state read failed/);
+        assert.ok(document.querySelector('[data-message-id="pending-approval"] button'));
+        await complete(reads.at(-1), state([saved, message('recovered-reply', 'Synthetic recovered reply')]));
+        assert.equal(app.error, '');
+        assert.ok(document.querySelector('[data-message-id="recovered-reply"]'));
+        expireRead = true;
+        await act(async () => event({ type: 'refresh' }));
+        expireRead = false;
+        const timedOut = reads.at(-1);
+        const deadline = deadlines.at(-1);
+        await act(async () => event({ type: 'refresh' }));
+        const beforeTimeout = reads.length;
+        await act(async () => deadline.abort(new DOMException('Synthetic deadline', 'TimeoutError')));
+        assert.equal(timedOut.signal.aborted, true);
+        assert.match(app.error, /did not finish within 15 seconds/);
+        assert.equal(reads.length, beforeTimeout + 1);
+        assert.equal(reads.at(-1).signal.aborted, false);
+        await complete(reads.at(-1), state([message('after-timeout', 'Synthetic reply after timeout')]));
+        assert.equal(app.error, '');
+        assert.ok(document.querySelector('[data-message-id="after-timeout"]'));
+        await complete(timedOut, state([message('timed-out-reply', 'Synthetic expired reply')]));
+        assert.equal(document.querySelector('[data-message-id="timed-out-reply"]'), null);
+        await act(async () => event({ type: 'refresh' }));
+        const old = reads.at(-1);
+        await act(async () => event({ type: 'refresh' }));
+        await act(async () => app.resetConversation(threadId));
+        assert.equal(app.state.threadId, nextThreadId);
+        assert.equal(app.error, '');
+        assert.equal(document.querySelector('[data-message-id="saved-reply"]'), null);
+        await act(async () => event({ type: 'refresh' }));
+        assert.equal(old.signal.aborted, true);
+        assert.notEqual(reads.at(-1), old);
+        await complete(reads.at(-1), state([message('new-thread-reply', 'Synthetic new conversation')], nextThreadId));
+        assert.ok(document.querySelector('[data-message-id="new-thread-reply"]'));
+        const resetReads = reads.length;
+        await complete(old, state([message('late-reply', 'Synthetic late reply')]));
+        assert.equal(app.state.threadId, nextThreadId);
+        assert.equal(document.querySelector('[data-message-id="late-reply"]'), null);
+        assert.equal(reads.length, resetReads);
+        await act(async () => event({ type: 'refresh' }));
+        const unmounted = reads.at(-1);
+        await act(async () => event({ type: 'refresh' }));
+        await act(async () => root.unmount());
+        assert.equal(unmounted.signal.aborted, true);
+        const count = reads.length;
+        const retiredSource = sources[0];
+        sessionStore.invalidate();
+        ownerId = 'other-synthetic-owner';
+        await sessionStore.refresh();
+        root = createRoot(document.getElementById('root'));
+        await act(async () => root.render(createElement(StrictMode, null, createElement(Screen, { key: ownerId }))));
+        assert.equal(reads.length, count + 2);
+        const abandoned = reads.at(-2);
+        assert.equal(abandoned.signal.aborted, true);
+        await act(async () => retiredSource.onmessage({ data: JSON.stringify({ type: 'refresh' }) }));
+        await complete(unmounted, state([message('unmounted-reply', 'Synthetic unmounted reply')]));
+        assert.equal(reads.length, count + 2);
+        await complete(reads.at(-1), state([message('other-owner-reply', 'Synthetic other owner reply')]));
+        assert.ok(document.querySelector('[data-message-id="other-owner-reply"]'));
+        await complete(abandoned, state([message('abandoned-reply', 'Synthetic abandoned reply')]));
+        assert.equal(reads.length, count + 2);
+        assert.equal(document.querySelector('[data-message-id="abandoned-reply"]'), null);
+        assert.equal(document.querySelector('[data-message-id="unmounted-reply"]'), null);
+        assert.equal(document.querySelector('[data-message-id="saved-reply"]'), null);
+      } finally {
+        await act(async () => root.unmount());
+        dom.window.close();
+      }
+    `,
+  });
+  assert.equal(result.exitCode, 0, result.stdout + result.stderr);
+});
+
 test('chat shows pending sends and active work before a model step', async () => {
   const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
     timeoutMs: 20_000,

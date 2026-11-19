@@ -2,6 +2,7 @@ export class ModelServiceError extends Error {
   constructor(
     message: string,
     readonly reason?: string,
+    readonly status?: number,
   ) {
     super(message);
   }
@@ -68,5 +69,8 @@ export async function modelServiceError(
   return new ModelServiceError(
     `${service} failed (HTTP ${response.status})${reason ? `: ${redact(reason).slice(0, 2000)}` : '.'}`,
     serviceReason ? redact(serviceReason) : undefined,
+    Number.isInteger(response.status) && response.status >= 100 && response.status <= 599
+      ? response.status
+      : undefined,
   );
 }

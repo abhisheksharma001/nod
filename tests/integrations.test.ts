@@ -3353,6 +3353,10 @@ test('hosted connection proof signs only the opened broker popup challenge for i
         for (let attempt = 0; attempt < 100 && !predicate(); attempt++) await delay(10);
         assert.ok(predicate(), 'The browser protocol did not reach the expected step.');
       };
+      await delay(50);
+      assert.equal(Boolean(browserKey), false);
+      assert.equal(popup.location.href, '');
+      (dom.window.document.getElementById('connect') as HTMLButtonElement).click();
       (dom.window.document.getElementById('connect') as HTMLButtonElement).click();
       await until(() => browserKey !== undefined && popup.location.href.startsWith(brokerOrigin));
       const challenge = [
@@ -3421,6 +3425,97 @@ test('hosted connection proof signs only the opened broker popup challenge for i
       dispatch(message);
       await delay(25);
       assert.equal(proofs.length, 1);
+    });
+  }
+});
+
+test('a discarded app sign-in closes its connection browser attempt', async (t) => {
+  for (const hosted of [false, true]) {
+    await t.test(hosted ? 'hosted' : 'native', async (t) => {
+      const origin = hosted ? 'https://nod.customer.example' : 'http://localhost:4310';
+      const browser = createIntegrationBrowser(hosted ? { origin } : undefined);
+      t.after(() => browser.close());
+      const app = Fastify();
+      t.after(() => app.close());
+      if (hosted) {
+        registerLocalAccess(app, 4310, { key: 'synthetic-owner-key', origin });
+        browser.registerRoutes(app);
+      }
+      const root = await mkdtemp(join(tmpdir(), 'nod-discarded-attempt-'));
+      t.after(() => rm(root, { recursive: true, force: true }));
+      let requests = 0;
+      const proxy = createComposioProxy({
+        dataRoot: root,
+        ownerId: 'fixture-owner',
+        keyStore: installationKeyStore,
+        checkpoint: fixtureIdentityCheckpoint,
+        url: 'https://proxy.example.test',
+        request: async () => {
+          requests++;
+          throw new Error('The synthetic connection service is offline.');
+        },
+        browser,
+      });
+      await proxy.initialize();
+      const provider = createComposioProvider({ proxy });
+      const authorize = () =>
+        provider.authorize!(
+          'fixture-owner',
+          'gmail',
+          `${origin}/api/apps/callback?state=${randomBytes(32).toString('base64url')}`,
+        );
+      const discarded = await authorize();
+      const survivor = await authorize();
+      assert.equal(browser.owns(discarded.url), true);
+      const url = new URL(discarded.url);
+      const page = hosted
+        ? (await app.inject({ url: url.pathname, headers: { host: url.host } })).body
+        : await (await fetch(discarded.url)).text();
+      const bridgeKey = hosted
+        ? JSON.parse(page.match(/const \{brokerOrigin,id,expiresAt,bridgeKey\}=(.+);/)![1])
+            .bridgeKey
+        : JSON.parse(page.match(/const bridgeKey=("[^"]+");/)![1]);
+      await provider.deleteAccount(discarded.accountId, 'fixture-owner');
+      assert.equal(browser.owns(discarded.url), false);
+      assert.equal(browser.owns(survivor.url), true);
+      const browserKey = generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).publicKey.export({
+        format: 'jwk',
+      });
+      if (hosted) {
+        assert.equal(
+          (await app.inject({ url: url.pathname, headers: { host: url.host } })).statusCode,
+          403,
+        );
+        const late = await app.inject({
+          method: 'POST',
+          url: url.pathname,
+          headers: { host: url.host, origin, 'x-nod-bridge': bridgeKey },
+          payload: { browserKey },
+        });
+        assert.equal(late.statusCode, 403);
+      } else {
+        await assert.rejects(fetch(discarded.url));
+        await assert.rejects(
+          fetch(`${url.origin}/start`, {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              origin: url.origin,
+              'x-nod-bridge': bridgeKey,
+            },
+            body: JSON.stringify({ browserKey }),
+          }),
+        );
+      }
+      assert.equal(requests, 0);
+      await provider.deleteAccount(survivor.accountId, 'fixture-owner');
+      for (let attempt = 0; attempt < 20; attempt++) {
+        const next = await authorize();
+        await provider.deleteAccount(next.accountId, 'fixture-owner');
+      }
+      const last = await authorize();
+      assert.equal(browser.owns(last.url), true);
+      assert.equal(requests, 0);
     });
   }
 });
@@ -3560,6 +3655,64 @@ test('connection bridge binds a single browser bootstrap to one installation att
   await assert.rejects(
     browser.open(randomBytes(32).toString('base64url'), brokerOrigin, async () => ''),
   );
+});
+
+test('native connection waits for the owner and refuses a cancelled or expired start', async (t) => {
+  const { IDBFactory } = await import('fake-indexeddb');
+  for (const outcome of ['continue', 'cancel', 'expire'] as const) {
+    await t.test(outcome, async (t) => {
+      const browser = createIntegrationBrowser();
+      t.after(() => browser.close());
+      const id = randomBytes(32).toString('base64url');
+      let starts = 0;
+      const url = await browser.open(id, 'https://proxy.example.test', async () => {
+        starts++;
+        return 'https://proxy.example.test/v2/connect/pair?ticket=synthetic-consent';
+      });
+      const html = await (await fetch(url)).text();
+      const dom = new JSDOM(html, {
+        url,
+        runScripts: 'dangerously',
+        beforeParse(window) {
+          Object.defineProperty(window, 'crypto', { value: webcrypto });
+          Object.defineProperty(window, 'indexedDB', { value: new IDBFactory() });
+          Object.defineProperty(window, 'structuredClone', { value: structuredClone });
+          window.fetch = (input, init) =>
+            fetch(new URL(String(input), url), {
+              ...init,
+              headers: {
+                ...Object.fromEntries(new Headers(init?.headers)),
+                origin: new URL(url).origin,
+              },
+            });
+        },
+      });
+      t.after(() => dom.window.close());
+      await delay(100);
+      assert.equal(Number(starts), 0);
+      assert.equal(browser.remote(url), undefined);
+      const button = dom.window.document.getElementById('connect') as HTMLButtonElement;
+      assert.ok(button && !button.disabled);
+      if (outcome === 'cancel') browser.finish(id);
+      if (outcome === 'expire') {
+        const expired = Date.now() + 11 * 60_000;
+        Object.defineProperty(dom.window.Date, 'now', { value: () => expired });
+      }
+      button.click();
+      button.click();
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (
+          outcome === 'continue'
+            ? starts === 1
+            : dom.window.document.body.classList.contains('failed')
+        )
+          break;
+        await delay(10);
+      }
+      assert.equal(starts, outcome === 'continue' ? 1 : 0);
+      if (outcome !== 'continue') assert.ok(dom.window.document.body.classList.contains('failed'));
+    });
+  }
 });
 
 test(
@@ -3723,6 +3876,9 @@ fetch('/v2/connect/verify',{method:'POST',headers:{'Content-Type':'application/j
         '--disable-background-networking',
         '--no-first-run',
         `--user-data-dir=${profile}`,
+        '--remote-debugging-port=0',
+        '--password-store=basic',
+        '--use-mock-keychain',
         bridgeUrl,
       ],
       { env: serviceEnvironment(), stdio: 'ignore' },
@@ -3730,6 +3886,59 @@ fetch('/v2/connect/verify',{method:'POST',headers:{'Content-Type':'application/j
     childClosed = new Promise<void>((resolve) => {
       child!.once('close', () => resolve());
     });
+    let targets: Array<{ url: string; webSocketDebuggerUrl: string }> = [];
+    const targetDeadline = performance.now() + 10_000;
+    while (performance.now() < targetDeadline) {
+      try {
+        const [port] = (await readFile(join(profile, 'DevToolsActivePort'), 'utf8')).split('\n');
+        targets = await (
+          await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(2000) })
+        ).json();
+        if (targets.some((target) => target.url === bridgeUrl)) break;
+      } catch {}
+      await delay(50);
+    }
+    const target = targets.find((target) => target.url === bridgeUrl);
+    assert.ok(target);
+    assert.equal(Boolean(browserKey), false);
+    assert.equal(verified, 0);
+    assert.equal(callbacks, 0);
+    const socket = new WebSocket(target.webSocketDebuggerUrl);
+    t.after(() => socket.close());
+    await once(socket, 'open');
+    type BrowserReply = { id: number; result?: { result?: { value?: unknown } } };
+    let commandId = 0;
+    const pending = new Map<number, (reply: BrowserReply) => void>();
+    socket.addEventListener('message', (event) => {
+      const reply = JSON.parse(String(event.data)) as BrowserReply;
+      if (!reply || !Number.isSafeInteger(reply.id) || !pending.has(reply.id)) return;
+      const receive = pending.get(reply.id);
+      if (typeof receive === 'function') {
+        pending.delete(reply.id);
+        receive(reply);
+      }
+    });
+    const evaluate = (expression: string) => {
+      const id = ++commandId;
+      const response = new Promise<BrowserReply>((resolve) => pending.set(id, resolve));
+      socket.send(JSON.stringify({ id, method: 'Runtime.evaluate', params: { expression } }));
+      return response;
+    };
+    let ready = false;
+    for (let attempt = 0; attempt < 200; attempt++) {
+      const reply = await evaluate("Boolean(document.getElementById('connect'))");
+      if (reply.result?.result?.value === true) {
+        ready = true;
+        break;
+      }
+      await delay(25);
+    }
+    assert.equal(ready, true);
+    assert.equal(Boolean(browserKey), false);
+    const clickResult = await evaluate(
+      "(() => { const button = document.getElementById('connect'); if (!button || button.disabled) return false; button.click(); button.click(); return true; })()",
+    );
+    assert.equal(clickResult.result?.result?.value, true, JSON.stringify(clickResult));
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
@@ -8489,6 +8698,7 @@ function composioProxyFixture(
     parseCallback: async () => assert.fail('Unexpected fixture callback.'),
     upload: async () => assert.fail('Unexpected fixture upload.'),
     isPendingAccount: () => false,
+    finishPendingAccount: () => assert.fail('Unexpected fixture sign-in discard.'),
     backoff: () => undefined,
     ...overrides,
   };
@@ -10758,8 +10968,13 @@ test(
       assert.equal((await discovered.servers())[0].tools[0].name, 'known_tool');
       assert.equal(requests, 2);
       release();
-      await delay(0);
-      assert.equal((await discovered.servers())[0].tools[0].name, 'new_tool');
+      let refreshed = await discovered.servers();
+      for (let attempt = 0; attempt < 100 && refreshed[0].tools[0].name !== 'new_tool'; attempt++) {
+        await delay(10);
+        refreshed = await discovered.servers();
+      }
+      assert.equal(refreshed[0].tools[0].name, 'new_tool');
+      assert.equal(requests, 2);
       await pool.query('DELETE FROM discovered_connections WHERE id=$1', [connectionId]);
       assert.deepEqual(await discovered.servers(), []);
     } finally {

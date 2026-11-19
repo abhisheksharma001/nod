@@ -37,6 +37,8 @@ flowchart TD
 
 Messages and schedule fires become turns in PostgreSQL with a `thread-drain` job. App events and source checks feed one observer through a saved source queue. The worker picks up the job and asks the runtime to run a turn. The runtime opens a Pi agent session, and Pi calls tools that act in the workspace, the browser and your connected apps.
 
+The web client reads saved chat state after a server update. A new update during a read queues one more read. It does not cancel the active read, so frequent updates cannot keep saved replies or approval cards from appearing. A read stops after 15 seconds and shows a timeout error. A queued read can then run. A conversation reset or account change still blocks old replies.
+
 ## Main ideas
 
 <CardGrid>

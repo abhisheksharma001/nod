@@ -47,7 +47,9 @@ You need two things from the model server:
 
 </Steps>
 
-Nod reads each Ollama model's details. When the server reports model capabilities, Nod lists only models that support tools. Models with missing capability data also appear. Nod sends images to vision models, offers the model's thinking levels and uses its context length.
+Nod reads each Ollama model's details. When the server reports model capabilities, Nod lists only models that support tools. Models with missing capability data also appear. Nod sends images to vision models and offers the model's thinking levels.
+
+If a loaded model's name exactly matches its entry in Nod's model list, Nod uses the smaller of its loaded context and the limit in its model details. After you load a model or change its context, refresh the connection's model list. If Ollama does not return a loaded context, Nod uses the model details. These can state the training limit rather than the server's active limit. Set the server context before you load the model.
 
 </TabItem>
 <TabItem label="LM Studio">
