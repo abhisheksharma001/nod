@@ -133,8 +133,15 @@ function senderApps(addresses: string[], own: string[]) {
   return found;
 }
 
-export function masked(text: string) {
-  return text
+export function masked(value: unknown) {
+  return JSON.stringify(value ?? null, (_key, entry: unknown) => {
+    if (typeof entry !== 'string' || !/^\s*[[{]/.test(entry)) return entry;
+    try {
+      return JSON.parse(entry) as unknown;
+    } catch {
+      return entry;
+    }
+  })
     .replace(/https?:\/\/(?:[^\s"\\]|\\["\\/])+/g, '[link]')
     .replace(/[A-Z0-9._%+-]+@[A-Z0-9-]+(?:\.[A-Z0-9-]+)*\.[A-Z]{2,}/gi, '[email]')
     .replace(/\bsk-[A-Za-z0-9_-]{12,}/g, '[key]')
@@ -392,9 +399,8 @@ export function createOnboardingSuggestions(options: {
             accountSignal,
           );
           if (!(await active(account, accountSignal))) break;
-          const full = JSON.stringify(clean ?? null);
           for (const slug of senderApps(senderAddresses(clean), own)) seen.add(slug);
-          const text = masked(full).slice(0, briefLimit / Math.max(1, accounts.length * 2));
+          const text = masked(clean).slice(0, briefLimit / Math.max(1, accounts.length * 2));
           if (text && text !== 'null') observations.push(text);
         } catch {
           accountSignal.throwIfAborted();
