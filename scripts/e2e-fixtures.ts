@@ -676,6 +676,7 @@ const toolDefinitions = [
       type: 'object',
       properties: {
         recipient_email: { type: 'string', maxLength: 320 },
+        extra_recipients: { type: 'array', items: { type: 'string', maxLength: 320 } },
         subject: { type: 'string', maxLength: 300 },
         body: { type: 'string', maxLength: 12000 },
         user_id: { type: 'string', enum: ['me'] },
@@ -1158,11 +1159,22 @@ export function createIntegrationFixture(
           if (action === 'GMAIL_CREATE_EMAIL_DRAFT') {
             if (
               Object.keys(args).some(
-                (key) => !['recipient_email', 'subject', 'body', 'user_id'].includes(key),
+                (key) =>
+                  !['recipient_email', 'extra_recipients', 'subject', 'body', 'user_id'].includes(
+                    key,
+                  ),
               ) ||
               typeof args.recipient_email !== 'string' ||
               !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(args.recipient_email) ||
               args.recipient_email.length > 320 ||
+              (args.extra_recipients !== undefined &&
+                (!Array.isArray(args.extra_recipients) ||
+                  args.extra_recipients.some(
+                    (recipient) =>
+                      typeof recipient !== 'string' ||
+                      recipient.length > 320 ||
+                      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient),
+                  ))) ||
               typeof args.subject !== 'string' ||
               !args.subject ||
               args.subject.length > 300 ||
@@ -1177,7 +1189,9 @@ export function createIntegrationFixture(
               accountId: accountId!,
               message: {
                 id: `fixture-draft-message-${item.id}`,
-                to: args.recipient_email,
+                to: [args.recipient_email, ...((args.extra_recipients as string[]) ?? [])].join(
+                  ', ',
+                ),
                 subject: args.subject,
                 body: args.body,
                 labelIds: ['DRAFT'],

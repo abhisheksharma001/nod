@@ -154,6 +154,12 @@ Telegram can change its update numbers after seven days without messages. Nod st
 
 The Channels page checks status every five seconds while visible. During Telegram pairing, or with the WhatsApp connection panel open, it checks every two seconds. **Connecting** means WhatsApp is trying to reconnect. **Connection failed** shows a stopped connection and its reason. WhatsApp errors distinguish a signed-out device, a replaced connection, a rejected session or device version, an incorrect bot account, and local storage or message errors. The connection panel shows the same reason. Connection failures also enter the local diagnostic log, without WhatsApp phone numbers, QR codes, or device keys. When the QR connection ignores an incoming WhatsApp message, the log records only a fixed reason, the connection mode, how WhatsApp addressed the chat (phone number, private ID or other), and how many similar messages it skipped. It records each reason and addressing type at most once a minute. The log never includes the message, the sender, or any number or ID.
 
+## Answer approval questions
+
+In Telegram, tap **Approve** or **Cancel** below a new approval question. If the question appears without buttons, reply directly to it with yes or no. If it spans more than one message, reply to one of them, including the reply guidance. In WhatsApp, reply directly to the question. See [how approvals work](/trust/approvals/).
+
+Approval buttons work automatically in Telegram polling mode. If you set up a Telegram webhook in Nod before buttons were available, open **Channels** and select **Reconnect**. For a webhook you registered yourself, [update the Telegram webhook registration](/deploy/configuration/#telegram-webhooks).
+
 ## Private steps happen in the Nod app
 
 Passwords, saved logins, app sign-ins and payment approvals never go through a chat app. When a task started on Telegram or WhatsApp needs one, Nod asks you to open Nod. Finish the step there, and the task carries on and replies in the chat app.

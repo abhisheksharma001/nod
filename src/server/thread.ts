@@ -52,7 +52,12 @@ import type {
   RuntimeContext,
   RuntimeResult,
 } from '../ports/agent.ts';
-import { appConfirmation, ContextLimitError, ModelRequestError } from '../ports/agent.ts';
+import {
+  appConfirmation,
+  ContextLimitError,
+  ModelRequestError,
+  ToolFailureError,
+} from '../ports/agent.ts';
 import { isMessageReaction, reactionEmoji } from '../shared/emoji.ts';
 import { defaultPreferences, isQuietTime } from './preferences.ts';
 import { formattingLocale, timeZoneRegion } from '../shared/date-locale.ts';
@@ -170,7 +175,11 @@ export interface ThreadDependencies {
     input:
       { kind: 'interrupted'; work?: string } | { kind: 'failed'; error: string; work?: string },
   ) => Promise<string>;
-  observeTurn?: (turnId: string, operation: () => Promise<void>) => Promise<void>;
+  observeTurn?: (
+    turnId: string,
+    operation: () => Promise<void>,
+    sessionId: string,
+  ) => Promise<void>;
   taskChecks?: (threadId: string) => Promise<void>;
   taskClassification?: boolean;
   consumers?: WorkConsumers;
@@ -205,6 +214,7 @@ export interface ThreadDependencies {
   accountProfile?: () => Promise<RuntimeContext['account']>;
   connectedApps?: () => Promise<NonNullable<RuntimeContext['connectedApps']>>;
   localFiles?: boolean;
+  computerUse?: boolean;
   mcpServers?: () => Promise<NonNullable<RuntimeContext['mcpServers']>>;
   memoryContext?: () => Promise<RuntimeContext['memory']>;
   recall?: (
@@ -236,11 +246,6 @@ export interface ThreadDependencies {
     input: unknown,
     show: (image: Uint8Array) => Promise<void>,
   ) => ReturnType<NonNullable<RuntimeContext['requestPayment']>>;
-  checkWorkspaceCommand?: (
-    turn: TurnRef,
-    input: Parameters<NonNullable<RuntimeContext['checkWorkspaceCommand']>>[0],
-    signal: AbortSignal,
-  ) => ReturnType<NonNullable<RuntimeContext['checkWorkspaceCommand']>>;
   integration: (
     turn: TurnRef,
     action: string,
@@ -274,7 +279,11 @@ export interface ThreadDependencies {
     turn: TurnRef,
     action: string,
     args: Record<string, unknown>,
-    provenance: { sourceMessageId: string | null; admit?: (asks: boolean) => Promise<void> },
+    provenance: {
+      sourceMessageId: string | null;
+      signal: AbortSignal;
+      admit?: (asks: boolean) => Promise<void>;
+    },
   ) => Promise<unknown>;
 }
 
@@ -944,7 +953,7 @@ async function withdraw(client: PoolClient, turnIds: string[], wholeRequest: boo
 export async function cancelTurns(
   client: PoolClient,
   threadId: string,
-  scope: { sessionId?: string; background?: boolean } = {},
+  scope: { sessionId?: string; background?: boolean; withdrawRequest?: boolean } = {},
   analytics?: CaptureAnalytics,
   actor: 'owner' | 'agent' = 'owner',
 ) {
@@ -966,7 +975,7 @@ export async function cancelTurns(
     "UPDATE turns SET status='cancelled',finished_at=now() WHERE thread_id=$1 AND owner_id=$2 AND ($3::uuid IS NULL OR session_id=$3) AND (NOT $4 OR session_id<>$1) AND status IN ('queued','running','waiting') RETURNING id,session_id",
     values,
   );
-  if (actor === 'owner') {
+  if (actor === 'owner' && scope.withdrawRequest !== false) {
     const stopped = new Set(current.rows.map((row) => row.id as string));
     await withdraw(
       client,
@@ -1113,7 +1122,7 @@ export async function clearChatContext(
       chatStop = new AbortController();
       previous.abort(clearedIntakeError());
     });
-    await cancelTurns(client, thread.id, { sessionId: thread.id });
+    await cancelTurns(client, thread.id, { sessionId: thread.id, withdrawRequest: false });
     const turnId = randomUUID();
     await client.query(
       `INSERT INTO turns(id,owner_id,thread_id,session_id,source,source_id,message_id,prompt,channel,status,finished_at)
@@ -1499,11 +1508,13 @@ async function failTurn(
     failure,
     contextExhausted,
     cause,
+    expected = false,
   }: {
     next?: string;
     failure?: 'model' | 'offline' | 'unknown';
     contextExhausted?: boolean;
     cause?: Pick<ScheduleRunPresentation, 'reason' | 'code' | 'link'>;
+    expected?: boolean;
   } = {},
 ) {
   const modelFailure = failure === 'model' || failure === 'offline';
@@ -1596,7 +1607,7 @@ async function failTurn(
     if (!current.rowCount) return;
     const ref = { threadId: turn.thread_id, turnId, taskMessageId: turn.taskMessageId };
     const streamId = `${failureStream}:${turnId}`;
-    if (failure === 'unknown')
+    if (failure === 'unknown' && !expected)
       await insertBugReportDraft(
         client,
         ref,
@@ -1732,7 +1743,11 @@ async function drainThread(threadId: string, dependencies: ThreadDependencies) {
   if (claimed.length) refresh();
   for (const turn of claimed) {
     const execute = () => executeTurn(turn, dependencies);
-    const work = (dependencies.observeTurn ? dependencies.observeTurn(turn.id, execute) : execute())
+    const work = (
+      dependencies.observeTurn
+        ? dependencies.observeTurn(turn.id, execute, turn.session_id)
+        : execute()
+    )
       .catch((error) => logFailure('turn_unfinished', error, { threadId, turnId: turn.id }))
       .then(() => drainNext(threadId))
       .finally(refresh);
@@ -1843,7 +1858,7 @@ async function loadTurnContext(turn: any, dependencies: ThreadDependencies) {
       [ownerId, turn.session_id, turn.id],
     ),
     pool.query(
-      'SELECT time_zone,locale,hour_cycle,notification_rule,rules,quiet_hours_enabled,quiet_start,quiet_end FROM preferences WHERE owner_id=$1',
+      'SELECT time_zone,locale,hour_cycle,notification_rule,rules,quiet_hours_enabled,quiet_start,quiet_end,computer_use FROM preferences WHERE owner_id=$1',
       [ownerId],
     ),
     dependencies.accountProfile?.().catch(() => undefined),
@@ -1914,6 +1929,7 @@ async function loadTurnContext(turn: any, dependencies: ThreadDependencies) {
       ...(learnedSkills?.length ? { learnedSkills } : {}),
       ...(connectedApps ? { connectedApps } : {}),
       ...(dependencies.localFiles ? { localFiles: true } : {}),
+      ...(dependencies.computerUse && preference?.computer_use ? { computerUse: true } : {}),
       ...(mcpServers?.length ? { mcpServers } : {}),
     },
   };
@@ -2409,17 +2425,6 @@ async function executeTurn(turn: any, dependencies: ThreadDependencies) {
             ),
           }
         : {}),
-      ...(dependencies.checkWorkspaceCommand
-        ? {
-            checkWorkspaceCommand: fenced((input, callSignal) =>
-              dependencies.checkWorkspaceCommand!(
-                ref,
-                input,
-                AbortSignal.any([signal, callSignal]),
-              ),
-            ),
-          }
-        : {}),
       integration: fenced(async (action, args, callSignal?: AbortSignal, admit?) => {
         const operation = callSignal ? AbortSignal.any([signal, callSignal]) : signal;
         operation.throwIfAborted();
@@ -2438,7 +2443,7 @@ async function executeTurn(turn: any, dependencies: ThreadDependencies) {
           : value;
       }),
       manage: fenced((action, args, admit) =>
-        dependencies.manage(ref, action, args, { sourceMessageId, admit }),
+        dependencies.manage(ref, action, args, { sourceMessageId, signal, admit }),
       ),
       task:
         dependencies.task &&
@@ -2462,7 +2467,12 @@ async function executeTurn(turn: any, dependencies: ThreadDependencies) {
           ? undefined
           : async () => {
               if (signal.aborted) throw turnStopped();
-              if (await dependencies.spendingLimit?.()) return [];
+              try {
+                if (await dependencies.spendingLimit?.()) return [];
+              } catch (error) {
+                logFailure('queued_message_limit_failed', error, { threadId, turnId });
+                return [];
+              }
               const taken = await takeQueuedMessages(turnId, turn.session_id, turn.channel);
               if (taken.length) {
                 sourceMessageId = taken.at(-1)!.id;
@@ -2678,6 +2688,7 @@ async function executeTurn(turn: any, dependencies: ThreadDependencies) {
       if (
         await failTurn(turnId, dependencies.present, text, {
           failure,
+          expected: error instanceof ToolFailureError,
           next: alternative ?? (server ? offlineHint : undefined),
           contextExhausted: error instanceof ContextLimitError,
           cause: offline
