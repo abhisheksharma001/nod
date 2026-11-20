@@ -28,7 +28,12 @@ import {
   safeMessageLink,
   setupLink,
 } from '../lib/message-links';
-import { rehypeLocalLinks, rehypeMessageBreaks, remarkLinkDestinations } from '../lib/markdown';
+import {
+  rehypeDropBlankMessage,
+  rehypeLocalLinks,
+  rehypeMessageBreaks,
+  remarkLinkDestinations,
+} from '../lib/markdown';
 import { nextReaction, reactionName } from '../lib/reactions';
 import { SetupActions } from './setup-link';
 import { TelegramChatLink, useTelegramChatUrl } from './telegram-chat-link';
@@ -42,6 +47,7 @@ import { Tooltip } from './tooltip';
 import type { ImagePreview } from './attachment-images';
 import { MessagePresentation } from './message-presentation';
 import { BugReportCard } from './bug-report-card';
+import { ScheduleRunTrack } from './schedule-run';
 import { formatFullDateTime, formatTime, useDateFormat } from '../lib/date-format';
 import { copyContent, selectedText } from '../lib/clipboard';
 
@@ -215,6 +221,7 @@ export const MessageText = memo(function MessageText({
             rehypeMessageBreaks,
             rehypeLocalLinks,
             [rehypeSanitize, messageSchema],
+            rehypeDropBlankMessage,
           ]}
           components={{
             table: ({ node, ...props }) => (
@@ -355,6 +362,10 @@ export function MessageBubble({
   handoffPaused?: boolean;
 }) {
   const dateFormat = useDateFormat();
+  const run =
+    message.role === 'assistant' && message.presentation?.type === 'schedule-run'
+      ? message.presentation
+      : null;
   const visibleText =
     (message.role === 'user' ? message.displayText : undefined) ??
     message.audioCaption ??
@@ -691,7 +702,8 @@ export function MessageBubble({
     >
       <div className="message-content">
         {work && <WorkLabel work={work} />}
-        <div className="message-row">
+        {run && <ScheduleRunTrack run={run} />}
+        <div className="message-row" hidden={run?.outcome === 'failed'}>
           <div className={`message-bubble${!streaming && shownReaction ? ' has-reaction' : ''}`}>
             <div
               className="message-body"
@@ -797,6 +809,7 @@ export function MessageBubble({
                 !streaming &&
                 message.presentation &&
                 message.presentation.type !== 'apps' &&
+                message.presentation.type !== 'schedule-run' &&
                 (message.presentation.type === 'bug-report' ? (
                   <BugReportCard
                     key={message.presentation.draftId}

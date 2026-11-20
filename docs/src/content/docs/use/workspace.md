@@ -44,7 +44,7 @@ flowchart LR
 - **The browser.** Nod's browser runs in its own container. The workspace can't read its saved sign-ins.
 
 :::caution
-The workspace can reach the internet. Code that Nod runs there can download files and call websites.
+The workspace can reach the internet. Code that Nod runs there can download files and call websites. Commands run without a [trust check](/trust/approvals/#workspace-commands), because the workspace holds no keys or sign-ins. A command can still send files that are in the workspace to an outside site.
 :::
 
 ## Watch Nod's commands

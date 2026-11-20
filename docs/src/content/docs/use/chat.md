@@ -17,22 +17,22 @@ Nod follows your latest clear message's language, spoken or typed, including que
 
 Type in the message box and press Enter. Press Shift+Enter for a new line.
 
-Pasted text stays literal. Nod uses the clipboard's plain text even when the source also offers formatting. Line breaks, indentation and Markdown-looking characters such as `*priority*`, `# call` and `<u>text</u>` stay as written in the composer, the sent message and Nod's request. An unsent pasted draft keeps them after a reload.
+Pasted text stays literal by default. Nod uses the clipboard's plain text even when the source also offers formatting. Line breaks, indentation and Markdown-looking characters such as `*priority*`, `# call` and `<u>text</u>` stay as written in the composer, the sent message and Nod's request. If plain text in the same paragraph would change it, such as a `!` before a link or a `*` that pairs with italic text, the sent message adds backslashes: before that `!`, or before every `*`, `_`, `~` and backtick in the paragraph's plain text. A web or email address typed directly against formatting is sent as a link, such as `<https://example.com>`. An unsent pasted draft keeps them after a reload.
 
 Messages can contain up to 100,000 characters. Some emoji and symbols count as two characters toward this limit. If your text is longer, the composer keeps your draft and asks you to shorten it or attach the content as a file.
 
 Web and desktop chat limit text message attempts to 120 per minute and audio message attempts to 120 per minute. If you reach either limit, wait and send again.
 
-Use the formatting toolbar when you want formatted text, including underline and links. It also formats pasted text. Code stays literal, including text that looks like a link or a code fence.
+Use the formatting toolbar to add underline, links, and other formatting to typed or pasted text. To link a selection within one paragraph, paste a single URL beginning with `https://` or `http://`. Code stays literal, including text that looks like a link or a code fence.
 
 - **Attach files.** Select **Attach files**, press Command+U on Mac or Ctrl+U on Windows and Linux while writing a message, paste an image or drop files anywhere in the conversation. Each file stays inside the composer while it uploads. Select it to open the same file viewer used for sent attachments, or retry or remove a failed upload. Each file can be 90 MB or smaller. Nod gets a copy in its [workspace](/use/workspace/). It sees PNG, JPEG and WebP images directly, up to 3.75 MB each and 16 MB per message, unless the model you chose can't read images.
-- **Reply to a message.** Hover over a message and select **Reply**. On touch screens or in a narrow chat, hold or right-click the bubble to open **Reply**, **React** and **Copy**. You can also focus a message and press Shift+F10. Replies show a formatted excerpt in the composer and sent reply. Select it to jump to the original message, then select **Return to where you were** to go back. To see the time inside the bottom-right corner of a bubble, hover over the message, focus one of its controls, or tap its text.
+- **Reply to a message.** Hover over a message and select **Reply**. On touch screens or in a narrow chat, hold or right-click the bubble to open **Reply**, **React** and **Copy**. You can also focus a message and press Shift+F10. Replies show a formatted excerpt in the composer and sent reply. Select it to jump to the original message, then select **Return to previous position** to go back. To see the time inside the bottom-right corner of a bubble, hover over the message, focus one of its controls, or tap its text.
 
 Your unfinished draft stays on this device for your account and conversation. After a reload, Nod restores its text, reply target, and available uploaded files. It checks saved files before you can send them. If a check fails, select **Retry** or remove the file. An interrupted upload needs the original file again. Private entry values and recognized verification replies are excluded. A file that exceeds the limit is rejected individually; other valid files stay attached. Removing an uploaded draft file offers **Undo**.
 
 Unsent files become eligible for cleanup 24 hours after upload or their last successful renewal. Existing unsent uploads get a fresh 24-hour grace period on the first upgrade that adds cleanup. Keeping the draft open renews its files every five minutes. Returning to the app or restoring a draft checks and renews them again. Removed files stop renewing. You can still renew or send a file until cleanup starts deleting it. After that, attach it again from your device. Sent attachments and files Nod publishes are kept.
 
-Select a passage in a message, then **Reply to selection** to quote it. Selected passages keep their exact text, including literal symbols, and stay separate from your own message. Select a reply quote to visit its source. **Return to where you were** restores your reading position. Copy controls on code blocks and tables copy only that block. Table content pastes into spreadsheet cells. Message Copy includes formatted text where the clipboard supports it. **Copy Markdown** copies the source text.
+Select a passage in a message, then **Reply to selection** to quote it. Selected passages keep their exact text, including literal symbols, and stay separate from your own message. Select a reply quote to visit its source. **Return to previous position** restores your reading position. Copy controls on code blocks and tables copy only that block. Table content pastes into spreadsheet cells. Message Copy includes formatted text where the clipboard supports it. **Copy Markdown** copies the source text.
 
 Select **Search chat** to search stored messages in the current conversation. Search shows up to 50 recent matches, with the sender, date and highlighted text. Use the arrow keys to move between results and Enter to open a message. Escape closes search and returns focus to the control you used before opening it. Press Command/Ctrl+K outside an editor to open pages, files, and tasks. In the desktop app, Command/Ctrl+F opens conversation search outside an editor.
 
@@ -76,6 +76,8 @@ When a visual makes an answer easier to understand, nod can include images, maps
 
 Each visual appears as a single preview. Hover over it or focus it with the keyboard to reveal its expand control, which stays visible on touch screens. Select that control to inspect it in the file panel. A self-contained card can be the whole answer. Nod adds text for useful context or caveats instead of announcing the card or repeating its contents. Supplied sources and freshness details remain available inside the card. Nod can capture a page it visits and include the screenshot with its answer; select the image to inspect it in the file panel.
 
+When the file panel has more than one file, select the filename at the top to switch files. You can also use the previous and next buttons.
+
 When nod suggests apps to connect, it lists up to three below its message, each with a **Connect** button. Connect starts sign-in right there in the chat, the same as the email step in onboarding. If the app list fails to load, select **Try again** below the message. If catalog access is unavailable, select **Open Apps** to see the available connections. In Telegram and WhatsApp, nod names the apps to connect in [Apps](/connect/apps/) instead.
 
 Location cards pair a numbered overview with a list of places. Select a marker or place, then **Open in Maps** to open its marked location in OpenStreetMap. Select **Map** to load the selected place's street map in chat, or **Overview** to return to relative positions. Maps load only when you choose. With a marker or place focused, use the arrow keys to change selection. A place's **Source** link opens its supplied reference separately.
@@ -116,9 +118,9 @@ The message box stays open while Nod works, so you can send another message at a
 
 The line describes the work instead of showing internal tool names. When Nod hasn't named a step, it names the app, website or kind of work that's active, or the model Nod is waiting for. It never counts seconds or guesses when Nod will finish. When Nod answers, the answer takes its place. It clears when Nod asks you something or stops, and hides while the app reconnects. A failed send clears the line and shows an error. Steps come from Nod's own short descriptions, which appear as soon as Nod starts the tool they describe, and, when your model shares a summary of its reasoning, from that summary's heading, such as "Researching Málaga travel ideas".
 
-After an operation finishes, up to four recent operations appear below the line, with the newest first. Select the line to hide or show them. The current activity stays visible. The list covers only the current work and clears when a new request starts. It uses saved activity records and needs no extra model request.
+After an operation finishes, the line keeps up to four recent operations, with the newest first. Their details start closed for each turn. Select the line to show or hide them. The current activity stays visible. The list covers only the current work and clears when a new request starts. It uses saved activity records and needs no extra model request.
 
-![The current activity above four completed operations, beside the Nod mark and above the message box.](../../../assets/screens/chat-recent-activity.png)
+![Expanded recent activity below the current step and above the message box.](../../../assets/screens/chat-recent-activity.png)
 
 The line follows only the work on your messages. A task shows its progress on its own card, and a question from a task or schedule shows it on the small line above that question. While anything works, the message box says **Send another message to Nod…**. While a task works, a small dot pulses just above the top-right corner of the message box. A task that needs your answer shows a slightly larger pink dot with a question mark. Hover over a dot or focus it to see which task it is. Select it to open the task's card with a soft highlight: if the card is already on screen, the chat stays where it is; otherwise the chat scrolls to it.
 
@@ -192,6 +194,14 @@ To answer in your own words, type in **Type your own answer** at the bottom of t
 An action that needs your approval appears as a card with Nod's question and two choices: the action and **Cancel**. An email or message shows the app, the recipients, subject or channel and the text instead, with **Cancel** and the action as buttons below it. Once you answer, the card stays in the conversation, greyed out, with what you chose and what happened. While a sign-in waits for a verification code, a card under Nod's message asks you to send the code by itself in the message box. In Nod web and desktop, a payment that waits for your card's security code shows the same card; the code is the only card detail Nod takes there, and [Approve payment](/trust/payments/) takes it too.
 
 Nod doesn't ask for passwords or card numbers in chat. It uses a saved login or a private form instead. See [Vault](/trust/vault/).
+
+## Start a fresh chat
+
+Send `/clear` as a text message without attachments or a recording to start fresh chat context and a clean view. This command works without a model connection on the web, desktop, Telegram and WhatsApp.
+
+Nod stops work in the main chat. Independent tasks keep running, and saved task and schedule instructions stay valid. Files, apps, Vault, memory, schedules and settings stay. Previous messages remain available in chat search. The next message starts with fresh model context; automatic related-chat recall also starts at this point.
+
+Nod has one main chat. `/clear` does not create a second conversation or delete previous messages.
 
 ## Stop Nod
 
@@ -274,6 +284,8 @@ A request, task or schedule run that stops on an unexpected error outside the mo
 In Telegram and WhatsApp, the draft arrives as text. Reply "send" to share the summary, without a diagnostic report, since you can't review one there. To add the report, send the same draft from its card in Nod on your computer. Nod sends it only when your reply clearly asks for that, and otherwise asks you to confirm first. Nothing is sent until you click **Send report** or reply to send it.
 
 **Include diagnostic report** starts selected for every feedback category until you change it. It adds recent messages, tool inputs and results, errors, and app activity to help fix problems and improve Nod. Known secrets and recognized personal details are masked, but redaction can miss information.
+
+When a private sign-in choice fails a safety check, the report can include a fixed reason, such as a changed control or a covered button. This reason contains no page text, selector, website address or account value.
 
 Select **Review** to inspect the **Chat**, **Activity** and **Connections** tabs. Tool activity groups each input with its result and status. **Download** saves the same redacted report as a JSON file. Untick the checkbox to leave it out. Nod remembers your choice for your account on this device, including after sending or discarding a draft.
 

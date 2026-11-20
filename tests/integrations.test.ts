@@ -63,11 +63,13 @@ import { createIntegrationBrowser } from '../src/server/integration-browser.ts';
 import {
   createDiscoveredTransport,
   ownerAddress,
+  ownerFetch,
   safeRemoteFetch,
 } from '../src/providers/discovered/remote.ts';
 import { createAgentRuntime } from '../src/runtime/index.ts';
 import { createDiscoveredOAuth } from '../src/providers/discovered/oauth.ts';
 import { createDiscoveredConnections } from '../src/server/discovered-connections.ts';
+import { transaction } from '../src/server/transaction.ts';
 import { registerLocalAccess } from '../src/server/access.ts';
 import { createIntegrations, initializeIntegrationSchema } from '../src/server/integrations.ts';
 import { cachedIcons } from '../src/server/link-previews.ts';
@@ -196,7 +198,7 @@ test('app folders reject escaped paths, incomplete contracts, and unsupported se
       (value) => {
         value.mcpServers.linear = { type: 'stdio', command: 'node' };
       },
-      /streamable-http/,
+      /selected server must use streamable-http/,
     ],
     [
       'server',
@@ -204,7 +206,7 @@ test('app folders reject escaped paths, incomplete contracts, and unsupported se
       (value) => {
         value.connection.server = 'missing';
       },
-      /selected server/,
+      /mcp\.json has no server named missing\./,
     ],
     [
       'placeholder',
@@ -490,6 +492,18 @@ test('app access paths reject inconsistent API reads and more than 16 CLI fields
     false,
   );
   assert.throws(() => appRequestUrl(path.endpoint, 'account#private'), /path/);
+  assert.equal(
+    appRequestUrl(path.endpoint, '/images:annotate'),
+    'https://api.synthetic-nod.dev/v1/images:annotate',
+  );
+  for (const escape of [
+    '/../x',
+    '/%2e%2e/x',
+    '/x:y/../../z',
+    'http://evil.synthetic-nod.dev/x',
+    '//evil.synthetic-nod.dev/x',
+  ])
+    assert.throws(() => appRequestUrl(path.endpoint, escape), /saved API address/);
 });
 
 test(
@@ -1003,7 +1017,12 @@ test('app skills cannot shadow core guides or load without a trusted root', asyn
   assert.equal(library.read('community-guide').content, body);
   await mkdir(join(builtin, 'community-guide'));
   await writeFile(join(builtin, 'community-guide/SKILL.md'), body);
-  assert.throws(() => createSkillLibrary([builtin, apps], ['artifacts']), /metadata is invalid/);
+  assert.throws(
+    () => createSkillLibrary([builtin, apps], ['artifacts']),
+    (error: Error) =>
+      error.message.includes('community-guide') &&
+      ['builtin', 'apps'].every((root) => error.message.includes(join(root, 'community-guide'))),
+  );
 });
 
 test('published app schemas reject unsupported definitions with the runtime validators', async () => {
@@ -1028,6 +1047,15 @@ test('published app schemas reject unsupported definitions with the runtime vali
     },
     (value: any) => {
       value.displayName = ' Leading space';
+    },
+    (value: any) => {
+      value.displayName = 'Fixture\nApp';
+    },
+    (value: any) => {
+      value.displayName = 'Fixture\u202eApp';
+    },
+    (value: any) => {
+      value.displayName = 'Fixture\u2028App';
     },
     (value: any) => {
       value.requirements = ['   '];
@@ -1334,6 +1362,135 @@ function fakeProvider(session: IntegrationSession): IntegrationProvider {
     },
   };
 }
+
+test('remote MCP calls ask the server for progress so long calls can keep reporting', async (t) => {
+  const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
+  const { StreamableHTTPServerTransport } =
+    await import('@modelcontextprotocol/sdk/server/streamableHttp.js');
+  const server = createServer(async (request, response) => {
+    const mcp = new McpServer({ name: 'synthetic-jobs', version: '1' });
+    mcp.registerTool('long-job', { description: 'Run a long job' }, async (extra) => {
+      const progressToken = extra._meta?.progressToken;
+      if (progressToken === undefined)
+        return { content: [{ type: 'text', text: 'no progress token' }] };
+      for (const progress of [1, 2])
+        await extra.sendNotification({
+          method: 'notifications/progress',
+          params: { progressToken, progress, total: 3 },
+        });
+      return { content: [{ type: 'text', text: 'synthetic job result' }] };
+    });
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    response.on('close', () => void transport.close());
+    await mcp.connect(transport);
+    await transport.handleRequest(request, response);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const transport = createDiscoveredTransport(ownerFetch(origin), async (value) => value);
+  assert.deepEqual(await transport.callTool(`${origin}/mcp`, {}, 'long-job', {}), {
+    content: [{ type: 'text', text: 'synthetic job result' }],
+  });
+});
+
+test('remote MCP falls back to HTTP+SSE only when the server refuses Streamable HTTP', async (t) => {
+  const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
+  const { SSEServerTransport } = await import('@modelcontextprotocol/sdk/server/sse.js');
+  const token = 'synthetic-legacy-token';
+  const sessions = new Map<string, InstanceType<typeof SSEServerTransport>>();
+  const streams: string[] = [];
+  let failure: 'post' | 'stream' | undefined;
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url!, 'http://localhost');
+    const label = String(request.headers['x-fixture-case']);
+    if (url.pathname === '/mcp' && request.method === 'GET') streams.push(label);
+    if (request.headers.authorization !== `Bearer ${token}`) {
+      response.writeHead(401).end();
+      return;
+    }
+    if (url.pathname === '/mcp' && request.method === 'POST') {
+      response.writeHead(label === 'server-error' ? 500 : 405).end();
+      return;
+    }
+    if (url.pathname === '/mcp' && request.method === 'GET') {
+      const transport = new SSEServerTransport('/messages', response);
+      sessions.set(transport.sessionId, transport);
+      const mcp = new McpServer({ name: 'synthetic-legacy', version: '1' });
+      mcp.registerTool('legacy-echo', { description: 'Echo' }, async () => ({
+        content: [{ type: 'text', text: 'synthetic legacy reply' }],
+      }));
+      await mcp.connect(transport);
+      return;
+    }
+    const session = sessions.get(url.searchParams.get('sessionId') ?? '');
+    if (url.pathname === '/messages' && session) {
+      if (failure) {
+        const current = failure;
+        failure = undefined;
+        if (current === 'post') response.writeHead(429).end('Synthetic rate limit.');
+        else {
+          response.writeHead(202).end();
+          await session.close();
+        }
+        return;
+      }
+      await session.handlePostMessage(request, response);
+      return;
+    }
+    response.writeHead(404).end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const endpoint = `${origin}/mcp`;
+  const transport = createDiscoveredTransport(ownerFetch(origin), async (value) => value);
+  const legacy = { authorization: `Bearer ${token}`, 'x-fixture-case': 'legacy' };
+  const listed = await transport.listTools(endpoint, legacy);
+  assert.deepEqual(
+    listed.tools.map((tool) => tool.name),
+    ['legacy-echo'],
+  );
+  assert.deepEqual(await transport.callTool(endpoint, legacy, 'legacy-echo', {}), {
+    content: [{ type: 'text', text: 'synthetic legacy reply' }],
+  });
+  await assert.rejects(
+    transport.listTools(endpoint, {
+      authorization: 'Bearer synthetic-wrong-token',
+      'x-fixture-case': 'unauthorized',
+    }),
+  );
+  await assert.rejects(
+    transport.listTools(endpoint, { ...legacy, 'x-fixture-case': 'server-error' }),
+  );
+  const unreachable = createDiscoveredTransport(
+    ownerFetch('http://127.0.0.1:1'),
+    async (value) => value,
+  );
+  await assert.rejects(unreachable.listTools('http://127.0.0.1:1/mcp', legacy), /ECONNREFUSED/);
+  assert.deepEqual(streams, ['legacy']);
+  failure = 'post';
+  await assert.rejects(
+    transport.callTool(endpoint, legacy, 'legacy-echo', {}),
+    /HTTP 429.*Synthetic rate limit\./,
+  );
+  assert.deepEqual(streams, ['legacy']);
+  await transport.listTools(endpoint, legacy);
+  failure = 'stream';
+  await assert.rejects(
+    transport.callTool(endpoint, legacy, 'legacy-echo', {}, AbortSignal.timeout(5000)),
+    /Connection closed/,
+  );
+  assert.deepEqual(streams, ['legacy', 'legacy']);
+  await transport.listTools(endpoint, legacy);
+  assert.deepEqual(streams, ['legacy', 'legacy', 'legacy']);
+});
 
 test(
   'installation identity checkpoints prevent replacement after file loss and recover interrupted first initialization',
@@ -3205,6 +3362,10 @@ test('hosted connection proof signs only the opened broker popup challenge for i
         for (let attempt = 0; attempt < 100 && !predicate(); attempt++) await delay(10);
         assert.ok(predicate(), 'The browser protocol did not reach the expected step.');
       };
+      await delay(50);
+      assert.equal(Boolean(browserKey), false);
+      assert.equal(popup.location.href, '');
+      (dom.window.document.getElementById('connect') as HTMLButtonElement).click();
       (dom.window.document.getElementById('connect') as HTMLButtonElement).click();
       await until(() => browserKey !== undefined && popup.location.href.startsWith(brokerOrigin));
       const challenge = [
@@ -3273,6 +3434,97 @@ test('hosted connection proof signs only the opened broker popup challenge for i
       dispatch(message);
       await delay(25);
       assert.equal(proofs.length, 1);
+    });
+  }
+});
+
+test('a discarded app sign-in closes its connection browser attempt', async (t) => {
+  for (const hosted of [false, true]) {
+    await t.test(hosted ? 'hosted' : 'native', async (t) => {
+      const origin = hosted ? 'https://nod.customer.example' : 'http://localhost:4310';
+      const browser = createIntegrationBrowser(hosted ? { origin } : undefined);
+      t.after(() => browser.close());
+      const app = Fastify();
+      t.after(() => app.close());
+      if (hosted) {
+        registerLocalAccess(app, 4310, { key: 'synthetic-owner-key', origin });
+        browser.registerRoutes(app);
+      }
+      const root = await mkdtemp(join(tmpdir(), 'nod-discarded-attempt-'));
+      t.after(() => rm(root, { recursive: true, force: true }));
+      let requests = 0;
+      const proxy = createComposioProxy({
+        dataRoot: root,
+        ownerId: 'fixture-owner',
+        keyStore: installationKeyStore,
+        checkpoint: fixtureIdentityCheckpoint,
+        url: 'https://proxy.example.test',
+        request: async () => {
+          requests++;
+          throw new Error('The synthetic connection service is offline.');
+        },
+        browser,
+      });
+      await proxy.initialize();
+      const provider = createComposioProvider({ proxy });
+      const authorize = () =>
+        provider.authorize!(
+          'fixture-owner',
+          'gmail',
+          `${origin}/api/apps/callback?state=${randomBytes(32).toString('base64url')}`,
+        );
+      const discarded = await authorize();
+      const survivor = await authorize();
+      assert.equal(browser.owns(discarded.url), true);
+      const url = new URL(discarded.url);
+      const page = hosted
+        ? (await app.inject({ url: url.pathname, headers: { host: url.host } })).body
+        : await (await fetch(discarded.url)).text();
+      const bridgeKey = hosted
+        ? JSON.parse(page.match(/const \{brokerOrigin,id,expiresAt,bridgeKey\}=(.+);/)![1])
+            .bridgeKey
+        : JSON.parse(page.match(/const bridgeKey=("[^"]+");/)![1]);
+      await provider.deleteAccount(discarded.accountId, 'fixture-owner');
+      assert.equal(browser.owns(discarded.url), false);
+      assert.equal(browser.owns(survivor.url), true);
+      const browserKey = generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).publicKey.export({
+        format: 'jwk',
+      });
+      if (hosted) {
+        assert.equal(
+          (await app.inject({ url: url.pathname, headers: { host: url.host } })).statusCode,
+          403,
+        );
+        const late = await app.inject({
+          method: 'POST',
+          url: url.pathname,
+          headers: { host: url.host, origin, 'x-nod-bridge': bridgeKey },
+          payload: { browserKey },
+        });
+        assert.equal(late.statusCode, 403);
+      } else {
+        await assert.rejects(fetch(discarded.url));
+        await assert.rejects(
+          fetch(`${url.origin}/start`, {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              origin: url.origin,
+              'x-nod-bridge': bridgeKey,
+            },
+            body: JSON.stringify({ browserKey }),
+          }),
+        );
+      }
+      assert.equal(requests, 0);
+      await provider.deleteAccount(survivor.accountId, 'fixture-owner');
+      for (let attempt = 0; attempt < 20; attempt++) {
+        const next = await authorize();
+        await provider.deleteAccount(next.accountId, 'fixture-owner');
+      }
+      const last = await authorize();
+      assert.equal(browser.owns(last.url), true);
+      assert.equal(requests, 0);
     });
   }
 });
@@ -3414,6 +3666,64 @@ test('connection bridge binds a single browser bootstrap to one installation att
   );
 });
 
+test('native connection waits for the owner and refuses a cancelled or expired start', async (t) => {
+  const { IDBFactory } = await import('fake-indexeddb');
+  for (const outcome of ['continue', 'cancel', 'expire'] as const) {
+    await t.test(outcome, async (t) => {
+      const browser = createIntegrationBrowser();
+      t.after(() => browser.close());
+      const id = randomBytes(32).toString('base64url');
+      let starts = 0;
+      const url = await browser.open(id, 'https://proxy.example.test', async () => {
+        starts++;
+        return 'https://proxy.example.test/v2/connect/pair?ticket=synthetic-consent';
+      });
+      const html = await (await fetch(url)).text();
+      const dom = new JSDOM(html, {
+        url,
+        runScripts: 'dangerously',
+        beforeParse(window) {
+          Object.defineProperty(window, 'crypto', { value: webcrypto });
+          Object.defineProperty(window, 'indexedDB', { value: new IDBFactory() });
+          Object.defineProperty(window, 'structuredClone', { value: structuredClone });
+          window.fetch = (input, init) =>
+            fetch(new URL(String(input), url), {
+              ...init,
+              headers: {
+                ...Object.fromEntries(new Headers(init?.headers)),
+                origin: new URL(url).origin,
+              },
+            });
+        },
+      });
+      t.after(() => dom.window.close());
+      await delay(100);
+      assert.equal(Number(starts), 0);
+      assert.equal(browser.remote(url), undefined);
+      const button = dom.window.document.getElementById('connect') as HTMLButtonElement;
+      assert.ok(button && !button.disabled);
+      if (outcome === 'cancel') browser.finish(id);
+      if (outcome === 'expire') {
+        const expired = Date.now() + 11 * 60_000;
+        Object.defineProperty(dom.window.Date, 'now', { value: () => expired });
+      }
+      button.click();
+      button.click();
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (
+          outcome === 'continue'
+            ? starts === 1
+            : dom.window.document.body.classList.contains('failed')
+        )
+          break;
+        await delay(10);
+      }
+      assert.equal(starts, outcome === 'continue' ? 1 : 0);
+      if (outcome !== 'continue') assert.ok(dom.window.document.body.classList.contains('failed'));
+    });
+  }
+});
+
 test(
   'native browser completes the local app sign-in bridge through a signed proof and synthetic callback',
   {
@@ -3434,12 +3744,98 @@ test(
     let bridgeOrigin = '';
     let returnPath = '';
     let brokerOrigin = '';
+    let bridgeUrl = '';
     let challenge = '';
     let verified = 0;
     let callbacks = 0;
     let brokerFailure: unknown;
     let child: ReturnType<typeof spawn> | undefined;
     let childClosed: Promise<void> | undefined;
+    let debuggerPort: number | undefined;
+    const diagnostics = {
+      version: 1,
+      source: /^[a-f0-9]{40}$/.test(process.env.GITHUB_SHA ?? '')
+        ? process.env.GITHUB_SHA
+        : undefined,
+      launch: {
+        error: 'none',
+        closed: false,
+        exitCode: null as number | null,
+        signal: null as NodeJS.Signals | null,
+      },
+      debugger: {
+        polls: 0,
+        portFile: 'not-read',
+        portReadError: 'none',
+        response: 'not-read',
+        transportError: 'none',
+        httpStatus: null as number | null,
+        targetCount: 0,
+        targetTypes: {} as Record<string, number>,
+        targetMatches: {} as Record<string, number>,
+      },
+      cleanup: {
+        taskkill: process.platform === 'win32' ? 'not-started' : 'not-windows',
+        taskkillExitCode: null as number | null,
+        processAlreadyClosed: false,
+        processExitObserved: false,
+        processClosed: false,
+        bridgeClosed: false,
+        appClosed: false,
+        brokerClosed: false,
+        profileRemoved: false,
+        debugger: 'not-known',
+      },
+    };
+    const targetSummary = (targets: Array<{ type?: string; url: string }>) => {
+      diagnostics.debugger.targetCount = Math.min(targets.length, 1024);
+      diagnostics.debugger.targetTypes = {};
+      diagnostics.debugger.targetMatches = {};
+      for (const target of targets.slice(0, 1024)) {
+        const type = [
+          'page',
+          'iframe',
+          'service_worker',
+          'background_page',
+          'browser',
+          'webview',
+        ].includes(target?.type ?? '')
+          ? target.type!
+          : 'other';
+        let match = 'invalid';
+        try {
+          const url = new URL(target.url);
+          const bridge = new URL(bridgeUrl);
+          match =
+            target.url === bridgeUrl
+              ? 'exact-bridge'
+              : url.href.split('#', 1)[0] === bridge.href && url.href !== bridge.href
+                ? 'bridge-fragment'
+                : url.origin === bridge.origin &&
+                    url.pathname === bridge.pathname &&
+                    url.username === bridge.username &&
+                    url.password === bridge.password &&
+                    url.search !== bridge.search
+                  ? 'bridge-query'
+                  : url.protocol === 'https:' &&
+                      bridge.protocol === 'http:' &&
+                      url.host === bridge.host
+                    ? 'bridge-https-host-port'
+                    : url.origin === bridge.origin
+                      ? 'bridge-origin'
+                      : url.protocol === 'about:'
+                        ? 'about'
+                        : ['edge:', 'chrome:', 'devtools:'].includes(url.protocol)
+                          ? 'browser-internal'
+                          : ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)
+                            ? 'other-loopback'
+                            : 'other';
+        } catch {}
+        diagnostics.debugger.targetTypes[type] = (diagnostics.debugger.targetTypes[type] ?? 0) + 1;
+        diagnostics.debugger.targetMatches[match] =
+          (diagnostics.debugger.targetMatches[match] ?? 0) + 1;
+      }
+    };
     let complete!: () => void;
     const completed = new Promise<void>((resolve) => {
       complete = resolve;
@@ -3527,36 +3923,74 @@ fetch('/v2/connect/verify',{method:'POST',headers:{'Content-Type':'application/j
       }
     });
     t.after(async () => {
-      if (child) {
-        if (process.platform === 'win32' && child.pid)
-          spawnSync('taskkill.exe', ['/T', '/F', '/PID', String(child.pid)], {
-            env: serviceEnvironment(),
-            stdio: 'ignore',
-            timeout: 3000,
+      try {
+        diagnostics.cleanup.processAlreadyClosed = diagnostics.launch.closed;
+        if (child) {
+          const exited =
+            diagnostics.launch.closed || child.exitCode !== null || child.signalCode !== null;
+          diagnostics.cleanup.processExitObserved = exited;
+          if (process.platform === 'win32') {
+            if (diagnostics.launch.closed) diagnostics.cleanup.taskkill = 'skipped-closed';
+            else if (exited) diagnostics.cleanup.taskkill = 'skipped-exited';
+            else if (child.pid) {
+              diagnostics.cleanup.taskkill = 'attempted';
+              diagnostics.cleanup.taskkillExitCode = spawnSync(
+                'taskkill.exe',
+                ['/T', '/F', '/PID', String(child.pid)],
+                {
+                  env: serviceEnvironment(),
+                  stdio: 'ignore',
+                  timeout: 3000,
+                },
+              ).status;
+            } else diagnostics.cleanup.taskkill = 'no-pid';
+          }
+          if (!exited) child.kill('SIGKILL');
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, 3000);
+            void childClosed?.then(() => {
+              clearTimeout(timer);
+              resolve();
+            });
           });
-        child.kill('SIGKILL');
-        await new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, 3000);
-          void childClosed?.then(() => {
-            clearTimeout(timer);
-            resolve();
-          });
-        });
+        }
+        await browser.close();
+        app.closeAllConnections();
+        broker.closeAllConnections();
+        await Promise.all([
+          new Promise<void>((resolve) => app.close(() => resolve())),
+          new Promise<void>((resolve) => broker.close(() => resolve())),
+          rm(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }),
+        ]);
+        diagnostics.cleanup.processClosed = diagnostics.launch.closed;
+        diagnostics.cleanup.bridgeClosed = !browser.owns(bridgeUrl);
+        diagnostics.cleanup.appClosed = !app.listening;
+        diagnostics.cleanup.brokerClosed = !broker.listening;
+        diagnostics.cleanup.profileRemoved = await stat(profile).then(
+          () => false,
+          (error: NodeJS.ErrnoException) => error.code === 'ENOENT',
+        );
+        if (debuggerPort !== undefined)
+          diagnostics.cleanup.debugger = await fetch(`http://127.0.0.1:${debuggerPort}/json/list`, {
+            signal: AbortSignal.timeout(2000),
+          }).then(
+            () => 'responding',
+            (error: Error & { cause?: { code?: string } }) =>
+              error.cause?.code === 'ECONNREFUSED'
+                ? 'refused'
+                : error.name === 'TimeoutError'
+                  ? 'timeout'
+                  : 'unavailable',
+          );
+      } finally {
+        t.diagnostic(JSON.stringify(diagnostics));
       }
-      await browser.close();
-      app.closeAllConnections();
-      broker.closeAllConnections();
-      await Promise.all([
-        new Promise<void>((resolve) => app.close(() => resolve())),
-        new Promise<void>((resolve) => broker.close(() => resolve())),
-        rm(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }),
-      ]);
     });
     app.listen(0, '127.0.0.1');
     broker.listen(0, '127.0.0.1');
     await Promise.all([once(app, 'listening'), once(broker, 'listening')]);
     brokerOrigin = `http://127.0.0.1:${(broker.address() as { port: number }).port}`;
-    const bridgeUrl = await browser.open(state, brokerOrigin, async (key, origin, native) => {
+    bridgeUrl = await browser.open(state, brokerOrigin, async (key, origin, native) => {
       assert.ok(native);
       browserKey = key as import('node:crypto').JsonWebKey;
       bridgeOrigin = origin;
@@ -3575,13 +4009,136 @@ fetch('/v2/connect/verify',{method:'POST',headers:{'Content-Type':'application/j
         '--disable-background-networking',
         '--no-first-run',
         `--user-data-dir=${profile}`,
+        '--remote-debugging-port=0',
+        '--password-store=basic',
+        '--use-mock-keychain',
         bridgeUrl,
       ],
       { env: serviceEnvironment(), stdio: 'ignore' },
     );
     childClosed = new Promise<void>((resolve) => {
-      child!.once('close', () => resolve());
+      child!.once('close', (code, signal) => {
+        diagnostics.launch.closed = true;
+        diagnostics.launch.exitCode = code;
+        diagnostics.launch.signal = signal;
+        resolve();
+      });
     });
+    child.once('error', (error: NodeJS.ErrnoException) => {
+      diagnostics.launch.error = ['ENOENT', 'EACCES', 'ENOEXEC', 'ENOMEM', 'ETXTBSY'].includes(
+        error.code ?? '',
+      )
+        ? error.code!
+        : 'other';
+    });
+    let targets: Array<{ url: string; webSocketDebuggerUrl: string }> = [];
+    const targetDeadline = performance.now() + 10_000;
+    while (performance.now() < targetDeadline) {
+      diagnostics.debugger.polls++;
+      try {
+        const [port] = await readFile(join(profile, 'DevToolsActivePort'), 'utf8').then(
+          (value) => {
+            diagnostics.debugger.portFile = 'read';
+            diagnostics.debugger.portReadError = 'none';
+            return value.split('\n');
+          },
+          (error: NodeJS.ErrnoException) => {
+            diagnostics.debugger.portFile = error.code === 'ENOENT' ? 'missing' : 'read-failed';
+            diagnostics.debugger.portReadError = [
+              'ENOENT',
+              'EACCES',
+              'EPERM',
+              'EIO',
+              'EMFILE',
+              'ENFILE',
+              'EISDIR',
+            ].includes(error.code ?? '')
+              ? error.code!
+              : 'other';
+            throw error;
+          },
+        );
+        if (/^\d+\s*$/.test(port) && Number(port) > 0 && Number(port) <= 65535)
+          debuggerPort = Number(port);
+        else diagnostics.debugger.portFile = 'invalid';
+        diagnostics.debugger.response = 'unavailable';
+        diagnostics.debugger.transportError = 'none';
+        const response = await fetch(`http://127.0.0.1:${port}/json/list`, {
+          signal: AbortSignal.timeout(2000),
+        }).catch((error: Error & { cause?: { code?: string } }) => {
+          diagnostics.debugger.transportError = [
+            'ECONNREFUSED',
+            'ECONNRESET',
+            'ETIMEDOUT',
+            'EHOSTUNREACH',
+            'ENETUNREACH',
+            'EACCES',
+            'EPERM',
+            'UND_ERR_CONNECT_TIMEOUT',
+            'UND_ERR_HEADERS_TIMEOUT',
+            'UND_ERR_SOCKET',
+          ].includes(error.cause?.code ?? '')
+            ? error.cause!.code!
+            : error.name === 'TimeoutError'
+              ? 'timeout'
+              : error.name === 'AbortError'
+                ? 'aborted'
+                : 'other';
+          throw error;
+        });
+        diagnostics.debugger.httpStatus = response.status;
+        diagnostics.debugger.response = 'invalid-json';
+        targets = await response.json();
+        diagnostics.debugger.response = 'invalid-targets';
+        if (Array.isArray(targets)) {
+          targetSummary(targets);
+          diagnostics.debugger.response = 'targets';
+        }
+        if (targets.some((target) => target.url === bridgeUrl)) break;
+      } catch {}
+      await delay(50);
+    }
+    const target = targets.find((target) => target.url === bridgeUrl);
+    assert.ok(target);
+    assert.equal(Boolean(browserKey), false);
+    assert.equal(verified, 0);
+    assert.equal(callbacks, 0);
+    const socket = new WebSocket(target.webSocketDebuggerUrl);
+    t.after(() => socket.close());
+    await once(socket, 'open');
+    type BrowserReply = { id: number; result?: { result?: { value?: unknown } } };
+    let commandId = 0;
+    const pending = new Map<number, (reply: BrowserReply) => void>();
+    socket.addEventListener('message', (event) => {
+      const reply = JSON.parse(String(event.data)) as BrowserReply;
+      if (!reply || !Number.isSafeInteger(reply.id) || !pending.has(reply.id)) return;
+      const receive = pending.get(reply.id);
+      if (typeof receive === 'function') {
+        pending.delete(reply.id);
+        receive(reply);
+      }
+    });
+    const evaluate = (expression: string) => {
+      const id = ++commandId;
+      const response = new Promise<BrowserReply>((resolve) => pending.set(id, resolve));
+      socket.send(JSON.stringify({ id, method: 'Runtime.evaluate', params: { expression } }));
+      return response;
+    };
+    let ready = false;
+    for (let attempt = 0; attempt < 200; attempt++) {
+      const reply = await evaluate("Boolean(document.getElementById('connect'))");
+      if (reply.result?.result?.value === true) {
+        ready = true;
+        break;
+      }
+      await delay(25);
+    }
+    assert.equal(ready, true);
+    assert.equal(Boolean(browserKey), false);
+    const clickResult = await evaluate(
+      "(() => { const button = document.getElementById('connect'); if (!button || button.disabled) return false; button.click(); button.click(); return true; })()",
+    );
+    assert.equal(clickResult.result?.result?.value, true, JSON.stringify(clickResult));
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
@@ -6716,6 +7273,7 @@ test(
     assert.equal((await status()).oauthStatus, 'cancelled');
     assert.equal((await status()).oauthError, undefined);
     assert.equal((await rawStatus(first.json().url)).apps[0].available, false);
+    assert.equal((await rawStatus(first.json().url)).apps[0].error, undefined);
     assert.notEqual((await setupStatus()).apps[0].available, false);
     const firstHash = createHash('sha256').update(first.json().url).digest('hex');
     const mixed = await app.inject({
@@ -6745,6 +7303,11 @@ test(
     assert.equal(await callback(states[1], 'code=fail'), 'failed');
     assert.equal((await status()).oauthStatus, 'failed');
     assert.match((await status()).oauthError, /Synthetic exchange failure/);
+    assert.match(
+      (await rawStatus(authorizations.get(states[1])!.url)).apps[0].error,
+      /Synthetic exchange failure/,
+    );
+    assert.equal((await setupStatus()).apps[0].error, undefined);
     beginFails = true;
     assert.equal((await authorize({ restart: true })).statusCode, 502);
     assert.equal((await status()).oauthError, undefined);
@@ -6765,6 +7328,10 @@ test(
       (await status()).oauthError,
       /invalid_request.*Synthetic resource parameter refused/,
     );
+    const refused = (await rawStatus(authorizations.get(states[2])!.url)).apps[0];
+    assert.equal(refused.available, false);
+    assert.match(refused.error, /invalid_request.*Synthetic resource parameter refused/);
+    assert.ok(!refused.error.includes('synthetic-private'));
     assert.equal((await authorize()).statusCode, 200);
     assert.equal(await callback(states[3], 'error='), 'failed');
     assert.match((await status()).oauthError, /no authorization code/);
@@ -7416,6 +7983,47 @@ test(
     assert.equal(pairingChecks.mock.callCount(), 1);
     assert.deepEqual(await read(recovered, foreign.url), expected);
     assert.equal(pairingChecks.mock.callCount(), 1);
+  },
+);
+
+test(
+  'an action the connection service does not offer is refused before any app request',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async (t) => {
+    const f = await appsFixture(t);
+    await f.connect('slack');
+    f.sessions.length = 0;
+    let offered: boolean | Error = false;
+    f.session.offers = async () => {
+      if (offered instanceof Error) throw offered;
+      return offered;
+    };
+    await assert.rejects(
+      f.service.assertOffered('local-development', 'SLACK_POST_MESSAGE'),
+      (error: Error & { statusCode?: number }) => {
+        assert.equal(error.statusCode, 404);
+        assert.ok(error.message.includes('SLACK_POST_MESSAGE'));
+        return true;
+      },
+    );
+    assert.equal(f.sessions.length, 1);
+    assert.equal(f.executed.length, 0);
+    offered = new Error('lookup unavailable');
+    await f.service.assertOffered('local-development', 'SLACK_POST_MESSAGE');
+    offered = true;
+    await f.service.assertOffered('local-development', 'SLACK_SEND_MESSAGE');
+    offered = false;
+    const lookups = f.sessions.length;
+    await f.service.assertOffered('local-development', 'SLACK_SEND_MESSAGE');
+    t.mock.method(f.session, 'search', async () => ({
+      tools: { SLACK_FIND_CHANNELS: {} },
+      suggestions: [],
+    }));
+    await f.service.execute('local-development', 'SEARCH_TOOLS', { query: 'find channels' });
+    const searched = f.sessions.length;
+    await f.service.assertOffered('local-development', 'SLACK_FIND_CHANNELS');
+    assert.equal(lookups, 3);
+    assert.equal(f.sessions.length, searched);
   },
 );
 
@@ -8290,6 +8898,7 @@ function composioProxyFixture(
     parseCallback: async () => assert.fail('Unexpected fixture callback.'),
     upload: async () => assert.fail('Unexpected fixture upload.'),
     isPendingAccount: () => false,
+    finishPendingAccount: () => assert.fail('Unexpected fixture sign-in discard.'),
     backoff: () => undefined,
     ...overrides,
   };
@@ -9049,7 +9658,22 @@ test(
     }
     assert.equal((await create({ ...input, clientIdRequired: 'true' })).statusCode, 400);
     assert.equal((await create({ ...input, ownerId: 'foreign-owner' })).statusCode, 400);
+    assert.equal((await create({ ...input, name: '   ' })).statusCode, 400);
     assert.equal((await pool.query('SELECT id FROM discovered_connection_proposals')).rowCount, 0);
+    const named = await create({
+      ...input,
+      name: 'Example Work (n8n)',
+      endpoint: 'https://93.184.216.34/named',
+    });
+    assert.equal(named.statusCode, 200, named.body);
+    assert.equal(
+      (
+        await pool.query('SELECT name FROM discovered_connection_proposals WHERE id=$1', [
+          named.json().id,
+        ])
+      ).rows[0].name,
+      'Example Work (n8n)',
+    );
     const response = await create(input);
     assert.equal(response.statusCode, 200, response.body);
     assert.equal(response.headers['cache-control'], 'no-store');
@@ -9128,6 +9752,143 @@ test(
       assert.equal(Object.hasOwn(view.json(), 'callbackUrl'), false);
     }
     assert.equal((await pool.query('SELECT id FROM discovered_connections')).rowCount, 0);
+  },
+);
+
+test(
+  'renames a custom MCP server for the owner without changing its saved connection',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async (t) => {
+    const schema = `test_mcp_name_${randomUUID().replaceAll('-', '')}`;
+    const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    const pool = new pg.Pool({
+      connectionString: process.env.TEST_DATABASE_URL,
+      options: `-c search_path=${schema}`,
+    });
+    const app = Fastify();
+    const foreign = Fastify();
+    t.after(async () => {
+      await app.close();
+      await foreign.close();
+      await pool.end();
+      await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+      await admin.end();
+    });
+    const ownerId = 'fixture-mcp-owner';
+    const key = randomBytes(32);
+    const keyStore = { id: 'fixture', configured: true, getKey: async () => key };
+    const unused = async () => {
+      throw new Error('Renaming must not call the MCP server or its authorization service.');
+    };
+    const transport = {
+      ...createDiscoveredTransport(unused),
+      listTools: t.mock.fn(async () => ({
+        tools: [{ name: 'list_records', inputSchema: { type: 'object' } }],
+      })),
+    };
+    const options = {
+      ownerId,
+      baseUrl: 'http://localhost:4310',
+      grantVault: await createAppGrantVault(pool, { ownerId, keyStore }),
+      transport,
+      oauth: { begin: unused, finish: unused, refresh: unused },
+    };
+    const connections = await createDiscoveredConnections(pool, options);
+    connections.registerRoutes(app);
+    const foreignConnections = await createDiscoveredConnections(pool, {
+      ...options,
+      ownerId: 'foreign-owner',
+      grantVault: await createAppGrantVault(pool, { ownerId: 'foreign-owner', keyStore }),
+    });
+    foreignConnections.registerRoutes(foreign);
+    const token = 'synthetic-mcp-token';
+    const connect = async (server: typeof app, name: string, accountName: string) => {
+      const created = await server.inject({
+        method: 'POST',
+        url: '/api/apps/mcp',
+        payload: { name, endpoint: 'https://93.184.216.34/mcp', auth: 'bearer' },
+      });
+      assert.equal(created.statusCode, 200, created.body);
+      const done = await server.inject({
+        method: 'POST',
+        url: `/api/apps/discovery/${created.json().id}/complete`,
+        payload: { token, accountName },
+      });
+      assert.equal(done.statusCode, 200, done.body);
+    };
+    await connect(app, 'Fixture Research', 'Fixture account');
+    const before = (await connections.list())[0];
+    const id = before.connectionId!;
+    const service = before.slug;
+    assert.equal(before.canRename, true);
+    const args = { connectionId: id, pathId: before.accessPaths![0].id, tool: 'list_records' };
+    const approved = await connections.approvalDetails('CONNECTED_MCP_CALL', args);
+    const binding = await connections.binding(id);
+    const priorServers = await connections.servers();
+    assert.equal(priorServers.length, 1);
+    assert.equal(priorServers[0].name, 'Fixture Research');
+    const rename = (server: typeof app, service: string, payload: Record<string, unknown>) =>
+      server.inject({ method: 'PATCH', url: `/api/apps/mcp/${service}`, payload });
+
+    const catalogCalls = transport.listTools.mock.callCount();
+    const response = await rename(app, service, { name: '  Project Library MCP  ' });
+    assert.equal(response.statusCode, 200, response.body);
+    assert.deepEqual(response.json(), { name: 'Project Library MCP' });
+    assert.equal((await options.grantVault.read(id))?.value, token);
+    assert.equal(await connections.binding(id), binding);
+    assert.deepEqual(await connections.approvalDetails('CONNECTED_MCP_CALL', args), {
+      ...approved,
+      account: { ...approved.account, name: 'Project Library MCP' },
+    });
+    const next = await connections.reconnect(service, id, 'apps', true);
+    assert.equal(next.name, 'Project Library MCP');
+    const setupPath = new URL(next.url, 'http://localhost').searchParams.get('connect');
+    const setup = await app.inject({ url: `/api/apps/discovery/${setupPath}` });
+    assert.equal(setup.json().name, 'Project Library MCP');
+    assert.deepEqual(await connections.servers(), [
+      { ...priorServers[0], name: 'Project Library MCP' },
+    ]);
+    for (const name of ['Project Library MCP', 'Fixture Research']) {
+      const { accounts } = await connections.search(name, id);
+      assert.equal(accounts[0].paths[0].kind, 'mcp');
+      assert.deepEqual((accounts[0].paths[0] as { toolNames?: string[] }).toolNames, [
+        'list_records',
+      ]);
+    }
+    assert.equal(transport.listTools.mock.callCount(), catalogCalls);
+    assert.equal((await rename(app, service, { name: ' ' })).statusCode, 400);
+    assert.equal(
+      (await rename(app, service, { name: 'Valid', endpoint: 'https://example.test/mcp' }))
+        .statusCode,
+      400,
+    );
+    assert.equal((await rename(app, 'notion', { name: 'Project Library' })).statusCode, 404);
+    assert.equal((await rename(foreign, service, { name: 'Foreign' })).statusCode, 404);
+    const added = await app.inject({
+      method: 'POST',
+      url: `/api/apps/discovery/${setupPath}/complete`,
+      payload: { token, accountName: 'Sibling account' },
+    });
+    assert.equal(added.statusCode, 200, added.body);
+    await connect(foreign, 'Fixture Research', 'Foreign account');
+    const saved = await connections.list();
+    const sibling = saved.find(({ accountName }) => accountName === 'Sibling account');
+    assert.equal(saved.length, 2);
+    assert.deepEqual(
+      saved.find(({ connectionId }) => connectionId === id),
+      {
+        ...before,
+        name: 'Project Library MCP',
+      },
+    );
+    assert.equal(sibling?.name, 'Project Library MCP');
+    assert.equal((await foreignConnections.list())[0].name, 'Fixture Research');
+    await connections.disconnect(id, service);
+    assert.equal((await connections.list())[0].name, 'Project Library MCP');
+    await connections.disconnect(sibling!.connectionId!, service);
+    await connect(app, 'New Cabinet', 'Fixture account');
+    assert.equal((await connections.list())[0].name, 'New Cabinet');
   },
 );
 
@@ -9289,6 +10050,7 @@ test(
       let cliCalls = 0;
       let cliExitCode: number | undefined;
       const cliRuns: unknown[] = [];
+      const authorizations: string[] = [];
       let blocked: 'http' | 'listTools' | 'callTool' | 'cli' | undefined;
       let entered = () => {};
       const waitForAbort = async (method: typeof blocked, signal?: AbortSignal) => {
@@ -9306,8 +10068,9 @@ test(
         grantVault,
         transport: {
           validateEndpoint: async (endpoint) => endpoint,
-          http: async (_endpoint, _headers, method, _body, signal) => {
+          http: async (_endpoint, headers, method, _body, signal) => {
             await waitForAbort('http', signal);
+            authorizations.push(headers.Authorization);
             assert.equal(method, 'GET');
             return { status: 200, body: { items: [] } };
           },
@@ -9726,6 +10489,15 @@ test(
         ),
         /install source/,
       );
+      await assert.rejects(
+        discovered.execute(
+          'CONNECTED_CLI',
+          { connectionId, pathId: cliPath, argv: ['list', 'synthetic\u0000value'] },
+          ref,
+          new AbortController().signal,
+        ),
+        { name: 'ZodError' },
+      );
       await assert.rejects(discovered.reconnect('legacy-cli', legacyId), /set up this CLI again/);
       assert.equal(cliCalls, 1);
       await discovered.disconnect(legacyId, 'legacy-cli');
@@ -9756,7 +10528,7 @@ test(
         app.inject({
           method: 'POST',
           url: `/api/apps/discovery/${proposalId}/complete`,
-          payload: { token: 'synthetic-new-token', accountName: 'Replacement account' },
+          payload: { token: ' synthetic-new-token\n', accountName: 'Replacement account' },
         });
       const account = async () =>
         (await integrations.connectedApps(owner, true)).find(
@@ -9765,11 +10537,558 @@ test(
       const replacedAccount = await account();
       assert.ok(replacedAccount);
       assert.equal((await complete()).statusCode, 200);
+      assert.equal(authorizations.at(-1), 'Bearer synthetic-new-token');
       assert.equal((await complete()).statusCode, 404);
       assert.equal((await grantVault.read(connectionId)).value, 'synthetic-new-token');
       assert.notEqual(await account(), replacedAccount);
     } finally {
       await app.close();
+      await pool.end();
+      await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+      await admin.end();
+    }
+  },
+);
+
+test(
+  'HTTP confirmation context keeps the exact request and connection binding',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async () => {
+    const schema = `test_http_context_${randomUUID().replaceAll('-', '')}`;
+    const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    const pool = new pg.Pool({
+      connectionString: process.env.TEST_DATABASE_URL,
+      options: `-c search_path=${schema}`,
+    });
+    try {
+      const owner = 'synthetic-http-context-owner';
+      const key = randomBytes(32);
+      const grantVault = await createAppGrantVault(pool, {
+        ownerId: owner,
+        keyStore: { id: 'fixture', configured: true, getKey: async () => key },
+      });
+      const calls: unknown[] = [];
+      const discovered = await createDiscoveredConnections(pool, {
+        ownerId: owner,
+        baseUrl: 'http://localhost:4310',
+        grantVault,
+        transport: {
+          validateEndpoint: async (value) => value,
+          http: async (url, headers, method, body) => {
+            assert.equal(headers.Authorization, 'Bearer synthetic-http-context-secret');
+            calls.push({ url, method, body });
+            return { status: 200, body: { records: 2 } };
+          },
+          listTools: async () => assert.fail('HTTP context must not load an MCP catalog.'),
+          callTool: async () => assert.fail('HTTP context must not call an MCP tool.'),
+        },
+        oauth: {} as Parameters<typeof createDiscoveredConnections>[1]['oauth'],
+      });
+      const connectionId = randomUUID();
+      const pathId = randomUUID();
+      const path = {
+        id: pathId,
+        kind: 'http',
+        endpoint: 'https://api.example.test/v2',
+        auth: 'bearer',
+      };
+      await pool.query(
+        'INSERT INTO discovered_connections(id,owner_id,service,name,account_name,paths) VALUES($1,$2,$3,$4,$5,$6)',
+        [
+          connectionId,
+          owner,
+          'http-context',
+          'Synthetic HTTP API',
+          'Synthetic account',
+          JSON.stringify([path]),
+        ],
+      );
+      await grantVault.put(connectionId, 'synthetic-http-context-secret');
+      for (const [method, body] of [
+        ['GET', { ignored: true }],
+        ['POST', { label: 'Synthetic record', enabled: false }],
+        ['PUT', null],
+        ['PATCH', ['Synthetic value']],
+        ['DELETE', 0],
+      ] as const) {
+        const args = {
+          connectionId,
+          pathId,
+          method,
+          path: '/signals?route=one%2Ftwo&label=Caf%C3%A9',
+          body,
+        };
+        const details = await discovered.approvalDetails('CONNECTED_HTTP', args);
+        const expected = {
+          method,
+          url: `${path.endpoint}${args.path}`,
+          ...(method === 'GET' ? {} : { body }),
+        };
+        assert.deepEqual(details.request, expected);
+        assert.deepEqual(details.account, {
+          name: 'Synthetic HTTP API',
+          identity: 'Synthetic account',
+        });
+        assert.equal(details.verifiedBinding, await discovered.binding(connectionId));
+        assert.doesNotMatch(JSON.stringify(details), /synthetic-http-context-secret/);
+        assert.equal(calls.length, ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].indexOf(method));
+        await discovered.execute(
+          'CONNECTED_HTTP',
+          args,
+          undefined,
+          undefined,
+          details.verifiedBinding,
+        );
+        assert.deepEqual(calls.at(-1), { ...expected, body: method === 'GET' ? undefined : body });
+      }
+      const args = {
+        connectionId,
+        pathId,
+        method: 'POST',
+        path: '/original',
+        body: { label: 'Original record' },
+      };
+      const pending = discovered.approvalDetails('CONNECTED_HTTP', args);
+      args.method = 'DELETE';
+      args.path = '/changed';
+      args.body.label = 'Changed record';
+      const details = await pending;
+      assert.deepEqual(details.request, {
+        method: 'POST',
+        url: `${path.endpoint}/original`,
+        body: { label: 'Original record' },
+      });
+      await pool.query(
+        'UPDATE discovered_connections SET account_id=gen_random_uuid() WHERE id=$1',
+        [connectionId],
+      );
+      await assert.rejects(
+        discovered.execute('CONNECTED_HTTP', args, undefined, undefined, details.verifiedBinding),
+        (cause: Error & { notRun?: boolean }) => {
+          assert.match(cause.message, /connected account changed/);
+          assert.equal(cause.notRun, true);
+          return true;
+        },
+      );
+      const controller = new AbortController();
+      controller.abort(new Error('synthetic_stop'));
+      await assert.rejects(
+        discovered.approvalDetails('CONNECTED_HTTP', args, controller.signal),
+        /synthetic_stop/,
+      );
+      await assert.rejects(
+        discovered.approvalDetails('CONNECTED_HTTP', { ...args, path: '../escape' }),
+        /stay in the saved API address/,
+      );
+      await pool.query('UPDATE discovered_connections SET owner_id=$2 WHERE id=$1', [
+        connectionId,
+        'another-synthetic-owner',
+      ]);
+      await assert.rejects(discovered.approvalDetails('CONNECTED_HTTP', args), /unavailable/);
+      assert.equal(calls.length, 5);
+    } finally {
+      await pool.end();
+      await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+      await admin.end();
+    }
+  },
+);
+
+test(
+  'MCP confirmation context keeps the exact catalog, owner and connection binding',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async (t) => {
+    const schema = `test_mcp_context_${randomUUID().replaceAll('-', '')}`;
+    const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    const pool = new pg.Pool({
+      connectionString: process.env.TEST_DATABASE_URL,
+      options: `-c search_path=${schema}`,
+    });
+    try {
+      const owner = 'synthetic-context-owner';
+      const key = randomBytes(32);
+      const grantVault = await createAppGrantVault(pool, {
+        ownerId: owner,
+        keyStore: { id: 'fixture', configured: true, getKey: async () => key },
+      });
+      async function fixture() {
+        const connectionId = randomUUID();
+        const pathId = randomUUID();
+        let endpoint = 'https://context.example.test/mcp';
+        let listFailure = false;
+        let beforeList: (() => Promise<void>) | undefined;
+        let beforeToken:
+          ((client: Parameters<typeof grantVault.read>[1]) => Promise<void>) | undefined;
+        let lists = 0;
+        let calls = 0;
+        const paths = () => [{ id: pathId, kind: 'mcp', endpoint, auth: 'bearer' }];
+        const discovered = await createDiscoveredConnections(pool, {
+          ownerId: owner,
+          baseUrl: 'http://localhost:4310',
+          grantVault: {
+            ...grantVault,
+            read: async (id, client) => {
+              const grant = await grantVault.read(id, client);
+              await beforeToken?.(client);
+              return grant;
+            },
+          },
+          transport: {
+            validateEndpoint: async (value) => value,
+            http: async () => assert.fail('No HTTP request is expected.'),
+            callTool: async () => {
+              calls++;
+              return { content: [{ type: 'text', text: 'Synthetic rows.' }] };
+            },
+            listTools: async (address) => {
+              lists++;
+              await beforeList?.();
+              if (listFailure)
+                throw Object.assign(
+                  new Error('Synthetic catalog is unavailable: synthetic-context-secret'),
+                  { statusCode: 503, code: 'SYNTHETIC_BUSY' },
+                );
+              return {
+                tools: [
+                  {
+                    name: 'read_rows',
+                    description: `Read rows at ${address}. synthetic-context-secret`,
+                    inputSchema: { type: 'object', properties: { tableId: { type: 'string' } } },
+                  },
+                  { name: 'read_rows_status', inputSchema: {} },
+                ],
+              };
+            },
+          },
+          oauth: {} as Parameters<typeof createDiscoveredConnections>[1]['oauth'],
+        });
+        await pool.query(
+          'INSERT INTO discovered_connections(id,owner_id,service,name,account_name,paths) VALUES($1,$2,$3,$4,$5,$6)',
+          [
+            connectionId,
+            owner,
+            'context-fixture',
+            'Synthetic MCP',
+            'Synthetic account',
+            JSON.stringify(paths()),
+          ],
+        );
+        await grantVault.put(connectionId, 'synthetic-context-secret');
+        return {
+          discovered,
+          connectionId,
+          args: { connectionId, pathId, tool: 'read_rows', input: { tableId: 'synthetic-table' } },
+          counts: () => ({ lists, calls }),
+          beforeList: (fn: () => Promise<void>) => {
+            beforeList = fn;
+          },
+          beforeToken: (fn: (client: Parameters<typeof grantVault.read>[1]) => Promise<void>) => {
+            beforeToken = fn;
+          },
+          failList: () => {
+            listFailure = true;
+          },
+          replace: async (client: Parameters<typeof grantVault.read>[1] = pool) => {
+            endpoint = 'https://replacement.example.test/mcp';
+            await client.query(
+              'UPDATE discovered_connections SET paths=$2,account_id=$3 WHERE id=$1',
+              [connectionId, JSON.stringify(paths()), randomUUID()],
+            );
+          },
+          replacePath: async () => {
+            endpoint = 'https://replacement.example.test/mcp';
+            await pool.query('UPDATE discovered_connections SET paths=$2 WHERE id=$1', [
+              connectionId,
+              JSON.stringify(paths()),
+            ]);
+          },
+        };
+      }
+      const refused = (cause: Error & { notRun?: boolean }) => {
+        assert.match(cause.message, /changed/);
+        assert.equal(cause.notRun, true);
+        return true;
+      };
+      await t.test('selects one exact tool and hides the credential', async () => {
+        const f = await fixture();
+        const details = await f.discovered.approvalDetails('CONNECTED_MCP_CALL', f.args);
+        assert.ok(details.tool);
+        assert.equal(details.tool.name, 'read_rows');
+        assert.match(details.tool.description!, /context\.example\.test/);
+        assert.equal(JSON.stringify(details).includes('synthetic-context-secret'), false);
+        assert.equal(details.account.identity, 'Synthetic account');
+        assert.equal(details.verifiedBinding, await f.discovered.binding(f.connectionId));
+        for (const args of [
+          { ...f.args, tool: 'READ_ROWS' },
+          { ...f.args, tool: 'read_row' },
+          { ...f.args, pathId: randomUUID() },
+          { ...f.args, connectionId: randomUUID() },
+        ])
+          await assert.rejects(
+            f.discovered.approvalDetails('CONNECTED_MCP_CALL', args),
+            /unavailable/,
+          );
+        await pool.query('UPDATE discovered_connections SET owner_id=$2 WHERE id=$1', [
+          f.connectionId,
+          'another-synthetic-owner',
+        ]);
+        await assert.rejects(
+          f.discovered.approvalDetails('CONNECTED_MCP_CALL', f.args),
+          /unavailable/,
+        );
+        assert.deepEqual(f.counts(), { lists: 1, calls: 0 });
+      });
+      await t.test('a replaced endpoint with the same path ID gets its own catalog', async () => {
+        const f = await fixture();
+        const first = await f.discovered.approvalDetails('CONNECTED_MCP_CALL', f.args);
+        await f.replacePath();
+        const second = await f.discovered.approvalDetails('CONNECTED_MCP_CALL', f.args);
+        assert.ok(second.tool);
+        assert.match(second.tool.description!, /replacement\.example\.test/);
+        assert.notEqual(first.verifiedBinding, second.verifiedBinding);
+        assert.equal(f.counts().lists, 2);
+      });
+      await t.test('failed refreshes do not approve with an expired catalog', async (t) => {
+        const f = await fixture();
+        await f.discovered.approvalDetails('CONNECTED_MCP_CALL', f.args);
+        const now = Date.now();
+        t.mock.method(Date, 'now', () => now + 11 * 60_000);
+        f.failList();
+        await assert.rejects(
+          f.discovered.approvalDetails('CONNECTED_MCP_CALL', f.args),
+          (cause: Error & { notRun?: boolean }) => {
+            assert.match(cause.message, /status 503; code SYNTHETIC_BUSY/);
+            assert.match(cause.message, /Synthetic catalog is unavailable/);
+            assert.equal(JSON.stringify(cause).includes('synthetic-context-secret'), false);
+            assert.equal(cause.message.includes('synthetic-context-secret'), false);
+            assert.equal(cause.notRun, true);
+            return true;
+          },
+        );
+        await assert.rejects(
+          f.discovered.approvalDetails('CONNECTED_MCP_CALL', f.args),
+          (cause: Error & { notRun?: boolean }) => {
+            assert.match(cause.message, /status 503; code SYNTHETIC_BUSY/);
+            assert.match(cause.message, /Synthetic catalog is unavailable/);
+            assert.equal(JSON.stringify(cause).includes('synthetic-context-secret'), false);
+            assert.equal(cause.message.includes('synthetic-context-secret'), false);
+            assert.equal(cause.notRun, true);
+            return true;
+          },
+        );
+        assert.equal(f.counts().lists, 3);
+      });
+      await t.test('a change during catalog loading refuses the context', async () => {
+        const f = await fixture();
+        f.beforeList(f.replace);
+        await assert.rejects(f.discovered.approvalDetails('CONNECTED_MCP_CALL', f.args), refused);
+        assert.deepEqual(f.counts(), { lists: 1, calls: 0 });
+      });
+      await t.test('a change during credential loading makes no metadata request', async () => {
+        const f = await fixture();
+        f.beforeToken(f.replace);
+        await assert.rejects(f.discovered.approvalDetails('CONNECTED_MCP_CALL', f.args), refused);
+        assert.deepEqual(f.counts(), { lists: 0, calls: 0 });
+      });
+      await t.test('an old approval cannot dispatch through a new connection', async () => {
+        const f = await fixture();
+        const details = await f.discovered.approvalDetails('CONNECTED_MCP_CALL', f.args);
+        await f.replace();
+        await assert.rejects(
+          f.discovered.execute(
+            'CONNECTED_MCP_CALL',
+            f.args,
+            undefined,
+            undefined,
+            details.verifiedBinding,
+          ),
+          refused,
+        );
+        assert.equal(f.counts().calls, 0);
+      });
+      await t.test('a change during dispatch credential loading makes no tool call', async () => {
+        const f = await fixture();
+        const details = await f.discovered.approvalDetails('CONNECTED_MCP_CALL', f.args);
+        f.beforeToken(f.replace);
+        await assert.rejects(
+          f.discovered.execute(
+            'CONNECTED_MCP_CALL',
+            f.args,
+            undefined,
+            undefined,
+            details.verifiedBinding,
+          ),
+          refused,
+        );
+        assert.equal(f.counts().calls, 0);
+      });
+      await t.test('a new OAuth connection does not join or accept an old refresh', async () => {
+        const connectionId = randomUUID();
+        const path = {
+          id: randomUUID(),
+          kind: 'mcp',
+          endpoint: 'https://old-context.example.test/mcp',
+          auth: 'oauth',
+        };
+        const sibling = { ...path, id: randomUUID() };
+        const replacement = { ...path, endpoint: 'https://new-context.example.test/mcp' };
+        const state = (name: string) => ({
+          redirectUri: 'http://localhost/callback',
+          tokens: {
+            access_token: `synthetic-${name}-access`,
+            refresh_token: `synthetic-${name}-refresh`,
+            token_type: 'Bearer',
+          },
+          expiresAt: 1,
+        });
+        let entered!: () => void;
+        let release!: () => void;
+        const refreshing = new Promise<void>((resolve) => {
+          entered = resolve;
+        });
+        const waiting = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const refreshes: string[] = [];
+        const metadata: string[] = [];
+        const unused = async () => assert.fail('No action is expected.');
+        const discovered = await createDiscoveredConnections(pool, {
+          ownerId: owner,
+          baseUrl: 'http://localhost:4310',
+          grantVault,
+          transport: {
+            validateEndpoint: async (value) => value,
+            http: unused,
+            callTool: unused,
+            listTools: async (endpoint, headers) => {
+              assert.equal(endpoint, replacement.endpoint);
+              assert.equal(headers.Authorization, 'Bearer synthetic-refreshed-new');
+              metadata.push(endpoint);
+              return { tools: [{ name: 'read_rows', inputSchema: {} }] };
+            },
+          },
+          oauth: {
+            begin: unused,
+            finish: unused,
+            refresh: async (endpoint, saved) => {
+              const old = endpoint === path.endpoint;
+              assert.equal(
+                saved.tokens!.refresh_token,
+                state(old ? 'old' : 'new').tokens.refresh_token,
+              );
+              refreshes.push(endpoint);
+              if (old) {
+                entered();
+                await waiting;
+              }
+              return {
+                ...saved,
+                tokens: {
+                  ...saved.tokens!,
+                  access_token: `synthetic-refreshed-${old ? 'old' : 'new'}`,
+                },
+                expiresAt: Date.now() + 3_600_000,
+              };
+            },
+          },
+        });
+        await pool.query(
+          'INSERT INTO discovered_connections(id,owner_id,service,name,account_name,paths) VALUES($1,$2,$3,$4,$5,$6)',
+          [
+            connectionId,
+            owner,
+            'oauth-context',
+            'Synthetic MCP',
+            'Synthetic account',
+            JSON.stringify([path, sibling]),
+          ],
+        );
+        await grantVault.put(connectionId, JSON.stringify(state('old')));
+        const args = { connectionId, pathId: path.id, tool: 'read_rows', input: {} };
+        const old = discovered.approvalDetails('CONNECTED_MCP_CALL', args);
+        const rejected = assert.rejects(old, refused);
+        try {
+          await refreshing;
+          const shared = discovered.approvalDetails('CONNECTED_MCP_CALL', {
+            ...args,
+            pathId: sibling.id,
+          });
+          const sharedRejected = assert.rejects(shared, refused);
+          await delay(10);
+          await transaction(async (client) => {
+            await client.query(
+              'UPDATE discovered_connections SET account_id=gen_random_uuid(),paths=$2 WHERE id=$1',
+              [
+                connectionId,
+                JSON.stringify([replacement, { ...sibling, endpoint: replacement.endpoint }]),
+              ],
+            );
+            await grantVault.put(connectionId, JSON.stringify(state('new')), client);
+          }, pool);
+          const current = discovered.approvalDetails('CONNECTED_MCP_CALL', args);
+          assert.equal(
+            await Promise.race([current.then(() => true), delay(1000).then(() => false)]),
+            true,
+          );
+          release();
+          await Promise.all([rejected, sharedRejected]);
+          assert.equal((await current).tool!.name, 'read_rows');
+          assert.deepEqual(refreshes, [path.endpoint, replacement.endpoint]);
+          assert.deepEqual(metadata, [replacement.endpoint]);
+          assert.equal(
+            JSON.parse((await grantVault.read(connectionId)).value).tokens.access_token,
+            'synthetic-refreshed-new',
+          );
+          assert.equal(
+            (
+              await pool.query(
+                'SELECT reconnect_required FROM discovered_connections WHERE id=$1',
+                [connectionId],
+              )
+            ).rows[0].reconnect_required,
+            false,
+          );
+        } finally {
+          release();
+          await rejected;
+        }
+      });
+      await t.test('Stop refuses a cold or shared lookup after a late response', async () => {
+        for (const shared of [false, true]) {
+          const f = await fixture();
+          let entered!: () => void;
+          let release!: () => void;
+          const started = new Promise<void>((resolve) => {
+            entered = resolve;
+          });
+          const waiting = new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          f.beforeList(async () => {
+            entered();
+            await waiting;
+          });
+          const controller = new AbortController();
+          const first = f.discovered.approvalDetails(
+            'CONNECTED_MCP_CALL',
+            f.args,
+            shared ? undefined : controller.signal,
+          );
+          await started;
+          const stopped = shared
+            ? f.discovered.approvalDetails('CONNECTED_MCP_CALL', f.args, controller.signal)
+            : first;
+          const rejected = assert.rejects(stopped, /synthetic_stop/);
+          controller.abort(new Error('synthetic_stop'));
+          release();
+          await rejected;
+          if (shared) assert.equal((await first).tool!.name, 'read_rows');
+          assert.deepEqual(f.counts(), { lists: 1, calls: 0 });
+        }
+      });
+    } finally {
       await pool.end();
       await admin.query(`DROP SCHEMA ${schema} CASCADE`);
       await admin.end();
@@ -9861,8 +11180,13 @@ test(
       assert.equal((await discovered.servers())[0].tools[0].name, 'known_tool');
       assert.equal(requests, 2);
       release();
-      await delay(0);
-      assert.equal((await discovered.servers())[0].tools[0].name, 'new_tool');
+      let refreshed = await discovered.servers();
+      for (let attempt = 0; attempt < 100 && refreshed[0].tools[0].name !== 'new_tool'; attempt++) {
+        await delay(10);
+        refreshed = await discovered.servers();
+      }
+      assert.equal(refreshed[0].tools[0].name, 'new_tool');
+      assert.equal(requests, 2);
       await pool.query('DELETE FROM discovered_connections WHERE id=$1', [connectionId]);
       assert.deepEqual(await discovered.servers(), []);
     } finally {
@@ -9931,6 +11255,15 @@ test(
         }),
         { name: 'ZodError' },
       );
+      for (const name of [
+        'Fixture\ncloud',
+        'Fixture\u202ecloud',
+        'Fixture\u0007cloud',
+        'Fixture\u2029cloud',
+      ])
+        await assert.rejects(discovered.propose({ service: 'fixture-cloud', name, paths: [cli] }), {
+          name: 'ZodError',
+        });
       const proposal = await discovered.propose({
         service: 'fixture-cloud',
         name: 'Fixture cloud',
@@ -9949,7 +11282,15 @@ test(
         FIXTURE_ACCESS_KEY_ID: 'synthetic-key-id',
         FIXTURE_SECRET_ACCESS_KEY: 'synthetic-secret-key',
       };
-      assert.equal((await complete(values)).statusCode, 200);
+      assert.equal(
+        (
+          await complete({
+            FIXTURE_ACCESS_KEY_ID: ' synthetic-key-id',
+            FIXTURE_SECRET_ACCESS_KEY: 'synthetic-secret-key\n',
+          })
+        ).statusCode,
+        200,
+      );
       const saved = await pool.query<{ id: string; paths: Array<{ id: string }> }>(
         'SELECT id,paths FROM discovered_connections WHERE owner_id=$1',
         [owner],
@@ -9973,7 +11314,7 @@ test(
           await app.inject({
             method: 'POST',
             url: `/api/apps/discovery/${singleId}/complete`,
-            payload: { token: { FIXTURE_TOKEN: 'synthetic-tool-token' }, accountName: 'Tool' },
+            payload: { token: { FIXTURE_TOKEN: '\tsynthetic-tool-token ' }, accountName: 'Tool' },
           })
         ).statusCode,
         200,
@@ -10050,6 +11391,18 @@ test(
         return new Response(Buffer.from(`echo ${mixedCaseEncoded}`), {
           headers: { 'content-type': 'application/octet-stream' },
         });
+      if (String(input) === 'https://fixture.example/api/items/1/archive') {
+        const type = new Headers(init?.headers).get('content-type');
+        return init?.body === undefined && type
+          ? Response.json(
+              {
+                code: 'FST_ERR_CTP_EMPTY_JSON_BODY',
+                message: `Body cannot be empty when content-type is set to '${type}'`,
+              },
+              { status: 400 },
+            )
+          : Response.json({ archived: true, type, body: init?.body ?? null });
+      }
       if (init?.method === 'GET') return new Response(null, { status: 405 });
       const message = JSON.parse(String(init?.body));
       if (message.id === undefined) return new Response(null, { status: 202 });
@@ -10158,6 +11511,29 @@ test(
         error: 'The file was withheld because it contains the connection credential.',
       },
     });
+    for (const method of ['POST', 'PUT', 'PATCH', 'DELETE'])
+      assert.deepEqual(
+        await discovered.execute('CONNECTED_HTTP', {
+          connectionId,
+          pathId: httpPath,
+          method,
+          path: 'items/1/archive',
+        }),
+        { status: 200, body: { archived: true, type: null, body: null } },
+      );
+    assert.deepEqual(
+      await discovered.execute('CONNECTED_HTTP', {
+        connectionId,
+        pathId: httpPath,
+        method: 'POST',
+        path: 'items/1/archive',
+        body: { reason: 'done' },
+      }),
+      {
+        status: 200,
+        body: { archived: true, type: 'application/json', body: '{"reason":"done"}' },
+      },
+    );
     const input = {
       query: 'roadmap',
       page_url: 'https://www.notion.so/team/synthetic-page',
@@ -11131,6 +12507,50 @@ test('Composio failure envelopes reject with the provider error', async (t) => {
       (error: unknown) => error === requestError,
     );
   }
+  const lookup = t.mock.method(client.getClient().toolRouter.session, 'executeMeta', async () => ({
+    error: null,
+    data: { success: true, tool_schemas: {}, not_found: ['GMAIL_GET_MESSAGE'] },
+  }));
+  assert.equal(await session.offers!('GMAIL_GET_MESSAGE'), false);
+  assert.equal(await session.offers!('GMAIL_SEND_EMAIL'), true);
+  lookup.mock.mockImplementation(
+    async () =>
+      ({
+        error: null,
+        data: { data: { success: true, tool_schemas: {}, not_found: ['GMAIL_GET_MESSAGE'] } },
+      }) as never,
+  );
+  assert.equal(await session.offers!('GMAIL_GET_MESSAGE'), false);
+  lookup.mock.mockImplementation(async () => ({ error: 'unexpected', data: {} }) as never);
+  assert.equal(await session.offers!('GMAIL_GET_MESSAGE'), true);
+  lookup.mock.mockImplementation(async () => {
+    throw APIError.generate(404, { error: 'not_found' }, undefined, new Headers());
+  });
+  assert.equal(await session.offers!('GMAIL_GET_MESSAGE'), false);
+  lookup.mock.mockImplementation(async () => {
+    throw APIError.generate(404, undefined, '<html>missing</html>', new Headers());
+  });
+  await assert.rejects(session.offers!('GMAIL_GET_MESSAGE'));
+  lookup.mock.mockImplementation(async () => {
+    throw APIError.generate(503, { error: 'unavailable' }, undefined, new Headers());
+  });
+  await assert.rejects(session.offers!('GMAIL_GET_MESSAGE'));
+  requestError = APIError.generate(
+    404,
+    { error: 'not_found' },
+    undefined,
+    new Headers({ 'content-type': 'application/json' }),
+  );
+  await assert.rejects(
+    session.execute('GMAIL_GET_MESSAGE', {}, 'fixture-account'),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal((error as Error & { status?: number }).status, 404);
+      assert.ok(error.message.includes('GMAIL_GET_MESSAGE'));
+      assert.match(error.message, /HTTP 404.*not_found/);
+      return true;
+    },
+  );
 });
 
 test('Composio catalog and connection requests classify HTTP failures without exposing provider details', async (t) => {
@@ -11492,6 +12912,25 @@ test('connection service refusals pause the install from Retry-After or a growin
   stale.open(1);
   assert.deepEqual(await Promise.all(before), ['refused', 'refused']);
   assert.equal(waited(), 60);
+});
+
+test('a refused file upload keeps the connection service reason in the pause', async (t) => {
+  const service = await connectionServiceFixture(t);
+  service.reply(() => Response.json({ error: 'installation_busy' }, { status: 503 }));
+  const session = await service.provider.createSession('fixture-owner', {
+    gmail: 'ca_fixture_wait',
+  });
+  await assert.rejects(
+    session.upload!(
+      'GMAIL_SEND_EMAIL',
+      { name: 'synthetic.bin', mimeType: 'application/octet-stream', bytes: Uint8Array.of(1) },
+      undefined,
+      'ca_fixture_wait',
+    ),
+    /installation_busy\. HTTP 503\./,
+  );
+  assert.equal(service.provider.connectionBackoff!()?.status, 503);
+  assert.equal(service.provider.connectionBackoff!()?.code, 'installation_busy');
 });
 
 test(
@@ -12299,7 +13738,7 @@ test(
         },
       });
       const request = { task: 'review' as const, instructions: 'Synthetic', input: {} };
-      await assert.rejects(curator.curate(request), /Synthetic usage write failure/);
+      assert.deepEqual(await curator.curate(request), {});
       const failedAt = Date.now();
       await new Promise((resolve) => setTimeout(resolve, 20));
       await assert.rejects(curator.curate(request), /Synthetic usage write failure/);
@@ -13428,6 +14867,106 @@ test('discovered requests identify Nod, follow redirects only to checked public 
   );
 });
 
+test('discovered requests stay open while data arrives and end after ten silent minutes', async (t) => {
+  const { PassThrough } = await import('node:stream');
+  const { EventEmitter } = await import('node:events');
+  t.mock.method(AbortSignal, 'timeout', (ms: number) => {
+    const controller = new AbortController();
+    setTimeout(
+      () =>
+        controller.abort(
+          new DOMException('The operation was aborted due to timeout', 'TimeoutError'),
+        ),
+      ms,
+    );
+    return controller.signal;
+  });
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const streams: InstanceType<typeof PassThrough>[] = [];
+  const request = ((
+    url: URL,
+    options: { signal: AbortSignal },
+    callback: (incoming: unknown) => void,
+  ) => {
+    const moved = url.pathname === '/moved';
+    const outbound = Object.assign(new EventEmitter(), { end() {} });
+    const incoming = Object.assign(new PassThrough(), {
+      statusCode: moved ? 307 : 200,
+      headers: moved
+        ? { location: '/' }
+        : {
+            'content-type':
+              url.pathname === '/export' ? 'application/octet-stream' : 'text/event-stream',
+          },
+    });
+    options.signal.addEventListener(
+      'abort',
+      () => outbound.emit('error', new DOMException('The operation was aborted', 'AbortError')),
+      { once: true },
+    );
+    if (url.pathname === '/hang') return outbound;
+    options.signal.addEventListener('abort', () => incoming.destroy(new Error('aborted')), {
+      once: true,
+    });
+    if (!moved) streams.push(incoming);
+    queueMicrotask(() => callback(incoming));
+    return outbound;
+  }) as unknown as NonNullable<Parameters<typeof safeRemoteFetch>[2]>['request'];
+  const validate = async (value: string) => ({ url: new URL(value), address: '93.184.216.34' });
+  const open = async (path: string, accept = 'application/json, text/event-stream') =>
+    (
+      await safeRemoteFetch(
+        `https://mcp.fixture.example${path}`,
+        { method: 'POST', body: '{}', headers: { accept } },
+        { validate, request },
+      )
+    ).body!.getReader();
+  const decoder = new TextDecoder();
+  for (const path of ['/', '/moved']) {
+    const progress = await open(path);
+    const stream = streams.at(-1)!;
+    for (let minute = 0; minute < 20; minute += 5) {
+      stream.write(`event: progress\ndata: ${minute}\n\n`);
+      assert.equal(
+        decoder.decode((await progress.read()).value),
+        `event: progress\ndata: ${minute}\n\n`,
+      );
+      t.mock.timers.tick(5 * 60_000);
+    }
+    stream.end('event: result\n\n');
+    assert.equal(decoder.decode((await progress.read()).value), 'event: result\n\n');
+    assert.equal((await progress.read()).done, true);
+  }
+  const silent = await open('/');
+  t.mock.timers.tick(10 * 60_000);
+  await assert.rejects(silent.read(), /sent nothing for 10 minutes/);
+  const hanging = open('/hang');
+  await new Promise((resolve) => setImmediate(resolve));
+  t.mock.timers.tick(10 * 60_000);
+  await assert.rejects(hanging, /sent nothing for 10 minutes/);
+  const events = await open('/');
+  const eventStream = streams.at(-1)!;
+  for (let minute = 0; minute < 90; minute += 5) {
+    eventStream.write('event: progress\n\n');
+    await events.read();
+    t.mock.timers.tick(5 * 60_000);
+  }
+  eventStream.end();
+  assert.equal((await events.read()).done, true);
+  for (const [path, accept] of [
+    ['/export', undefined],
+    ['/', 'application/json'],
+  ] as const) {
+    const trickle = await open(path, accept);
+    for (let minute = 0; minute < 60; minute += 5) {
+      streams.at(-1)!.write('x');
+      await trickle.read();
+      t.mock.timers.tick(5 * 60_000);
+    }
+    await assert.rejects(trickle.read(), /did not finish within an hour/);
+  }
+});
+
 test(
   'connection failures expose bounded recovery errors and require a manual retry',
   { skip: !process.env.TEST_DATABASE_URL },
@@ -13506,6 +15045,51 @@ test(
     const prepared = await f.service.prepare(owner, 'GITHUB_LIST_REPOSITORIES', {
       connectionId: connected.connectionId,
     });
+    for (const phase of ['session startup', 'before dispatch', 'after dispatch'])
+      await t.test(`approved action Stop during ${phase} keeps its dispatch outcome`, async () => {
+        const controller = new AbortController();
+        const stop = new Error('Synthetic boundary stop.');
+        const createSession = f.provider.createSession;
+        const execute = f.session.execute;
+        const before = f.executed.length;
+        f.provider.createSession = async (...args) => {
+          const session = await createSession(...args);
+          if (phase === 'session startup') controller.abort(stop);
+          return session;
+        };
+        f.session.execute = async (...args) => {
+          const result = await execute(...args);
+          if (phase === 'after dispatch') {
+            controller.abort(stop);
+            controller.signal.throwIfAborted();
+          }
+          return result;
+        };
+        try {
+          await assert.rejects(
+            f.service.executeApproved(
+              owner,
+              'GITHUB_LIST_REPOSITORIES',
+              prepared,
+              undefined,
+              controller.signal,
+              undefined,
+              async () => {
+                if (phase === 'before dispatch') controller.abort(stop);
+              },
+            ),
+            (error: Error & { notRun?: boolean }) => {
+              assert.match(error.message, /Synthetic boundary stop/);
+              assert.equal(error.notRun === true, phase !== 'after dispatch');
+              return true;
+            },
+          );
+          assert.equal(f.executed.length, before + (phase === 'after dispatch' ? 1 : 0));
+        } finally {
+          f.provider.createSession = createSession;
+          f.session.execute = execute;
+        }
+      });
     const execute = f.session.execute;
     for (const status of [400, 429, 503]) {
       f.session.execute = async () => {
@@ -13527,6 +15111,7 @@ test(
     ]);
     await assert.rejects(f.service.executeApproved(owner, 'GITHUB_LIST_REPOSITORIES', prepared), {
       statusCode: 404,
+      notRun: true,
     });
     await f.pool.query('UPDATE app_connections SET account_active=true WHERE id=$1', [
       connected.connectionId,
@@ -13541,7 +15126,16 @@ test(
     };
     await assert.rejects(f.service.executeApproved(owner, 'GITHUB_LIST_REPOSITORIES', prepared), {
       statusCode: 404,
+      notRun: true,
     });
+    assert.equal(f.executed.length, executions);
+    await f.pool.query('DELETE FROM app_connections WHERE id=$1', [connected.connectionId]);
+    const sessions = f.sessions.length;
+    await assert.rejects(f.service.executeApproved(owner, 'GITHUB_LIST_REPOSITORIES', prepared), {
+      statusCode: 404,
+      notRun: true,
+    });
+    assert.equal(f.sessions.length, sessions);
     assert.equal(f.executed.length, executions);
   },
 );

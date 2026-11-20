@@ -83,9 +83,7 @@ export function ManualMcpDialog({
               name="name"
               placeholder="My workspace"
               required
-              minLength={2}
               maxLength={80}
-              pattern="[A-Za-z0-9][A-Za-z0-9 .&amp;'_\-]{1,79}"
               disabled={saving}
             />
           </Field>

@@ -195,7 +195,7 @@ for index,(args,child_env,seconds) in enumerate(steps):
   output('stderr',b'The connected CLI install is not sealed. Propose it again.\\n')
   finish({'type':'exit','code':126,'reason':None})
  try: p=subprocess.Popen(args,stdin=subprocess.PIPE if last else subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True,env=child_env,cwd=home)
- except OSError as error:
+ except (OSError,ValueError) as error:
   output('stderr',(str(error)+'\\n').encode())
   finish({'type':'exit','code':127,'reason':None})
  sel.register(p.stdout,selectors.EVENT_READ,'stdout')

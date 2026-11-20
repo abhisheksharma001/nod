@@ -41,7 +41,14 @@ export function createSkillLibrary(
     skills.length !== skillPaths.length ||
     skills.some((skill) => skill.name !== basename(skill.baseDir))
   )
-    throw new Error('The skill metadata is invalid.');
+    throw new Error(
+      `The skill metadata is invalid${diagnostics
+        .map(
+          ({ path, message, collision }, index) =>
+            `${index ? ';' : ':'} ${message} in ${collision ? `${collision.winnerPath} and ${collision.loserPath}` : path}`,
+        )
+        .join('')}.`,
+    );
   const enabled = skills.filter((skill) => !skill.disableModelInvocation);
   const byName = new Map(enabled.map((skill) => [skill.name, skill.baseDir]));
   return {
