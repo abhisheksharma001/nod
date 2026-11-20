@@ -80,6 +80,7 @@ export function Onboarding({
 }) {
   useBrowserTimeZone();
   const desktop = desktopRuntimeAvailable();
+  const privacy = usageShared || (traces !== undefined && Boolean(onTraces));
   const models = usePageData<ModelsResponse>('/api/models');
   const [position, setPosition] = useState<{
     step: SetupStep;
@@ -119,7 +120,8 @@ export function Onboarding({
       quiet: welcomed && step === 'email',
     };
   });
-  const { step, arrived } = position;
+  const { arrived } = position;
+  const step = position.step === 'privacy' && !privacy ? 'join' : position.step;
   const index = step === 'preferences' ? onboardingSteps.length : onboardingSteps.indexOf(step);
   const [preparation, setPreparation] = useState<'pending' | 'ready' | 'failed'>('pending');
   const [preparationError, setPreparationError] = useState<{
@@ -135,6 +137,9 @@ export function Onboarding({
   const [error, setError] = useState('');
   const [missing, setMissing] = useState<'brain' | 'email' | null>(null);
   const [skipModelStep, setSkipModelStep] = useState<boolean | null>(null);
+  const steps = onboardingSteps.filter(
+    (item) => (item !== 'brain' || skipModelStep !== true) && (item !== 'privacy' || privacy),
+  );
   const [mining, setMining] = useState(false);
   const emailSkipped = useRef(false);
   const started = useRef(false);
@@ -152,6 +157,10 @@ export function Onboarding({
   useEffect(() => {
     desktopRendererReady();
   }, []);
+
+  useEffect(() => {
+    if (step !== position.step) setPosition({ step, arrived });
+  }, [step]);
 
   useEffect(
     () =>
@@ -347,8 +356,9 @@ export function Onboarding({
   }
 
   function go(offset: 1 | -1) {
-    let next = onboardingSteps[index + offset];
-    if (next === 'brain' && skipModelStep === true) next = onboardingSteps[index + offset * 2];
+    let at = index + offset;
+    while (onboardingSteps[at] && !steps.includes(onboardingSteps[at])) at += offset;
+    const next = onboardingSteps[at];
     if (next) {
       setError('');
       setCompletionFailed(false);
@@ -449,7 +459,6 @@ export function Onboarding({
     </div>
   );
 
-  const steps = onboardingSteps.filter((item) => item !== 'brain' || skipModelStep !== true);
   if (step === 'preferences')
     return <DesktopPreferencesSetup notice={recovery} onReady={next} steps={steps} />;
 

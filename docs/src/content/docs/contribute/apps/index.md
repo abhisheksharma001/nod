@@ -23,6 +23,20 @@ You do not need to write TypeScript for a supported connection. APIs and CLIs co
 
 App-only contributions that use this profile can start with a folder and a PR. If the app needs a Nod runtime change, open an issue or discussion before you implement that change.
 
+## Current limitations
+
+Version one supports a limited set of Agent Plugins features. Check these limits before you create an app folder:
+
+- Each app describes one service and one connection method. Fixed connections use one authentication method.
+- MCP apps use Streamable HTTP. The app format does not support stdio servers, legacy SSE servers, or static MCP headers.
+- Fixed MCP addresses, HTTP API addresses, and CLI download addresses must use public HTTPS on port 80 or 443. OAuth endpoints must use port 443. Only n8n's app setup permits local or private instance addresses.
+- CLI apps must run without interaction in Nod's Linux workspace on every host platform.
+- App folders cannot add install scripts or hooks. Bundled skills can contain Markdown guides and references, but Nod does not execute their scripts.
+
+Each app must also list one to eight statements of unsupported or restricted behavior in `limitations`.
+
+See [Plan the app](/contribute/apps/plan/) for connection requirements and the [format reference](/contribute/apps/format/) for the complete field and transport rules.
+
 ## Build and submit
 
 | Step                                | Guide                                                 |
