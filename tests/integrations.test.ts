@@ -12852,6 +12852,25 @@ test('connection service refusals pause the install from Retry-After or a growin
   assert.equal(waited(), 60);
 });
 
+test('a refused file upload keeps the connection service reason in the pause', async (t) => {
+  const service = await connectionServiceFixture(t);
+  service.reply(() => Response.json({ error: 'installation_busy' }, { status: 503 }));
+  const session = await service.provider.createSession('fixture-owner', {
+    gmail: 'ca_fixture_wait',
+  });
+  await assert.rejects(
+    session.upload!(
+      'GMAIL_SEND_EMAIL',
+      { name: 'synthetic.bin', mimeType: 'application/octet-stream', bytes: Uint8Array.of(1) },
+      undefined,
+      'ca_fixture_wait',
+    ),
+    /installation_busy\. HTTP 503\./,
+  );
+  assert.equal(service.provider.connectionBackoff!()?.status, 503);
+  assert.equal(service.provider.connectionBackoff!()?.code, 'installation_busy');
+});
+
 test(
   'a connection service wait skips background reads across apps, refuses writes and lets an owner read try once',
   { skip: !process.env.TEST_DATABASE_URL },
