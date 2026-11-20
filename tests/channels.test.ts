@@ -1519,7 +1519,8 @@ test(
 );
 
 test('Telegram voice, contact and location replies still send when the message they answer is gone', async () => {
-  const calls: { method: string; replyParameters: unknown }[] = [];
+  const delivered: string[] = [];
+  let nextId = 500;
   const empty = { rows: [], rowCount: 0 };
   const pool = {
     query: async () => empty,
@@ -1530,18 +1531,23 @@ test('Telegram voice, contact and location replies still send when the message t
   const fakeFetch: typeof fetch = async (input, init) => {
     const method = String(input).split('/').at(-1)!;
     const body = init?.body;
-    const replyParameters =
+    const raw =
       body instanceof FormData
         ? body.get('reply_parameters')
-        : JSON.parse(String(body)).reply_parameters;
-    calls.push({
-      method,
-      replyParameters:
-        typeof replyParameters === 'string' ? JSON.parse(replyParameters) : replyParameters,
-    });
+        : body
+          ? JSON.parse(String(body)).reply_parameters
+          : undefined;
+    const reply = (typeof raw === 'string' ? JSON.parse(raw) : raw) as
+      { message_id: number; allow_sending_without_reply?: boolean } | undefined;
+    if (reply?.message_id === 41 && !reply.allow_sending_without_reply)
+      return Response.json(
+        { ok: false, error_code: 400, description: 'Bad Request: message to be replied not found' },
+        { status: 400 },
+      );
+    if (method !== 'getMe') delivered.push(method);
     return Response.json({
       ok: true,
-      result: { message_id: 500, date: 1, chat: { id: 123456, type: 'private' } },
+      result: { message_id: ++nextId, date: 1, chat: { id: 123456, type: 'private' } },
     });
   };
   const transport = createChatSdkTransport(pool, fixtureEnv, { fetch: fakeFetch });
@@ -1561,42 +1567,47 @@ test('Telegram voice, contact and location replies still send when the message t
   const original = globalThis.fetch;
   globalThis.fetch = fakeFetch;
   try {
-    await send('hello');
-    await send('', attachment('reply.ogg', 'audio/ogg', 'OggS synthetic voice'));
-    await send(
-      '',
-      attachment(
-        'contact.vcf',
-        'text/vcard',
-        'BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Synthetic Contact\r\nTEL:+34600000000\r\nEND:VCARD',
-      ),
-    );
-    await send(
-      '',
-      attachment(
-        'location.json',
-        'application/json',
-        JSON.stringify({ latitude: 41.4, longitude: 2.17 }),
-      ),
-    );
-    await send(
-      '',
-      attachment(
-        'location.json',
-        'application/json',
-        JSON.stringify({ latitude: 41.4, longitude: 2.17, name: 'Synthetic park' }),
-      ),
-    );
+    for (const [text, file] of [
+      ['hello'],
+      ['', attachment('reply.ogg', 'audio/ogg', 'OggS synthetic voice')],
+      [
+        '',
+        attachment(
+          'contact.vcf',
+          'text/vcard',
+          'BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Synthetic Contact\r\nTEL:+34600000000\r\nEND:VCARD',
+        ),
+      ],
+      [
+        '',
+        attachment(
+          'location.json',
+          'application/json',
+          JSON.stringify({ latitude: 41.4, longitude: 2.17 }),
+        ),
+      ],
+      [
+        '',
+        attachment(
+          'location.json',
+          'application/json',
+          JSON.stringify({ latitude: 41.4, longitude: 2.17, name: 'Synthetic park' }),
+        ),
+      ],
+    ] as const) {
+      const sent = await send(text, ...(file ? [file] : []));
+      assert.equal(sent.id, `123456:${nextId}`);
+    }
   } finally {
     globalThis.fetch = original;
   }
-  assert.deepEqual(
-    calls.filter(({ method }) => method !== 'getMe'),
-    ['sendMessage', 'sendVoice', 'sendContact', 'sendLocation', 'sendVenue'].map((method) => ({
-      method,
-      replyParameters: { message_id: 41, allow_sending_without_reply: true },
-    })),
-  );
+  assert.deepEqual(delivered, [
+    'sendMessage',
+    'sendVoice',
+    'sendContact',
+    'sendLocation',
+    'sendVenue',
+  ]);
 });
 
 test('WhatsApp bot mode accepts a confirmed private ID when mapping lookups miss', async (t) => {

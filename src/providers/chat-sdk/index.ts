@@ -148,6 +148,10 @@ class Telegram extends TelegramAdapter {
     return this.encodeMessageId(thread.chatId, sent.message_id);
   }
 
+  replyParameters(replyToMessageId: string | undefined, chatId: string) {
+    return this.buildReplyParameters(replyToMessageId, chatId);
+  }
+
   typing(threadId: string, signal?: AbortSignal) {
     return this.telegramFetch(
       'sendChatAction',
@@ -949,14 +953,8 @@ export function createChatSdkTransport(
           body.set('chat_id', decoded.chatId);
           if (decoded.messageThreadId)
             body.set('message_thread_id', String(decoded.messageThreadId));
-          if (input.replyToMessageId)
-            body.set(
-              'reply_parameters',
-              JSON.stringify({
-                message_id: Number(input.replyToMessageId.split(':').at(-1)),
-                allow_sending_without_reply: true,
-              }),
-            );
+          const replyParameters = telegram!.replyParameters(input.replyToMessageId, decoded.chatId);
+          if (replyParameters) body.set('reply_parameters', JSON.stringify(replyParameters));
           let bytes: Uint8Array;
           try {
             bytes = await file.read();
@@ -1086,14 +1084,10 @@ export function createChatSdkTransport(
                   ...(decoded.messageThreadId
                     ? { message_thread_id: decoded.messageThreadId }
                     : {}),
-                  ...(input.replyToMessageId
-                    ? {
-                        reply_parameters: {
-                          message_id: Number(input.replyToMessageId.split(':').at(-1)),
-                          allow_sending_without_reply: true,
-                        },
-                      }
-                    : {}),
+                  reply_parameters: telegram!.replyParameters(
+                    input.replyToMessageId,
+                    decoded.chatId,
+                  ),
                   ...message.data,
                 }),
                 signal: AbortSignal.timeout(60_000),
