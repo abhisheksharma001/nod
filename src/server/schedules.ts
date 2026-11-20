@@ -12,9 +12,10 @@ import type {
   ScheduleRun,
   TurnStatus,
 } from '../shared/contracts.ts';
-import type { enqueueTurn } from './thread.ts';
+import { abortTurns, cancelTurns, lockThread, type enqueueTurn } from './thread.ts';
 import { modelSelectionInput } from './models.ts';
 import {
+  canReuseWorkCost,
   repriceUsd,
   type ModelChoice,
   type ModelSelection,
@@ -23,7 +24,7 @@ import {
 import { activeThreadSql } from './history.ts';
 import { waitingTurnSql } from './turn-chain.ts';
 import type { WorkConsumers } from './work-admission.ts';
-import type { CaptureAnalytics } from './analytics.ts';
+import { snapshotAnalytics, type CaptureAnalytics } from './analytics.ts';
 import { logFailure } from './failure-log.ts';
 import { lockKey } from './locks.ts';
 import {
@@ -37,6 +38,13 @@ import {
 const queue = 'scheduled-task';
 const lateAfterMs = 10 * 60_000;
 const skippedCountLimit = 100;
+const runTurn = `JOIN LATERAL (
+  SELECT u.* FROM turns u WHERE u.owner_id=r.owner_id AND (u.id=r.turn_id OR u.session_id=r.turn_id)
+    AND (u.id=r.turn_id OR NOT (u.status='succeeded' AND u.started_at IS NULL
+      AND u.message_id IS NOT NULL AND u.source IN ('user','task')))
+  ORDER BY CASE WHEN u.status='running' THEN 0 WHEN u.status='queued' THEN 1
+    WHEN ${waitingTurnSql('u')} THEN 2 ELSE 3 END,u.created_at DESC,u.id DESC LIMIT 1
+) u ON true`;
 const timingSchema = z.object({
   kind: z.enum(['once', 'recurring']).default('recurring'),
   cron: z.string().trim().min(1).nullable().optional(),
@@ -100,19 +108,28 @@ export interface ScheduleDependencies {
   stopConsumer?: (id: string) => Promise<void>;
   enqueueTurn: typeof enqueueTurn;
   refresh(): void;
+  clearBrowser?(id: string): Promise<void>;
   retireScheduleConfirmations?(client: PoolClient, id: string, waitForSend: boolean): Promise<void>;
   now?: () => Date;
   sessionCosts?(sessionIds: string[]): Promise<Record<string, number | null>>;
   watchable?(connectionIds: string[]): Promise<boolean>;
   watchState?(connectionIds: string[]): Promise<string | null>;
   modelPaused?(model: ModelSelection | null): boolean;
-  recentTurnCost?(turnId?: string): Promise<number | null>;
+  recentTurnUsage?(
+    turnId?: string,
+    projectAtApiRates?: boolean,
+  ): Promise<Array<WorkUsage & { recordedUsd: number }>>;
   validateModel?(choice: ModelSelection): ModelSelection;
-  sessionUsage?(sessionIds: string[]): Promise<Record<string, WorkUsage>>;
+  sessionUsage?(sessionIds: string[]): Promise<Record<string, WorkUsage & { unpriced: boolean }>>;
   workPricing?(own: ModelSelection | null): WorkPrice | undefined;
 }
 
-type WorkPrice = { modelId: string; pricing: ModelChoice['pricing'] };
+type WorkPrice = {
+  modelId: string;
+  pricing: ModelChoice['pricing'];
+  audio?: boolean;
+  plan?: boolean;
+};
 
 interface ScheduleRow {
   id: string;
@@ -352,7 +369,8 @@ export function createSchedules(dependencies: ScheduleDependencies) {
           FROM schedule_runs r
          JOIN turns u ON u.owner_id=r.owner_id AND u.session_id=r.turn_id
          WHERE r.owner_id=$1 AND r.schedule_id=$2 AND (u.status IN ('queued','running')
-           OR (${waitingTurnSql('u')})) ORDER BY u.created_at DESC,u.id DESC LIMIT 1`,
+           OR (${waitingTurnSql('u')}))
+         ORDER BY (u.status='running') DESC,(u.status='queued') DESC,u.created_at DESC,u.id DESC LIMIT 1`,
       [ownerId, scheduleId],
     );
     return rows[0] ?? null;
@@ -446,6 +464,29 @@ export function createSchedules(dependencies: ScheduleDependencies) {
     return { ...run, activeRun: await activeRun(pool, id) };
   }
 
+  async function stopRun(id: string, turnId: string) {
+    z.uuid().parse(id);
+    z.uuid().parse(turnId);
+    const capture = snapshotAnalytics(dependencies.analytics);
+    const cancelled = await cancellationTransaction(async (client) => {
+      const thread = await lockThread(client, ownerId);
+      const run = (
+        await client.query<{ sessionId: string }>(
+          `SELECT r.turn_id AS "sessionId" FROM schedule_runs r
+           JOIN turns u ON u.session_id=r.turn_id AND u.owner_id=r.owner_id
+           WHERE r.owner_id=$1 AND r.schedule_id=$2 AND u.id=$3 AND u.thread_id=$4`,
+          [ownerId, id, turnId, thread.id],
+        )
+      ).rows[0];
+      if (!run) throw Object.assign(new Error('Schedule run not found.'), { statusCode: 404 });
+      return cancelTurns(client, thread.id, { sessionId: run.sessionId }, capture, 'owner');
+    }, pool);
+    abortTurns(cancelled.ids);
+    await Promise.allSettled(cancelled.browsers.map((id) => dependencies.clearBrowser?.(id)));
+    refresh();
+    return { ok: true };
+  }
+
   async function dispatch(job: Job<ScheduleJob>) {
     job.signal.throwIfAborted();
     const watched = (
@@ -509,8 +550,8 @@ export function createSchedules(dependencies: ScheduleDependencies) {
           row.watchMarker === unchanged &&
           (
             await client.query<{ status: TurnStatus }>(
-              `SELECT u.status FROM schedule_runs r JOIN turns u ON u.id=r.turn_id AND u.owner_id=r.owner_id
-               WHERE r.owner_id=$1 AND r.schedule_id=$2 ORDER BY r.scheduled_for DESC LIMIT 1`,
+              `SELECT u.status FROM schedule_runs r ${runTurn}
+               WHERE r.owner_id=$1 AND r.schedule_id=$2 ORDER BY r.scheduled_for DESC,r.created_at DESC,r.id DESC LIMIT 1`,
               [ownerId, row.id],
             )
           ).rows[0]?.status === 'succeeded'
@@ -636,7 +677,7 @@ export function createSchedules(dependencies: ScheduleDependencies) {
            r.scheduled_for AS "scheduledFor",r.time_zone AS "timeZone",r.created_at AS "createdAt",
            u.status,u.error,r.observation,r.observed_at AS "observedAt",m.id AS "messageId",m.text AS "messageText",
            to_char(r.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS "cursorAt"
-         FROM schedule_runs r JOIN turns u ON u.id=r.turn_id AND u.owner_id=r.owner_id
+         FROM schedule_runs r ${runTurn}
          LEFT JOIN LATERAL (
            SELECT m.id,left(m.text,4000) AS text FROM messages m
            WHERE m.turn_id=u.id AND m.owner_id=u.owner_id AND m.role='assistant'
@@ -733,47 +774,68 @@ export function createSchedules(dependencies: ScheduleDependencies) {
       await pool.query<{ schedule_id: string; turn_id: string; latest: boolean }>(
         `SELECT schedule_id,turn_id,latest FROM (
            SELECT r.schedule_id,r.turn_id,
-             row_number() OVER (PARTITION BY r.schedule_id ORDER BY r.scheduled_for DESC) AS recent,
-             row_number() OVER (ORDER BY r.scheduled_for DESC)<=10 AS latest
-           FROM schedule_runs r JOIN turns u ON u.id=r.turn_id AND u.owner_id=r.owner_id
+             row_number() OVER (PARTITION BY r.schedule_id ORDER BY r.scheduled_for DESC,r.created_at DESC,r.id DESC) AS recent,
+             row_number() OVER (ORDER BY r.scheduled_for DESC,r.created_at DESC,r.id DESC)<=10 AS latest
+           FROM schedule_runs r ${runTurn}
            WHERE r.owner_id=$2 AND u.status NOT IN ('queued','running','waiting')) runs
          WHERE (recent<=10 AND schedule_id=ANY($1::uuid[])) OR latest`,
         [recurring.map((row) => row.id), ownerId],
       )
     ).rows;
-    const costs = await dependencies.sessionCosts(runs.map((run) => run.turn_id));
-    const usage = (await dependencies.sessionUsage?.(runs.map((run) => run.turn_id))) ?? {};
-    const runCost = (run: (typeof runs)[number], target: WorkPrice | undefined) => {
-      const recorded = costs[run.turn_id];
-      const spent = usage[run.turn_id];
-      if (!spent || !target || (spent.models.length === 1 && spent.models[0] === target.modelId))
-        return recorded;
-      return repriceUsd(spent, target.pricing);
+    const sessions = runs.map((run) => run.turn_id);
+    const usage = dependencies.workPricing
+      ? await dependencies.sessionUsage?.(sessions)
+      : undefined;
+    const costs = usage ? {} : await dependencies.sessionCosts(sessions);
+    const forecast = (
+      spent: WorkUsage | undefined,
+      recorded: number | null | undefined,
+      target: WorkPrice | undefined,
+    ) => {
+      if (!spent || !target) return typeof recorded === 'number' && recorded > 0 ? recorded : null;
+      if (canReuseWorkCost(spent, target.modelId, target.pricing)) return recorded;
+      const cost = repriceUsd(spent, target.pricing, target.audio);
+      const tokens = spent.input + spent.output + spent.cacheRead + spent.cacheWrite;
+      return cost === 0 && tokens === 0 ? null : cost;
     };
+    const hasPrice = (cost: number | null | undefined): cost is number =>
+      typeof cost === 'number' && Number.isFinite(cost) && cost >= 0;
     const pricedRuns = (
       target: WorkPrice | undefined,
       keep: (run: (typeof runs)[number]) => boolean,
     ) =>
       runs.flatMap((run) => {
-        const cost = keep(run) ? runCost(run, target) : undefined;
-        return typeof cost === 'number' && cost > 0 ? [cost] : [];
+        const spent = usage?.[run.turn_id];
+        const recorded = spent ? spent.agentUsd + spent.otherUsd : costs[run.turn_id];
+        if (!keep(run) || spent?.unpriced) return [];
+        const cost = forecast(spent, recorded, target);
+        return hasPrice(cost) ? [cost] : [];
       });
-    let fallback: Promise<number | null> | undefined;
+    let fallback: Promise<Array<WorkUsage & { recordedUsd: number }>> | undefined;
+    const recentTurnMedian = async (target: WorkPrice | undefined) => {
+      const samples = (
+        await (fallback ??=
+          dependencies.recentTurnUsage?.(turnId, target !== undefined) ?? Promise.resolve([]))
+      )
+        .map((sample) => forecast(sample, sample.recordedUsd, target))
+        .filter(hasPrice)
+        .sort((a, b) => a - b);
+      if (!samples.length) return [];
+      const middle = Math.floor(samples.length / 2);
+      return [(samples[middle]! + samples[Math.ceil(samples.length / 2) - 1]!) / 2];
+    };
     const from = now();
     const month = 30 * 86_400_000;
     for (const row of recurring) {
       const target = dependencies.workPricing?.(row.model);
-      if (dependencies.workPricing && !target) continue;
+      if (target?.plan || (dependencies.workPricing && !target)) continue;
       const own = pricedRuns(target, (run) => run.schedule_id === row.id);
       const recent = pricedRuns(target, (run) => run.latest);
       const priced = runs.some((run) => run.schedule_id === row.id)
         ? own
         : recent.length
           ? recent
-          : [
-              (await (fallback ??=
-                dependencies.recentTurnCost?.(turnId) ?? Promise.resolve(null))) ?? 0,
-            ];
+          : await recentTurnMedian(target);
       if (!priced.some((cost) => cost > 0)) continue;
       const upcoming = scheduler.previewSchedule(row.cron!, { tz: row.timeZone, count: 200, from });
       const last = upcoming.at(-1)?.getTime();
@@ -1270,6 +1332,10 @@ export function createSchedules(dependencies: ScheduleDependencies) {
     app.get('/api/schedules', list);
     app.post<{ Params: { id: string } }>('/api/schedules/:id/run', (request) =>
       runNow(request.params.id, request.body),
+    );
+    app.post<{ Params: { id: string; turnId: string } }>(
+      '/api/schedules/:id/runs/:turnId/stop',
+      (request) => stopRun(request.params.id, request.params.turnId),
     );
     app.post<{ Params: { id: string } }>('/api/schedules/:id/preview', async (request) => {
       const previous = await read(z.uuid().parse(request.params.id));

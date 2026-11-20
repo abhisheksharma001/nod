@@ -121,6 +121,29 @@ Fixed server addresses and CLI download addresses must use public HTTPS on port 
 
 See the complete [API and CLI examples](/contribute/apps/api-and-cli/).
 
+## Connect form hints
+
+A connection can add `hints`: one short line, up to 200 characters, shown under a field of the Connect form. Use a hint to say where the user finds the value.
+
+```json
+{
+  "hints": {
+    "token": "Copy this token from Settings → Instance-level MCP in your n8n instance."
+  }
+}
+```
+
+The keys name the fields that connection asks for. Any other key fails validation.
+
+| Connection                                     | Hint keys                      |
+| ---------------------------------------------- | ------------------------------ |
+| Owner-supplied instance                        | `address`, `token`             |
+| Fixed MCP or HTTP with `bearer` or `x-api-key` | `token`                        |
+| HTTP with `oauth2`                             | `clientId`                     |
+| CLI                                            | The names in its `environment` |
+
+A hint is fixed text from the app definition. It contains no value, and Nod shows it only for the connection the app defines.
+
 ## Required contract fixture
 
 Every folder includes `io.n8n.nod/contract.json`:

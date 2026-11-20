@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import Fastify from 'fastify';
 import pg from 'pg';
+import { markdownToPlainText } from 'chat';
 import { channelReply, createChannels } from '../src/server/channels.ts';
 import { createAgentReactionService } from '../src/server/agent-reactions.ts';
 import { createChatVerification } from '../src/server/chat-verification.ts';
@@ -665,6 +666,112 @@ const fixtureEnv = {
   WHATSAPP_POLICY_CONFIRMED: 'true',
 };
 
+function describeChannelSchedule(
+  transport: MessagingTransport,
+  channel: string,
+  title: string,
+  prompt: string,
+) {
+  const definition = {
+    title,
+    prompt,
+    kind: 'recurring',
+    cron: '0 15 * * *',
+    timeZone: 'UTC',
+    enabled: true,
+  };
+  return createCommunication({
+    pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
+    ownerId: 'synthetic-owner',
+    canDeliverLiteral: (channelId, text, literal) =>
+      transport.canDeliverLiteral?.({ channelId, text, literal }) ?? false,
+    review: async (_instructions, value) =>
+      Object(value).purpose === 'confirmation_review'
+        ? { valid: true }
+        : { text: 'Create this schedule?', action: 'Create schedule' },
+  }).describe({
+    turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
+    channel,
+    action: 'NOD_schedule_create',
+    args: { ...definition },
+    details: { scheduleDefinition: definition },
+  });
+}
+
+test('channel transports check literal instructions against their actual formatting and split rules', async (t) => {
+  const sdk = createChatSdkTransport({} as pg.Pool, fixtureEnv);
+  const linked = createWhatsAppLinkedTransport({
+    mode: 'bot',
+    store: {
+      open: async () => {
+        throw new Error('This check must not open a linked account.');
+      },
+    },
+  });
+  const combined = combineMessagingTransports(sdk, linked);
+  for (const [literal, telegram, whatsapp] of [
+    [
+      'Review boîte@example.test.\n    Never send email.\nKeep [source](https://records.example.test/item) and `data`.',
+      true,
+      true,
+    ],
+    [
+      `${'a'.repeat(3600)}\n[Source](https://records.example.test/item)\n    Never send email.`,
+      false,
+      true,
+    ],
+    [
+      `${'a'.repeat(4200)}\n[Source](https://records.example.test/item)\n    Never send email.`,
+      false,
+      false,
+    ],
+    ['Keep ``` as literal text. Never send email.', true, false],
+    ['Keep {{emoji:smile}} as literal text.', false, false],
+  ] as const) {
+    const fence = literal.includes('```') ? '````' : '```';
+    const text = `Instruction:\n\n${fence}\n${literal}\n${fence}\n\nCreate this schedule?`;
+    assert.equal(sdk.canDeliverLiteral!({ channelId: 'telegram', text, literal }), telegram);
+    assert.equal(sdk.canDeliverLiteral!({ channelId: 'whatsapp', text, literal }), whatsapp);
+    assert.equal(linked.canDeliverLiteral!({ channelId: 'whatsapp', text, literal }), whatsapp);
+    assert.equal(combined.canDeliverLiteral!({ channelId: 'whatsapp', text, literal }), whatsapp);
+    assert.equal(combined.canDeliverLiteral!({ channelId: 'telegram', text, literal }), telegram);
+    assert.equal(combined.canDeliverLiteral!({ channelId: 'unknown', text, literal }), false);
+  }
+  const literal = 'Keep *these literal markers* unchanged. Never send email.';
+  for (const [title, telegram, whatsapp] of [
+    ['Synthetic review', true, true],
+    ['{{emoji:smile}}', false, false],
+    ['```', true, false],
+  ] as const) {
+    await t.test(`checked title ${JSON.stringify(title)} preserves its channel facts`, async () => {
+      const { question: text } = await describeChannelSchedule(sdk, 'web', title, literal);
+      assert.equal(linked.canDeliverLiteral!({ channelId: 'whatsapp', text, literal }), whatsapp);
+      for (const transport of [sdk, combined]) {
+        assert.equal(
+          transport.canDeliverLiteral!({ channelId: 'telegram', text, literal }),
+          telegram,
+        );
+        assert.equal(
+          transport.canDeliverLiteral!({ channelId: 'whatsapp', text, literal }),
+          whatsapp,
+        );
+      }
+    });
+  }
+  const block = `\`\`\`\n${literal}\n\`\`\``;
+  for (const text of [
+    `${block}\n\n> \`\`\`\n> Extra instruction\n> \`\`\``,
+    `${block}\n\n- Nested instruction:\n\n  \`\`\`\n  Extra instruction\n  \`\`\``,
+    `> \`\`\`\n> ${literal}\n> \`\`\``,
+  ]) {
+    await t.test('the sole literal block must be at the root with no nested extra block', () => {
+      for (const channelId of ['telegram', 'whatsapp'])
+        assert.equal(sdk.canDeliverLiteral!({ channelId, text, literal }), false);
+      assert.equal(linked.canDeliverLiteral!({ channelId: 'whatsapp', text, literal }), false);
+    });
+  }
+});
+
 test(
   'WhatsApp links privately, admits only its owner, fences echoes across restart, and reconnects without repeating sends',
   { skip: !process.env.TEST_DATABASE_URL, timeout: 30_000 },
@@ -1043,6 +1150,34 @@ test(
               (sent[0].quoted as { message: { conversation: string } }).message.conversation,
               'Fixture task question',
             );
+            const schedulePrompt =
+              'Review boîte@example.test.\n    Never send email or change a source.';
+            const { question: scheduleQuestion } = await describeChannelSchedule(
+              transport,
+              'whatsapp',
+              'Synthetic daily review',
+              schedulePrompt,
+            );
+            const beforeSchedule = sent.length;
+            await transport.post({
+              channelId: 'whatsapp',
+              accountId,
+              threadId: jid,
+              text: scheduleQuestion,
+              replyToMessageId: 'task-prompt',
+              replyToText: 'Fixture task question',
+            });
+            assert.equal(sent.length, beforeSchedule + 1);
+            assert.ok(String(sent.at(-1)!.content.text).includes(schedulePrompt));
+            assert.ok(
+              String(sent.at(-1)!.content.text).includes('Schedule: Synthetic daily review'),
+            );
+            assert.equal((sent.at(-1)!.quoted as { key: { id: string } }).key.id, 'task-prompt');
+            await assert.rejects(
+              describeChannelSchedule(transport, 'whatsapp', '```', schedulePrompt),
+              /cannot show the complete schedule confirmation in this channel/,
+            );
+            assert.equal(sent.length, beforeSchedule + 1);
             for (const [file, kind] of [
               [
                 audioFile('reply.wav', 'audio/wav', Buffer.from('RIFF\0\0\0\0WAVEfmt ')),
@@ -1504,6 +1639,260 @@ test('WhatsApp bot mode accepts a confirmed private ID when mapping lookups miss
     ['from-owner', 'after-reverification'],
   );
 });
+
+test('Telegram approval callbacks accept only taps on the paired bot message', async () => {
+  const acknowledgements: Record<string, unknown>[] = [];
+  const transport = createChatSdkTransport({} as pg.Pool, fixtureEnv, {
+    fetch: async (input, init) => {
+      assert.equal(new URL(String(input)).pathname.split('/').at(-1), 'answerCallbackQuery');
+      acknowledgements.push(JSON.parse(String(init?.body)));
+      return Response.json({ ok: true, result: true });
+    },
+  });
+  const callback = {
+    id: 'synthetic-tap',
+    data: 'nod:approval:yes',
+    from: { id: 123456, is_bot: false },
+    message: {
+      message_id: 42,
+      date: 1,
+      from: { id: 987, is_bot: true },
+      chat: { id: 123456, type: 'private' },
+    },
+  };
+  const receive = (value: unknown, secret = fixtureEnv.TELEGRAM_WEBHOOK_SECRET_TOKEN) =>
+    transport.receive({
+      channelId: 'telegram',
+      method: 'POST',
+      query: {},
+      headers: { 'x-telegram-bot-api-secret-token': secret },
+      body: Buffer.from(JSON.stringify({ update_id: 123, callback_query: value })),
+    });
+  try {
+    const accepted = await receive(callback);
+    assert.deepEqual(accepted.messages, []);
+    assert.equal(accepted.approvals?.length, 1);
+    const { acknowledge, ...approval } = accepted.approvals![0]!;
+    assert.deepEqual(approval, {
+      channelId: 'telegram',
+      accountId: '987',
+      senderId: '123456',
+      threadId: 'telegram:123456',
+      messageId: '123456:42',
+      approved: true,
+    });
+    assert.equal(acknowledgements.length, 0);
+    await acknowledge('recorded');
+    const declined = await receive({
+      ...callback,
+      id: 'synthetic-second-tap',
+      data: 'nod:approval:no',
+    });
+    assert.equal(declined.approvals?.[0]?.approved, false);
+    await declined.approvals?.[0]?.acknowledge('unavailable');
+    assert.deepEqual(
+      acknowledgements.map(({ callback_query_id }) => callback_query_id),
+      ['synthetic-tap', 'synthetic-second-tap'],
+    );
+    assert.notEqual(acknowledgements[0]!.text, acknowledgements[1]!.text);
+    assert.equal((await receive(callback, 'wrong-fixture-secret')).status, 401);
+    for (const change of [
+      { data: 'nod:approval:yes:untrusted' },
+      { from: { id: 654321, is_bot: false } },
+      { from: { id: 123456, is_bot: true } },
+      { message: { ...callback.message, from: { id: 988, is_bot: true } } },
+      { message: { ...callback.message, chat: { id: 654321, type: 'private' } } },
+      { message: { ...callback.message, chat: { id: 123456, type: 'group' } } },
+      { message: { ...callback.message, date: 0 } },
+      { message: undefined, inline_message_id: 'synthetic-inline-message' },
+    ]) {
+      const rejected = await receive({ ...callback, ...change });
+      assert.deepEqual(rejected.messages, []);
+      assert.equal(rejected.approvals, undefined);
+    }
+    assert.equal(acknowledgements.length, 2);
+  } finally {
+    await transport.close();
+  }
+});
+
+test(
+  'Telegram preserves approval text and enables buttons only when callbacks can arrive',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async (t) => {
+    const schema = `test_telegram_approval_${randomUUID().replaceAll('-', '')}`;
+    const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    const pool = new pg.Pool({
+      connectionString: process.env.TEST_DATABASE_URL,
+      options: `-c search_path=${schema}`,
+    });
+    t.after(async () => {
+      await pool.end();
+      await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+      await admin.end();
+    });
+    const deliveries: Record<string, unknown>[] = [];
+    let webhookChecks = 0;
+    let callbackEnabled = true;
+    let pollingAcknowledged = false;
+    let rejectMarkdown = false;
+    let markdownRefusals = 0;
+    let now = Date.now();
+    t.mock.method(Date, 'now', () => now);
+    t.mock.method(
+      globalThis,
+      'fetch',
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const method = new URL(input instanceof Request ? input.url : String(input)).pathname
+          .split('/')
+          .at(-1);
+        if (method === 'getMe')
+          return Response.json({
+            ok: true,
+            result: { id: 987, is_bot: true, first_name: 'Fixture', username: 'fixture_bot' },
+          });
+        if (method === 'getWebhookInfo') {
+          webhookChecks++;
+          return Response.json({
+            ok: true,
+            result: {
+              url: 'https://example.test/telegram',
+              allowed_updates: callbackEnabled ? ['message', 'callback_query'] : ['message'],
+            },
+          });
+        }
+        const body = JSON.parse(String(init?.body));
+        if (method === 'getUpdates') {
+          const callback = {
+            id: 'synthetic-polling-tap',
+            data: Object(deliveries.at(-1)?.reply_markup).inline_keyboard[0][1].callback_data,
+            from: { id: 123456, is_bot: false },
+            message: {
+              message_id: deliveries.length,
+              date: 1,
+              from: { id: 987, is_bot: true },
+              chat: { id: 123456, type: 'private' },
+            },
+          };
+          return Response.json({
+            ok: true,
+            result: body.allowed_updates.includes('callback_query')
+              ? [{ update_id: 123, callback_query: callback }]
+              : [],
+          });
+        }
+        if (method === 'answerCallbackQuery') {
+          assert.equal(body.callback_query_id, 'synthetic-polling-tap');
+          pollingAcknowledged = true;
+          return Response.json({ ok: true, result: true });
+        }
+        assert.equal(method, 'sendMessage');
+        if (rejectMarkdown && body.parse_mode === 'MarkdownV2') {
+          markdownRefusals++;
+          return Response.json(
+            { ok: false, error_code: 400, description: "Bad Request: can't parse entities" },
+            { status: 400 },
+          );
+        }
+        deliveries.push(body);
+        return Response.json({
+          ok: true,
+          result: {
+            message_id: deliveries.length,
+            date: 1,
+            chat: { id: 123456, type: 'private' },
+            text: body.text,
+          },
+        });
+      },
+    );
+    const env = { ...fixtureEnv, WHATSAPP_ENABLED: 'false', TELEGRAM_MODE: 'webhook' };
+    const transport = createChatSdkTransport(pool, env);
+    const polling = combineMessagingTransports(
+      createChatSdkTransport(pool, { ...env, TELEGRAM_MODE: 'polling' }),
+    );
+    const prompt = 'Review boîte@example.test.\n    Never send email or change the source.';
+    const approval = {
+      channelId: 'telegram',
+      accountId: '987',
+      threadId: 'telegram:123456',
+      replyToMessageId: '123456:7',
+      text: `Schedule instruction:\n\n\`\`\`\n${prompt}\n\`\`\`\n\nCreate this schedule?`,
+      approval: true as const,
+    };
+    try {
+      assert.deepEqual(await transport.post(approval), {
+        id: '123456:1',
+        ids: ['123456:1'],
+        approvalButtons: true,
+      });
+      const sent = deliveries[0]!;
+      assert.equal(sent.parse_mode, 'MarkdownV2');
+      assert.ok(String(sent.text).includes(prompt));
+      assert.ok(String(sent.text).includes('Create this schedule?'));
+      assert.equal(Object(sent.reply_parameters).message_id, 7);
+      assert.deepEqual(
+        Object(sent.reply_markup).inline_keyboard[0].map(
+          (button: { callback_data: string }) => button.callback_data,
+        ),
+        ['nod:approval:yes', 'nod:approval:no'],
+      );
+      rejectMarkdown = true;
+      const plain = await transport.post(approval);
+      assert.equal(markdownRefusals, 1);
+      assert.equal(plain.approvalButtons, true);
+      assert.equal(deliveries.at(-1)?.parse_mode, undefined);
+      assert.equal(deliveries.at(-1)?.text, markdownToPlainText(approval.text));
+      assert.deepEqual(deliveries.at(-1)?.reply_markup, sent.reply_markup);
+      assert.equal(webhookChecks, 1);
+      callbackEnabled = false;
+      now += 60_001;
+      await transport.post(approval);
+      assert.equal(webhookChecks, 2);
+      const plainApproval = deliveries.at(-1)!;
+      assert.equal(plainApproval.reply_markup, undefined);
+      assert.ok(String(plainApproval.text).startsWith(markdownToPlainText(approval.text)));
+      assert.match(String(plainApproval.text), /reply.*yes.*no/i);
+      const nearLimit = 'a'.repeat(3475);
+      const same = await transport.post({ ...approval, text: nearLimit });
+      assert.equal(same.ids?.length, 2);
+      assert.equal(deliveries.at(-2)?.text, nearLimit);
+      assert.equal(
+        Object(deliveries.at(-1)?.reply_parameters).message_id,
+        Number(same.id.split(':').at(-1)),
+      );
+      assert.match(String(deliveries.at(-1)?.text), /reply.*yes.*no/i);
+      callbackEnabled = true;
+      now += 60_001;
+      await transport.post(approval);
+      assert.equal(webhookChecks, 3);
+      assert.ok(deliveries.at(-1)?.reply_markup);
+      const long = await transport.post({
+        ...approval,
+        text: 'Long fixture sentence. '.repeat(230),
+      });
+      assert.ok(long.ids && long.ids.length > 1);
+      assert.ok(deliveries.slice(-long.ids.length).every((message) => !message.reply_markup));
+      assert.match(String(deliveries.at(-1)?.text), /reply.*yes.*no/i);
+      const polled = await polling.post(approval);
+      assert.equal(webhookChecks, 3);
+      await polling.poll!(
+        async () => assert.fail('An approval tap must not be treated as a message.'),
+        undefined,
+        undefined,
+        async ({ approved, messageId, acknowledge }) => {
+          assert.equal(approved, false);
+          assert.equal(messageId, polled.id);
+          await acknowledge('recorded');
+        },
+      );
+      assert.ok(pollingAcknowledged);
+    } finally {
+      await Promise.all([transport.close(), polling.close()]);
+    }
+  },
+);
 
 test('Telegram media keeps native replies and checks the sender before any download', async () => {
   const bytes = Buffer.from('synthetic image bytes');
@@ -2983,6 +3372,133 @@ test('on-device speech decodes a real WAV into bounded mono samples and refuses 
   });
 });
 
+test('local speech distinguishes tokenizer overflow before inference from waveform duration failures', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'nod-speech-limits-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const harness = join(root, 'worker.mjs');
+  await writeFile(
+    harness,
+    `import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { EventEmitter } from 'node:events';
+import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
+import { createRequire, stripTypeScriptTypes } from 'node:module';
+import { SourceTextModule, SyntheticModule, createContext } from 'node:vm';
+import { pathToFileURL } from 'node:url';
+const workerPath = process.argv[2];
+const cache = process.argv[3];
+const require = createRequire(workerPath);
+const hf = await import(pathToFileURL(require.resolve('@huggingface/transformers')));
+const { phonemizeSpeech } = await import(new URL('./phonemizer.ts', pathToFileURL(workerPath)));
+const tokenizer = new hf.PreTrainedTokenizer({
+  model: { type: 'WordLevel', vocab: { '[UNK]': 0 }, unk_token: '[UNK]' },
+  added_tokens: [], normalizer: null, post_processor: null, decoder: null,
+  pre_tokenizer: { type: 'Split', pattern: { Regex: '.' }, behavior: 'Isolated', invert: false },
+}, { unk_token: '[UNK]' });
+await fs.mkdir(path.join(cache, 'kokoro', 'voices'), { recursive: true });
+await fs.writeFile(path.join(cache, 'kokoro', 'voices', 'af_heart.bin'), Buffer.alloc(522240));
+let inferenceCalls = 0;
+let sampleCount = 24000;
+let modelFailure = false;
+let sent;
+const handlers = new Map();
+const context = createContext({
+  process: { argv: ['node', 'worker', cache], send: (value) => { sent = value; }, on: (name, fn) => handlers.set(name, fn), exit: () => { throw Error('unexpected exit'); } },
+  Float32Array, Uint8Array, BigInt, AbortSignal, fetch,
+});
+const source = await fs.readFile(workerPath, 'utf8');
+const worker = new SourceTextModule(stripTypeScriptTypes(source), { context });
+const modules = {
+  'node:crypto': { createHash }, 'node:fs/promises': fs, 'node:path': path,
+  '@huggingface/transformers': {
+    env: { backends: { onnx: {} } }, pipeline: async () => ({}),
+    RawAudio: hf.RawAudio, Tensor: hf.Tensor,
+    AutoTokenizer: { from_pretrained: async () => tokenizer },
+    StyleTextToSpeech2Model: { from_pretrained: async () => async () => {
+      inferenceCalls++;
+      if (modelFailure) throw new Error('synthetic model failure');
+      return { waveform: { data: new Float32Array(sampleCount) } };
+    } },
+  },
+  '@pedrobef/vozz/g2p': { phonemize: () => { throw new Error('unused language'); } },
+  './phonemizer.ts': { phonemizeSpeech }, './models.ts': { localSpeechModels: [] },
+  './audio.ts': { decodeLocalAudio: () => { throw new Error('unused decoder'); } },
+  './cache.ts': { localSpeechCacheMarker: '{}', localTranscriptionCacheMarker: '{}', matchesSpeechFile: async () => true, verifySpeechCache: async () => true },
+};
+await worker.link(async (specifier) => {
+  const exports = modules[specifier];
+  assert.ok(exports, specifier);
+  return new SyntheticModule(Object.keys(exports), function () {
+    for (const [key, value] of Object.entries(exports)) this.setExport(key, value);
+  }, { context });
+});
+await worker.evaluate();
+let id = 0;
+async function synthesize(text) {
+  sent = undefined;
+  inferenceCalls = 0;
+  await handlers.get('message')({ id: ++id, method: 'synthesize', voice: 'af_heart', text });
+  return sent;
+}
+const overflow = '1234567890 '.repeat(27).trim();
+for (const text of [overflow, 'Это короткая проверка речи. Сегодня ясный день и тихая погода. Мы читаем небольшой текст для простой проверки. Проверка завершена успешно.']) {
+  const reply = await synthesize(text);
+  assert.equal(reply.type, 'failed');
+  assert.equal(inferenceCalls, 0);
+  assert.equal(reply.reason, 'tokens');
+}
+assert.equal((await synthesize('red fox '.repeat(37))).type, 'audio');
+assert.equal(inferenceCalls, 1);
+sampleCount = 24000 * 301;
+assert.equal((await synthesize('red fox')).reason, 'length');
+assert.equal(inferenceCalls, 1);
+const { createLocalSpeechProvider } = await import(new URL('./index.ts', pathToFileURL(workerPath)));
+const { SpeechProviderError } = await import(new URL('../../ports/speech.ts', pathToFileURL(workerPath)));
+const child = new EventEmitter();
+child.send = (message, callback) => {
+  handlers.get('message')(message).then(() => child.emit('message', sent));
+  callback();
+};
+child.kill = () => true;
+const provider = createLocalSpeechProvider({ cacheDir: cache, fork: () => child });
+async function failure(text) {
+  let error;
+  try { await provider.synthesize(text); } catch (caught) { error = caught; }
+  assert.ok(error instanceof SpeechProviderError);
+  assert.equal(error.statusCode, 400);
+  return error;
+}
+try {
+  await provider.prepare();
+  modelFailure = true;
+  const generic = await failure('red fox');
+  modelFailure = false;
+  const duration = await failure('red fox');
+  sampleCount = 24000;
+  inferenceCalls = 0;
+  const tokens = await failure(overflow);
+  assert.equal(inferenceCalls, 0);
+  assert.notEqual(tokens.message, duration.message);
+  assert.notEqual(tokens.message, generic.message);
+} finally { await provider.close(); }
+`,
+  );
+  const result = await runProcess(
+    process.execPath,
+    [
+      '--experimental-vm-modules',
+      '--import',
+      import.meta.resolve('tsx'),
+      harness,
+      fileURLToPath(new URL('../src/providers/local-speech/worker.ts', import.meta.url)),
+      join(root, 'models'),
+    ],
+    { timeoutMs: 30_000 },
+  );
+  assert.equal(result.exitCode, 0, result.stderr);
+});
+
 test('local speech exports chunked audio as WAV and finds the silence token without loading a model', async () => {
   const { RawAudio, PreTrainedTokenizer } = await import('@huggingface/transformers');
   const samples = Float32Array.from(
@@ -4119,6 +4635,32 @@ test(
   },
 );
 
+test('channel presentation keeps punctuated local addresses out of delivery wording', async () => {
+  for (const text of [
+    'Read http://localhost:5678.',
+    'Read "http://127.0.0.1:5678".',
+    'Read http://[::1]:5678, next.',
+    'Read http://localhost.:5678.',
+    'Read `http://localhost:5678`.',
+  ]) {
+    let calls = 0;
+    const delivered = await channelReply(text, {
+      threadId: 'owned-thread',
+      present: async (_threadId, input) => {
+        calls++;
+        assert.equal(input.kind, 'delivery');
+        if (input.kind === 'delivery') assert.equal(input.secureAction, true);
+        assert.doesNotMatch(JSON.stringify(input), /localhost|127\.0\.0\.1|\[::1\]|5678/);
+        return 'Open Nod to read this instruction.';
+      },
+    });
+    assert.equal(calls, 1);
+    assert.equal(delivered, 'Open Nod to read this instruction.');
+  }
+  const publicText = 'Read https://records.example.test:443.';
+  assert.equal(await channelReply(publicText, { threadId: 'owned-thread' }), publicText);
+});
+
 test('channel presentation isolates private links from the model and rejects unsafe generated output', async () => {
   const modelsLink = await channelReply('Use [Reconnect](/settings/models).', {
     threadId: 'owned-thread',
@@ -4196,6 +4738,7 @@ test(
       options: `-c search_path=${schema}`,
     });
     const threadId = await createFixtureTables(pool, 'local-development');
+    await pool.query('ALTER TABLE messages ADD COLUMN suggestions jsonb');
     const sent: { provider: string; body: Record<string, unknown> }[] = [];
     const handoffPresentations: unknown[] = [];
     const unavailableFiles: string[][] = [];
@@ -4478,6 +5021,13 @@ test(
       await channels.drain();
       assert.equal((await pool.query('SELECT * FROM turns')).rowCount, 2);
       assert.equal((await pool.query('SELECT * FROM channel_inbox')).rowCount, 2);
+      const literal = 'Review boîte@example.test. Never send email.';
+      const literalQuestion = `Instruction:\n\n\`\`\`\n${literal}\n\`\`\`\n\nSave this schedule?`;
+      for (const row of (await pool.query('SELECT channel FROM turns')).rows) {
+        assert.match(row.channel, /^(telegram|whatsapp):[a-f0-9]{32}$/);
+        assert.equal(channels.canDeliverLiteral(row.channel, literalQuestion, literal), true);
+      }
+      assert.equal(channels.canDeliverLiteral('unknown:identity', literalQuestion, literal), false);
       await addReply(
         'channel:telegram:987:123456:10',
         'Finish [securely](/credentials/private-token), [approve payment](/payments/private-token) or [add a card](/vault?add=card).',
@@ -4773,6 +5323,136 @@ test(
       }
       assert.ok(rejectedFormatting.includes('markdown'));
       rejectMarkdown = false;
+      await t.test(
+        'a checked schedule keeps its full text through Telegram plain fallback',
+        async () => {
+          const prompt = [
+            'Review boîte@example.test.',
+            '    Keep this indentation and `literal values`.',
+            'Read https://records.example.test/item.',
+            'Final limit: never send email or change a source.',
+          ].join('\n');
+          const definition = {
+            title: 'Synthetic daily review',
+            prompt,
+            kind: 'recurring',
+            cron: '0 15 * * *',
+            timeZone: 'UTC',
+            enabled: true,
+          };
+          const sourceId = 'channel:telegram:987:123456:10';
+          const source = (
+            await pool.query(
+              'SELECT t.id,t.channel FROM turns t JOIN channel_inbox i ON i.turn_id=t.id WHERE i.source_id=$1',
+              [sourceId],
+            )
+          ).rows[0];
+          let wordingCalls = 0;
+          const communication = createCommunication({
+            pool,
+            ownerId: 'local-development',
+            canDeliverLiteral: channels.canDeliverLiteral,
+            review: async () => {
+              wordingCalls++;
+              return { text: 'Create this schedule?', action: 'Create schedule' };
+            },
+          });
+          const proposal = {
+            turn: { threadId, turnId: source.id },
+            channel: source.channel,
+            action: 'NOD_schedule_create',
+            args: { ...definition },
+            details: { scheduleDefinition: definition },
+          };
+          const { question } = await communication.describe(proposal);
+          const expected = markdownToPlainText(question);
+          assert.ok(expected.includes(prompt));
+          assert.ok(expected.includes(`Schedule: ${definition.title}`));
+          const before = sent.length;
+          const rejectedBefore = rejectedFormatting.length;
+          const replyTarget = (
+            await pool.query(
+              "SELECT message_id,provider_message_id FROM channel_outbox WHERE source_id=$1 AND state='sent' ORDER BY updated_at,message_id LIMIT 1",
+              [sourceId],
+            )
+          ).rows[0];
+          assert.ok(replyTarget);
+          rejectMarkdown = true;
+          const messageId = await addReply(sourceId, question);
+          await pool.query('UPDATE messages SET reply_to_message_id=$2 WHERE id=$1', [
+            messageId,
+            replyTarget.message_id,
+          ]);
+          await channels.drain();
+          rejectMarkdown = false;
+          const delivered = sent.slice(before);
+          assert.equal(delivered.length, 1);
+          assert.equal(rejectedFormatting.length, rejectedBefore + 1);
+          assert.equal(delivered[0]!.provider, 'telegram');
+          assert.equal(delivered[0]!.body.parse_mode, undefined);
+          assert.equal(delivered[0]!.body.text, expected);
+          assert.equal(
+            Object(delivered[0]!.body.reply_parameters).message_id,
+            Number(replyTarget.provider_message_id.split(':').at(-1)),
+          );
+          assert.deepEqual(
+            (
+              await pool.query(
+                'SELECT state,provider_message_ids FROM channel_outbox WHERE message_id=$1',
+                [messageId],
+              )
+            ).rows[0],
+            { state: 'sent', provider_message_ids: [`123456:${before + 101}`] },
+          );
+          assert.equal(wordingCalls, 1);
+          definition.title = '{{emoji:smile}}';
+          proposal.args.title = definition.title;
+          await assert.rejects(
+            communication.describe(proposal),
+            /cannot show the complete schedule confirmation in this channel/,
+          );
+          assert.equal(wordingCalls, 1);
+          assert.equal(sent.length, before + 1);
+        },
+      );
+      await t.test(
+        'a checked schedule keeps its literal instruction on WhatsApp cloud',
+        async () => {
+          await pool.query(
+            "UPDATE channel_inbox SET received_at=now() WHERE source_id='channel:whatsapp:555000:wamid.good'",
+          );
+          const prompt = 'Review boîte@example.test.\n    Never send email or change a source.';
+          const { question } = await describeChannelSchedule(
+            transport,
+            'whatsapp',
+            'Synthetic daily review',
+            prompt,
+          );
+          const before = sent.length;
+          const messageId = await addReply('channel:whatsapp:555000:wamid.good', question);
+          await channels.drain();
+          const delivered = sent.slice(before);
+          assert.equal(delivered.length, 1);
+          assert.equal(delivered[0]!.provider, 'whatsapp');
+          const text = String(Object(delivered[0]!.body.text).body);
+          assert.ok(text.includes(prompt));
+          assert.ok(text.includes('Schedule: Synthetic daily review'));
+          assert.deepEqual(
+            (
+              await pool.query(
+                'SELECT state,provider_message_ids FROM channel_outbox WHERE message_id=$1',
+                [messageId],
+              )
+            ).rows[0],
+            { state: 'sent', provider_message_ids: [`wamid.fixture-out-${before + 1}`] },
+          );
+          await assert.rejects(
+            describeChannelSchedule(transport, 'whatsapp', '```', prompt),
+            /cannot show the complete schedule confirmation in this channel/,
+          );
+          assert.equal(sent.length, before + 1);
+        },
+      );
       const family = '👩‍👩‍👧‍👦';
       const accented = 'e\u0301';
       const beforeUnicode = sent.length;

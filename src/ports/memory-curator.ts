@@ -22,6 +22,7 @@ export interface MemoryCurator {
         | 'check';
       instructions: string;
       input: object;
+      responseSchema?: Record<string, unknown>;
       images?: AgentImage[];
       automatic?: boolean;
     },

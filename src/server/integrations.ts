@@ -470,7 +470,9 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
           latest.watch_revision !== row.watch_revision ||
           latest.account_id !== row.account_id
         )
-          throw new IntegrationError('This connected account is unavailable.', 404);
+          throw Object.assign(new IntegrationError('This connected account is unavailable.', 404), {
+            notRun: true,
+          });
       }
       return await operation(session);
     } finally {
@@ -1618,6 +1620,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
     turn?: TurnRef,
     signal?: AbortSignal,
     expectedBinding?: string,
+    beforeDispatch?: () => Promise<void>,
   ) {
     if (isLocalFilesAction(action)) {
       assertOwner(ownerId);
@@ -1648,13 +1651,15 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
       return options.discovered.execute(action, args, turn, signal, expectedBinding);
     }
     assertOwner(ownerId);
-    const connectionId = z.uuid().safeParse(args.connectionId);
-    const observed = connectionId.success
-      ? (await connectionRows(ownerId)).find((row) => row.id === connectionId.data)
-      : undefined;
-    const known = observed ?? (await selectedConnection(ownerId, action, args));
-    const connection = connectionAnalytics(known.slug);
+    let known: ConnectionRow | undefined;
+    let dispatched = false;
     try {
+      const connectionId = z.uuid().safeParse(args.connectionId);
+      const observed = connectionId.success
+        ? (await connectionRows(ownerId)).find((row) => row.id === connectionId.data)
+        : undefined;
+      known = observed ?? (await selectedConnection(ownerId, action, args));
+      const connection = connectionAnalytics(known.slug);
       return await withServiceAnalytics(
         options.analytics,
         connection,
@@ -1670,7 +1675,9 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
               throw Object.assign(new IntegrationError('The selected account changed.', 409), {
                 notRun: true,
               });
+            if (beforeDispatch) await beforeDispatch();
             signal?.throwIfAborted();
+            dispatched = true;
             return session.execute(action, providerArgs, row.account_id!, signal);
           });
           return result;
@@ -1678,14 +1685,16 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
         signal,
       );
     } catch (error) {
-      if (error instanceof IntegrationError) throw error;
-      if (error instanceof IntegrationPermissionError)
-        throw new IntegrationError(
-          `${failure('The app request failed', error)} The selected ${known.slug} connection (${known.id}) lacks permissions for this action. Preserve this account and prepared work. Do not retry until permissions change. Ask before switching to browser sign-in unless the user already chose that recovery. The connection service's auth configuration must request the missing permission before reconnection can grant it; its operator may need to update it first. If the user chooses to reconnect, use manage_apps connect ${JSON.stringify({ service: known.slug, connectionId: known.id })}.`,
-          403,
-        );
-      const failed = requestFailure('The app request failed', error);
-      throw notRunMarker.safeParse(error).success
+      const failed =
+        error instanceof IntegrationError
+          ? error
+          : error instanceof IntegrationPermissionError && known
+            ? new IntegrationError(
+                `${failure('The app request failed', error)} The selected ${known.slug} connection (${known.id}) lacks permissions for this action. Preserve this account and prepared work. Do not retry until permissions change. Ask before switching to browser sign-in unless the user already chose that recovery. The connection service's auth configuration must request the missing permission before reconnection can grant it; its operator may need to update it first. If the user chooses to reconnect, use manage_apps connect ${JSON.stringify({ service: known.slug, connectionId: known.id })}.`,
+                403,
+              )
+            : requestFailure('The app request failed', error);
+      throw !dispatched || notRunMarker.safeParse(error).success
         ? Object.assign(failed, { notRun: true })
         : failed;
     }
@@ -3086,10 +3095,17 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
               !connection.browserState ||
               ['saved', 'needs_sign_in', 'pending'].includes(connection.browserState),
           )
-          .map(({ accountId: _accountId, browserUrl: _browserUrl, ...connection }) => ({
-            ...connection,
-            ...(connection.browserState ? { browserAccess: 'browser_session' } : {}),
-          }));
+          .map(
+            ({
+              accountId: _accountId,
+              browserUrl: _browserUrl,
+              canRename: _canRename,
+              ...connection
+            }) => ({
+              ...connection,
+              ...(connection.browserState ? { browserAccess: 'browser_session' } : {}),
+            }),
+          );
         const logins = connections.filter((connection) => connection.savedLogin);
         const matching = site
           ? logins.filter((connection) => {

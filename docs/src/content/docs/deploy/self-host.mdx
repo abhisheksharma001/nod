@@ -5,7 +5,7 @@ sidebar:
   order: 1
 ---
 
-import { Aside, Steps } from '@astrojs/starlight/components';
+import { Aside, Steps, TabItem, Tabs } from '@astrojs/starlight/components';
 
 Run Nod on a Linux server or Mac mini, then use the same assistant from your other devices.
 
@@ -152,9 +152,26 @@ Nod allows five minutes to receive a request body. This does not limit the durat
 
 ## Connect the desktop app
 
-Choose **Connect to a server** on first launch. After setup, open **Replay onboarding…** in the Nod menu (on Windows, from the tray icon), then choose **Connect to a server**. Enter the server address and the value of `NOD_AUTH_TOKEN`.
+On first launch, the setup screen is already open. If you've already set up Nod, reopen it from your desktop app's menu.
 
-Use the HTTPS address, or `http://localhost:4310` while your SSH tunnel is open. The app uses the server's conversation, files, models, and connected accounts. Closing the app does not stop the server.
+<Tabs syncKey="platform">
+  <TabItem label="macOS" icon="apple">
+    Click Nod in the Dock to bring the app to the front. In the macOS menu bar, open **Nod** next to
+    the Apple menu and choose **Replay onboarding…**
+  </TabItem>
+  <TabItem label="Windows" icon="seti:windows">
+    Right-click the Nod icon in the system tray and choose **Replay onboarding…**
+  </TabItem>
+  <TabItem label="Linux" icon="linux">
+    In the Nod window, choose **Nod → Replay onboarding…**
+  </TabItem>
+</Tabs>
+
+At the bottom of the setup screen, choose **Connect to a server**. If the app already uses a server, the button says **Change server**. Enter the server address and the value of `NOD_AUTH_TOKEN`, then select **Connect and restart app**.
+
+Use the server's HTTPS address. Nod accepts HTTP only for loopback addresses such as `localhost`. For an HTTP-only server on another device, [open an SSH tunnel](#open-a-remote-server-without-a-domain) and enter `http://localhost:<port>` using the tunnel's local port (`4310` by default).
+
+The app uses the server's conversation, files, models, and connected accounts. Closing the app does not stop the server.
 
 The app verifies the server before saving the token in your operating system's secure storage. It restarts into the remote assistant without starting a local runtime. The server owns the Composio identity and connected accounts, so another device reaches the same assistant without reconnecting those accounts.
 
