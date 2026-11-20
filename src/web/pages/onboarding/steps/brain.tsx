@@ -233,7 +233,7 @@ function ConnectButton({
   return (
     <Button type="submit" variant="outline" disabled={checking || disabled}>
       {checking && <LoaderCircle size={16} className="spin" aria-hidden="true" />}
-      {checking ? (saved ? 'Saving' : 'Checking') : saved ? 'Save key' : 'Connect'}
+      {checking ? (saved ? 'Saving' : 'Connecting') : saved ? 'Save key' : 'Connect'}
     </Button>
   );
 }
@@ -522,7 +522,7 @@ function Connected({ c, onReconnect }: { c: Connect; onReconnect: () => void }) 
                   : issue
                     ? 'Choose another model or continue with this one.'
                     : saved
-                      ? 'Access checked on first use. You can change the model any time.'
+                      ? 'I’ll check the connection in the background. You can continue.'
                       : 'I’ll use this model for every reply. You can change it any time.'}
           </p>
         </div>

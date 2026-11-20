@@ -470,7 +470,9 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
           latest.watch_revision !== row.watch_revision ||
           latest.account_id !== row.account_id
         )
-          throw new IntegrationError('This connected account is unavailable.', 404);
+          throw Object.assign(new IntegrationError('This connected account is unavailable.', 404), {
+            notRun: true,
+          });
       }
       return await operation(session);
     } finally {
@@ -1536,6 +1538,43 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
     return slug;
   }
 
+  const offeredActions = new Set<string>();
+  async function assertOffered(ownerId: string, action: string, signal?: AbortSignal) {
+    assertOwner(ownerId);
+    if (offeredActions.has(action) || !provider.configured || provider.connectionBackoff?.())
+      return;
+    let offered: boolean;
+    try {
+      const rows = await connectionRows(ownerId);
+      const slug = matchingService(action, knownServices(rows));
+      const row = rows.find(
+        (candidate) =>
+          candidate.slug === slug &&
+          candidate.account_id &&
+          !candidate.revoked &&
+          candidate.account_active &&
+          configurationMatches(candidate),
+      );
+      if (!slug || slug === retiredNotionMcp || directApps.has(slug) || !row) return;
+      const bounded = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(15_000)]);
+      offered = await withAccountSession(
+        ownerId,
+        [row],
+        bounded,
+        async (session) => (await session.offers?.(action, bounded)) ?? true,
+      );
+    } catch {
+      signal?.throwIfAborted();
+      return;
+    }
+    if (!offered)
+      throw new IntegrationError(
+        `${action} is not an action the connection service offers, so no app request was sent. Find the exact action name with SEARCH_TOOLS.`,
+        404,
+      );
+    offeredActions.add(action);
+  }
+
   async function selectedConnection(
     ownerId: string,
     action: string,
@@ -1581,6 +1620,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
     turn?: TurnRef,
     signal?: AbortSignal,
     expectedBinding?: string,
+    beforeDispatch?: () => Promise<void>,
   ) {
     if (isLocalFilesAction(action)) {
       assertOwner(ownerId);
@@ -1611,13 +1651,15 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
       return options.discovered.execute(action, args, turn, signal, expectedBinding);
     }
     assertOwner(ownerId);
-    const connectionId = z.uuid().safeParse(args.connectionId);
-    const observed = connectionId.success
-      ? (await connectionRows(ownerId)).find((row) => row.id === connectionId.data)
-      : undefined;
-    const known = observed ?? (await selectedConnection(ownerId, action, args));
-    const connection = connectionAnalytics(known.slug);
+    let known: ConnectionRow | undefined;
+    let dispatched = false;
     try {
+      const connectionId = z.uuid().safeParse(args.connectionId);
+      const observed = connectionId.success
+        ? (await connectionRows(ownerId)).find((row) => row.id === connectionId.data)
+        : undefined;
+      known = observed ?? (await selectedConnection(ownerId, action, args));
+      const connection = connectionAnalytics(known.slug);
       return await withServiceAnalytics(
         options.analytics,
         connection,
@@ -1633,7 +1675,9 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
               throw Object.assign(new IntegrationError('The selected account changed.', 409), {
                 notRun: true,
               });
+            if (beforeDispatch) await beforeDispatch();
             signal?.throwIfAborted();
+            dispatched = true;
             return session.execute(action, providerArgs, row.account_id!, signal);
           });
           return result;
@@ -1641,14 +1685,16 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
         signal,
       );
     } catch (error) {
-      if (error instanceof IntegrationError) throw error;
-      if (error instanceof IntegrationPermissionError)
-        throw new IntegrationError(
-          `${failure('The app request failed', error)} The selected ${known.slug} connection (${known.id}) lacks permissions for this action. Preserve this account and prepared work. Do not retry until permissions change. Ask before switching to browser sign-in unless the user already chose that recovery. The connection service's auth configuration must request the missing permission before reconnection can grant it; its operator may need to update it first. If the user chooses to reconnect, use manage_apps connect ${JSON.stringify({ service: known.slug, connectionId: known.id })}.`,
-          403,
-        );
-      const failed = requestFailure('The app request failed', error);
-      throw notRunMarker.safeParse(error).success
+      const failed =
+        error instanceof IntegrationError
+          ? error
+          : error instanceof IntegrationPermissionError && known
+            ? new IntegrationError(
+                `${failure('The app request failed', error)} The selected ${known.slug} connection (${known.id}) lacks permissions for this action. Preserve this account and prepared work. Do not retry until permissions change. Ask before switching to browser sign-in unless the user already chose that recovery. The connection service's auth configuration must request the missing permission before reconnection can grant it; its operator may need to update it first. If the user chooses to reconnect, use manage_apps connect ${JSON.stringify({ service: known.slug, connectionId: known.id })}.`,
+                403,
+              )
+            : requestFailure('The app request failed', error);
+      throw !dispatched || notRunMarker.safeParse(error).success
         ? Object.assign(failed, { notRun: true })
         : failed;
     }
@@ -1710,6 +1756,8 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
               signal?.throwIfAborted();
               return session.search(query, signal);
             });
+            for (const action of Object.keys(found.tools as Record<string, unknown>))
+              offeredActions.add(action);
             tools = Object.fromEntries(
               Object.entries(found.tools as Record<string, unknown>).filter(([action]) => {
                 const slug = matchingService(action, services);
@@ -2583,11 +2631,11 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
             ? await provider.connectionStatus?.(configuredOwner, pairingUrl).catch(() => undefined)
             : undefined;
         const discoveredLinks = discovered.flatMap(
-          ({ id, link_hash, available, expired, ...service }) => {
+          ({ id, link_hash, available, expired, error, ...service }) => {
             const proposalHash = createHash('sha256').update(`/apps?connect=${id}`).digest('hex');
             return [
               ...(link_hash && hashes.includes(link_hash)
-                ? [{ ...service, hash: link_hash, available }]
+                ? [{ ...service, hash: link_hash, available, ...(error ? { error } : {}) }]
                 : []),
               ...(hashes.includes(proposalHash)
                 ? [{ ...service, hash: proposalHash, ...(expired ? { available: false } : {}) }]
@@ -2605,6 +2653,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
               slug: row.slug,
               name: 'name' in row && typeof row.name === 'string' ? row.name : info.name,
               ...('available' in row ? { available: row.available } : {}),
+              ...('error' in row && typeof row.error === 'string' ? { error: row.error } : {}),
               ...(info.logoUrl ? { logoUrl: info.logoUrl } : {}),
               ...(connectionStatus?.pairingConfirmed && row.hash === pairingHash
                 ? { pairingConfirmed: true }
@@ -2953,6 +3002,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
     readActivity,
     watchable,
     watchState,
+    assertOffered,
     execute,
     executeApproved,
     serviceWait,
@@ -3045,10 +3095,17 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
               !connection.browserState ||
               ['saved', 'needs_sign_in', 'pending'].includes(connection.browserState),
           )
-          .map(({ accountId: _accountId, browserUrl: _browserUrl, ...connection }) => ({
-            ...connection,
-            ...(connection.browserState ? { browserAccess: 'browser_session' } : {}),
-          }));
+          .map(
+            ({
+              accountId: _accountId,
+              browserUrl: _browserUrl,
+              canRename: _canRename,
+              ...connection
+            }) => ({
+              ...connection,
+              ...(connection.browserState ? { browserAccess: 'browser_session' } : {}),
+            }),
+          );
         const logins = connections.filter((connection) => connection.savedLogin);
         const matching = site
           ? logins.filter((connection) => {

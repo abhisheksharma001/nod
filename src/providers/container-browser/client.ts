@@ -1,4 +1,8 @@
-import { browserErrorMessage, type BrowserErrorCode } from '../../shared/browser-errors.ts';
+import {
+  browserErrorMessage,
+  type BrowserErrorCode,
+  type BrowserSignInGuard,
+} from '../../shared/browser-errors.ts';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { z } from 'zod';
@@ -163,7 +167,11 @@ export function createBridgeComputer(options: {
     const failed = (
       reason: string,
       error?: unknown,
-      exit: { exitCode?: number | null; signal?: string | null } = {},
+      exit: {
+        exitCode?: number | null;
+        signal?: string | null;
+        signInGuard?: BrowserSignInGuard;
+      } = {},
     ) => {
       const message = error instanceof Error ? error.message : undefined;
       const context = {
@@ -177,7 +185,7 @@ export function createBridgeComputer(options: {
       if (reason === 'error_response')
         logRepeatedFailure(
           'browser_bridge_failed',
-          `${input.method}:${message}`,
+          `${input.method}:${message}:${exit.signInGuard ?? ''}`,
           { code: message, stderr },
           context,
         );
@@ -281,20 +289,29 @@ export function createBridgeComputer(options: {
         if (cancelling || (!response.ok && response.error === 'cancelled'))
           return reject(new Error('Browser operation cancelled.'));
         if (response.ok) return resolve(response.result);
-        failed('error_response', new Error(response.error));
+        failed('error_response', new Error(response.error), {
+          ...(response.signInGuard ? { signInGuard: response.signInGuard } : {}),
+        });
         if (browserErrorMessage(response.error))
           return reject(
-            new BrowserActionError(response.error as BrowserErrorCode, response.detail),
+            new BrowserActionError(
+              response.error as BrowserErrorCode,
+              response.detail,
+              response.signInGuard,
+            ),
           );
         if (response.error === 'locked') {
           const error = new Error('Browser observations are paused during credential entry.');
           return reject(Object.assign(error, { statusCode: 423 }));
         }
         reject(
-          new Error(
-            response.detail
-              ? `The workspace browser could not complete this action: ${response.detail}`
-              : 'The workspace browser could not complete this action. Try again.',
+          Object.assign(
+            new Error(
+              response.detail
+                ? `The workspace browser could not complete this action: ${response.detail}`
+                : 'The workspace browser could not complete this action. Try again.',
+            ),
+            response.signInGuard ? { signInGuard: response.signInGuard } : {},
           ),
         );
       });
@@ -559,11 +576,14 @@ export function createBridgeComputer(options: {
     selectSignInMethod: async (id, input, signal) => {
       await call({ method: 'selectSignInMethod', threadId: threadIdentity(id), input }, signal);
     },
-    fillCard: async (input) => {
-      await call({
-        method: 'fillCard',
-        input: browserCardInput.parse({ ...input, threadId: threadIdentity(input.threadId) }),
-      });
+    fillCard: async (input, signal) => {
+      await call(
+        {
+          method: 'fillCard',
+          input: browserCardInput.parse({ ...input, threadId: threadIdentity(input.threadId) }),
+        },
+        signal,
+      );
     },
     cardDestinations: async (id, fields) =>
       z
@@ -587,20 +607,23 @@ export function createBridgeComputer(options: {
         throw new Error('The checkout page could not be captured.');
       return new Uint8Array(Buffer.from(value, 'base64'));
     },
-    injectCredentials: async (input) => {
+    injectCredentials: async (input, signal) => {
       return (
         z
           .object({ status: z.literal('submitted') })
           .strict()
           .nullable()
           .parse(
-            await call({
-              method: 'injectCredentials',
-              input: browserCredentialInput.parse({
-                ...input,
-                threadId: threadIdentity(input.threadId),
-              }),
-            }),
+            await call(
+              {
+                method: 'injectCredentials',
+                input: browserCredentialInput.parse({
+                  ...input,
+                  threadId: threadIdentity(input.threadId),
+                }),
+              },
+              signal,
+            ),
           ) ?? undefined
       );
     },
