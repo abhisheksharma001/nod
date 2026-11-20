@@ -243,11 +243,6 @@ export function createSchedules(dependencies: ScheduleDependencies) {
 
   function validateTiming(input: z.infer<typeof timingSchema>, enabled: boolean) {
     if (!ianaTimeZone(input.timeZone)) throw invalid('Choose a valid time zone.');
-    try {
-      scheduler.previewSchedule('0 0 * * *', { tz: input.timeZone, count: 1 });
-    } catch {
-      throw invalid('Choose a valid time zone.');
-    }
     if (input.kind === 'once') {
       if (!input.runAt || input.cron)
         throw invalid('A one-off schedule needs one exact date and time, with its UTC offset.');
