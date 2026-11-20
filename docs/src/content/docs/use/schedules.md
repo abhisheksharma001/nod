@@ -61,6 +61,7 @@ flowchart TD
 ```
 
 - **It runs next to your chat.** A schedule doesn't wait for the conversation, and the conversation doesn't wait for it.
+- **Follow a run in Scheduled.** The schedule shows what Nod is doing, such as reading files or using an app. Open the live line to see recent completed activity when it is available.
 - **What you asked to get arrives every time.** A summary, brief or reminder comes on every run. A watch or check-in messages you only when something needs you, such as a real price drop, a problem or a question. Routine checks stay quiet.
 - **A failed run tells you.** If a run stops on an error, Nod sends a short message that names the schedule and says what stopped it, so a missing summary never goes unnoticed.
 - **It replies where you asked.** A schedule you set up on Telegram sends its messages to Telegram.

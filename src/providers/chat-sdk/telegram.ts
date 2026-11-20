@@ -5,6 +5,8 @@ import { modelServiceError } from '../model-error.ts';
 import { contactAttachment, locationAttachment, telegramContactCard } from './content.ts';
 import { sharedLocation } from '../../shared/channel-content.ts';
 
+export const telegramUpdateTypes = ['message', 'message_reaction', 'callback_query'];
+
 const telegramFile = z.object({
   file_id: z.string().min(1).max(512),
   file_size: z.number().int().nonnegative().optional(),

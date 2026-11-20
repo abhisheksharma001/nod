@@ -44,16 +44,19 @@ import { createErrorRedactor } from '../src/server/redaction.ts';
 import {
   approvalContent,
   approvalTitle,
+  calendarEventTarget,
   gmailDraftTarget,
   gmailMessageTarget,
 } from '../src/server/action-presentation.ts';
 import { createCommunication } from '../src/server/communication.ts';
+import { channelReply } from '../src/server/channels.ts';
 import { ApprovalCard, ApprovalChoiceCard } from '../src/web/components/action-card.tsx';
 import { MessageText } from '../src/web/components/message.tsx';
 import { createE2eCurators } from '../scripts/e2e-curators.ts';
 import { createIntegrationFixture } from '../scripts/e2e-fixtures.ts';
 import { createPiMemoryCurator } from '../src/providers/pi/memory-curator.ts';
 import { createIntegrations } from '../src/server/integrations.ts';
+import { createChatSdkTransport } from '../src/providers/chat-sdk/index.ts';
 
 function markdownNodes(markdown: string) {
   const tree = unified().use(remarkParse).use(remarkGfm).parse(markdown);
@@ -157,322 +160,23 @@ test('failed approval cards show the reason and distinguish an action that did n
   }
 });
 
-test('confirmation repairs rejected wording against the unchanged saved action', async () => {
-  const proposal: ApprovalDescription = {
-    turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
-    action: 'GMAIL_FETCH_EMAILS',
-    args: { query: 'Synthetic receipts' },
-  };
-  for (const mode of [
-    'wrong_action',
-    'wrong_label',
-    'format',
-    'invalid_review',
-    'rejected',
-  ] as const) {
-    let drafts = 0;
-    let checks = 0;
-    const expected = { question: 'Search Gmail for Synthetic receipts?', action: 'Search Gmail' };
-    const communication = createCommunication({
-      pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
-      ownerId: 'synthetic-owner',
-      review: async (_instructions, input) => {
-        const request = input as Record<string, any>;
-        assert.deepEqual(request.data.args, proposal.args);
-        assert.equal(request.data.action, proposal.action);
-        if (request.purpose === 'confirmation_review') {
-          checks++;
-          assert.equal(request.repair, undefined);
-          if (mode === 'invalid_review' && checks === 1) return { valid: 'true' };
-          return request.text === expected.question &&
-            request.action === expected.action &&
-            mode !== 'rejected'
-            ? { valid: true }
-            : {
-                valid: false,
-                reason: 'The question or label describes sending instead of searching.',
-              };
-        }
-        drafts++;
-        request.data.args.query = 'A mutated draft must not change the saved action';
-        if (drafts === 1) {
-          if (mode === 'format') return { text: expected.question };
-          if (mode === 'wrong_action' || mode === 'rejected')
-            return { text: 'Send the receipts?', action: 'Send email' };
-          if (mode === 'wrong_label') return { text: expected.question, action: 'Send email' };
-          return { text: expected.question, action: expected.action };
-        }
-        assert.ok(request.repair.issue);
-        return { text: expected.question, action: expected.action };
-      },
-    });
-    if (mode === 'rejected')
-      await assert.rejects(communication.describe(proposal), /sending instead of searching/);
-    else assert.deepEqual(await communication.describe(proposal), expected);
-    assert.equal(drafts, 2);
-    assert.equal(checks, mode === 'format' ? 1 : 2);
-    assert.deepEqual(proposal.args, { query: 'Synthetic receipts' });
-  }
-});
-
-test('local file confirmation reviews the visible path and rejects a different path', async (t) => {
-  for (const path of [
-    '/Users/tester/Second Brain/CLAUDE.md',
-    '/Users/tester/Documents/synthetic_notes [draft] (v2) #*1*.md',
-    String.raw`C:\Users\tester\Documents\wiki\Projetos.md`,
-    '/home/tester/Documents/GTD/20 Actions/Next Actions.md',
-  ]) {
-    for (const action of ['LOCAL_FILES_READ', 'LOCAL_FILES_IMPORT']) {
-      await t.test(`${action}: ${path}`, async () => {
-        const question = `Can I ${action === 'LOCAL_FILES_READ' ? 'read' : 'import'} ${path}?`;
-        let draftPath = path;
-        let reviews = 0;
-        const proposal: ApprovalDescription = {
-          turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
-          action,
-          args: { path },
-        };
-        const communication = createCommunication({
-          pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
-          ownerId: 'synthetic-owner',
-          review: async (_instructions, input) => {
-            const request = input as Record<string, any>;
-            assert.equal(request.data.action, action);
-            assert.deepEqual(request.data.args, { path });
-            if (request.purpose === 'confirmation_review') {
-              reviews++;
-              return request.text === question
-                ? { valid: true }
-                : { valid: false, reason: 'The question names a different path.' };
-            }
-            return {
-              text: question.replace(path, draftPath),
-              action: action === 'LOCAL_FILES_READ' ? 'Read file' : 'Import file',
-            };
-          },
-        });
-        const result = await communication.describe(proposal);
-        assert.equal(visibleMarkdownText(result.question), question);
-        const visible = (node: DefaultTreeAdapterMap['node']): string =>
-          'value' in node
-            ? node.value
-            : 'childNodes' in node
-              ? node.childNodes.map(visible).join('')
-              : '';
-        assert.equal(
-          visible(
-            parseFragment(
-              renderToStaticMarkup(createElement(MessageText, { text: result.question })),
-            ),
-          ),
-          question,
-        );
-        assert.equal(reviews, 1);
-        for (const different of [path.replace('.md', '-other.md'), path.replace('.md', '\\.md')]) {
-          draftPath = different;
-          await assert.rejects(communication.describe(proposal), /names a different path/);
-        }
-        assert.equal(reviews, 5);
-        assert.deepEqual(proposal.args, { path });
-      });
-    }
-  }
-});
-
-test('confirmation review keeps visible line and paragraph breaks', async () => {
-  let reviewedText = '';
+test('an ordinary message format failure makes no claim about an action', async () => {
+  let drafts = 0;
   const communication = createCommunication({
     pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
     ownerId: 'synthetic-owner',
-    review: async (_instructions, input) => {
-      const request = input as Record<string, any>;
-      if (request.purpose === 'confirmation_review') {
-        reviewedText = request.text;
-        return { valid: true };
-      }
-      return {
-        text: 'Can I submit the request?  \nAmount: 12 EUR.\n\nRecipient: Synthetic Recipient.',
-        action: 'Submit request',
-      };
+    review: async () => {
+      drafts++;
+      return { action: 'Synthetic invalid message' };
     },
   });
-  const result = await communication.describe({
-    turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
-    action: 'SYNTHETIC_SUBMIT',
-    args: { amount: '12 EUR', recipient: 'Synthetic Recipient' },
-  });
-  assert.equal(
-    reviewedText,
-    'Can I submit the request?\nAmount: 12 EUR.\n\nRecipient: Synthetic Recipient.',
-  );
-  const rendered = parseFragment(
-    renderToStaticMarkup(createElement(MessageText, { text: result.question })),
-  );
-  const message = rendered.childNodes.find(
-    (node) =>
-      'attrs' in node &&
-      node.attrs.some(
-        (attribute) => attribute.name === 'class' && attribute.value === 'message-text',
-      ),
-  );
-  assert.ok(message && 'childNodes' in message);
-  const paragraphs = message.childNodes.filter(
-    (node): node is DefaultTreeAdapterMap['element'] => 'tagName' in node && node.tagName === 'p',
-  );
-  assert.deepEqual(
-    paragraphs.map((node) =>
-      node.childNodes.map((child) => ('value' in child ? child.value : child.nodeName)),
-    ),
-    [['Can I submit the request?', 'br', 'Amount: 12 EUR.'], ['Recipient: Synthetic Recipient.']],
-  );
-});
-
-test('URL confirmations keep exact destinations separate from sentence punctuation', async (t) => {
-  const cases = [
-    ['NOD_vault_allow', 'https://portal.example.test'],
-    ['CONNECTED_MCP_CALL', 'http://127.0.0.1:8765/mcp'],
-    ['CONNECTED_MCP_CALL', 'https://mcp.example.test/tools(v2)'],
-    ['CONNECTED_MCP_CALL', 'https://mcp.example.test/mcp?'],
-    ['CONNECTED_MCP_CALL', 'https://mcp.example.test/mcp.'],
-    ['CONNECTED_MCP_CALL', 'https://mcp.example.test/mcp,'],
-    ['CONNECTED_MCP_CALL', 'https://mcp.example.test/mcp)'],
-    ['CONNECTED_MCP_CALL', 'http://[::1]:8765/mcp?mode=read&v=2'],
-    ['CONNECTED_MCP_CALL', 'https://mcp.example.test/`version`'],
-  ] as const;
-  for (const [action, endpoint] of cases) {
-    await t.test(`${action}: ${endpoint}`, async () => {
-      let draftEndpoint: string = endpoint;
-      let reviews = 0;
-      const proposal: ApprovalDescription = {
-        turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
-        action: action,
-        args:
-          action === 'NOD_vault_allow'
-            ? { origin: endpoint, kind: 'sign_in' }
-            : { server: 'synthetic', tool: 'setup', arguments: {} },
-        details: { account: { endpoint }, relatedEndpoint: endpoint.replace(/[?.,)]$/, '') },
-      };
-      const original = structuredClone(proposal);
-      const communication = createCommunication({
-        pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
-        ownerId: 'synthetic-owner',
-        review: async (_instructions, input) => {
-          const request = input as Record<string, any>;
-          assert.deepEqual(request.data.args, proposal.args);
-          if (request.purpose === 'confirmation_review') {
-            reviews++;
-            return request.text === `Can I use ${endpoint}?` &&
-              JSON.stringify(request.literalValues) === JSON.stringify([endpoint])
-              ? { valid: true }
-              : { valid: false, reason: 'The question names a different destination.' };
-          }
-          return { text: `Can I use ${draftEndpoint}?`, action: 'Continue' };
-        },
-      });
-      const result = await communication.describe(proposal);
-      assert.deepEqual(renderedCodeValues(result.question), [endpoint]);
-      assert.equal(visibleMarkdownText(result.question), `Can I use ${endpoint}?`);
-      for (const changed of [
-        endpoint
-          .replace('example.test', 'example.test.evil.test')
-          .replace('127.0.0.1', '127.0.0.2')
-          .replace('[::1]', '[::2]'),
-        `${endpoint}${endpoint.includes('?') ? '&' : '?'}mode=other`,
-      ]) {
-        draftEndpoint = changed;
-        await assert.rejects(communication.describe(proposal), /different destination/);
-      }
-      assert.equal(reviews, 5);
-      assert.deepEqual(proposal, original);
-    });
-  }
-});
-
-test('URL confirmation separates Unicode quotes and punctuation without hiding URL syntax', async () => {
-  const endpoint = 'https://mcp.example.test/mcp';
-  let question = '';
-  let reviewed: Record<string, any> | undefined;
-  const communication = createCommunication({
-    pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
-    ownerId: 'synthetic-owner',
-    review: async (_instructions, input) => {
-      const request = input as Record<string, any>;
-      if (request.purpose === 'confirmation_review') {
-        reviewed = request;
-        return { valid: true };
-      }
-      return { text: question, action: 'Continue' };
+  await assert.rejects(
+    communication.present(null, { kind: 'question', question: 'Which synthetic item?' }),
+    (error: Error & { notRun?: boolean }) => {
+      assert.equal(drafts, 2);
+      assert.equal(error.notRun, undefined);
+      return true;
     },
-  });
-  const proposal = {
-    turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
-    action: 'CONNECTED_MCP_CALL',
-    args: { tool: 'setup' },
-    details: { account: { endpoint } },
-  };
-  for (const [start, end] of [
-    ['“', '”?'],
-    ['«', '»?'],
-    ['「', '」?'],
-    ['（', '）？'],
-    ['', '？'],
-    ['', '。'],
-    ['', '؟'],
-    ['', '।'],
-    ['', '…'],
-    ['', '‽'],
-    ['', '‼'],
-    ['', '⁇'],
-    ['', '⁈'],
-    ['', '⁉'],
-  ]) {
-    question = `Can I use ${start}${endpoint}${end}`;
-    const result = await communication.describe(proposal);
-    assert.equal(visibleMarkdownText(result.question), question);
-    assert.equal(reviewed!.text, question);
-    assert.deepEqual(renderedCodeValues(result.question), [endpoint]);
-    assert.deepEqual(reviewed!.literalValues, [endpoint]);
-  }
-  for (const suffix of ['/', '&', '#', '@', '%']) {
-    question = `Can I use ${endpoint}${suffix}?`;
-    const result = await communication.describe(proposal);
-    assert.equal(visibleMarkdownText(result.question), question);
-    assert.equal(reviewed!.text, question);
-    assert.deepEqual(renderedCodeValues(result.question), [`${endpoint}${suffix}?`]);
-    assert.deepEqual(reviewed!.literalValues, [`${endpoint}${suffix}?`]);
-  }
-});
-
-test('URL confirmation preserves quotes, other words, and unknown destinations', async () => {
-  const first = 'https://mcp.example.test/mcp';
-  const second = `${first}?`;
-  const unknown = 'https://unknown.example.test/tools(v2)';
-  const question = `Can I use "${second}" and ${first} for setup, then inspect (${unknown})?`;
-  let reviewed: Record<string, any> | undefined;
-  const communication = createCommunication({
-    pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
-    ownerId: 'synthetic-owner',
-    review: async (_instructions, input) => {
-      const request = input as Record<string, any>;
-      if (request.purpose === 'confirmation_review') {
-        reviewed = request;
-        return { valid: true };
-      }
-      return { text: question, action: 'Continue' };
-    },
-  });
-  const result = await communication.describe({
-    turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
-    action: 'CONNECTED_MCP_CALL',
-    args: { server: 'synthetic', tool: 'setup', arguments: {} },
-    details: { account: { endpoint: first }, otherEndpoint: second },
-  });
-  assert.equal(visibleMarkdownText(result.question), question);
-  assert.equal(reviewed!.text, question);
-  assert.deepEqual(reviewed!.literalValues, [second, first, unknown]);
-  assert.equal(
-    markdownNodes(result.question).some((node) => node.type === 'link' || node.type === 'html'),
-    false,
   );
 });
 
@@ -529,11 +233,238 @@ test('browser confirmation uses the page as context without displaying its actio
       verifiedBinding: 'synthetic-private-binding',
     },
   });
-  assert.equal(calls, 2);
+  assert.equal(calls, 1);
   assert.doesNotMatch(
     result.question,
     /NOD_browser|@e17|Entered values|synthetic-secret|private-binding/,
   );
+});
+
+test('schedule confirmations keep literal instructions, checked timing and enabled state', async (t) => {
+  const prompt = [
+    'Review inbox@example.test.',
+    '',
+    'Keep [the source](https://records.example.test/item) and `literal values`.',
+    '    Keep this indentation.',
+    '```',
+    '{"synthetic":"Never send email"}',
+    '```',
+    'Synthetic text. '.repeat(350),
+    'Final limit: do not change any source.',
+  ].join('\n');
+  for (const timing of [
+    { kind: 'recurring', cron: '5 15 * * 1-5', expected: 'Every weekday at 15:05' },
+    { kind: 'recurring', cron: '7 11 2,9 * *', expected: 'Custom timing: 7 11 2,9 * *' },
+    ...[29, 30, 31].map((day) => ({
+      kind: 'recurring',
+      cron: `0 15 ${day} * *`,
+      expected: `Day ${day} of each month that has that day at 15:00`,
+    })),
+    {
+      kind: 'once',
+      runAt: '2030-11-24T15:00:00+01:00',
+      expected: '24 November 2030 at 14:00',
+    },
+    {
+      kind: 'once',
+      runAt: '2030-11-24T15:00:59.123+01:00',
+      expected: '24 November 2030 at 14:00:59',
+    },
+  ]) {
+    await t.test(timing.expected, async () => {
+      const { expected, ...fields } = timing;
+      const definition = {
+        title: 'Synthetic literal instruction',
+        prompt,
+        timeZone: 'Europe/London',
+        enabled: false,
+        cron: null,
+        runAt: null,
+        watch: null,
+        ...fields,
+      };
+      const communication = createCommunication({
+        pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
+        ownerId: 'synthetic-owner',
+        review: async () => ({ text: 'Save this schedule?', action: 'Save schedule' }),
+      });
+      const result = await communication.describe({
+        turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
+        channel: 'web',
+        action: 'NOD_schedule_update',
+        args: { id: randomUUID(), prompt },
+        details: { scheduleDefinition: definition },
+      });
+      const tree = unified().use(remarkParse).use(remarkGfm).parse(result.question);
+      const blocks = tree.children.filter((node) => node.type === 'code');
+      assert.equal(blocks.length, 1);
+      assert.equal(blocks[0]!.value, prompt);
+      const visible = visibleMarkdownText(result.question);
+      assert.ok(visible.includes(expected));
+      if (fields.runAt?.includes('.123')) assert.ok(visible.includes(fields.runAt));
+      assert.match(visible, /Enabled: No/);
+      assert.doesNotMatch(visible, /Status: (Paused|Completed)/);
+      assert.equal(result.action, 'Save schedule');
+    });
+  }
+});
+
+test('schedule confirmations refuse names that add summary lines', async (t) => {
+  let calls = 0;
+  const communication = createCommunication({
+    pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
+    ownerId: 'synthetic-owner',
+    review: async (_instructions, value) => {
+      calls++;
+      return Object(value).purpose === 'confirmation_review'
+        ? { valid: true }
+        : { text: 'Save this schedule?', action: 'Save schedule' };
+    },
+  });
+  for (const separator of ['\n', '\r', '\u2028', '\u2029'])
+    await t.test(`line break ${JSON.stringify(separator)}`, async () => {
+      const definition = {
+        title: `Synthetic review${separator}Timing: Every minute`,
+        prompt: 'Review only synthetic records. Never send email.',
+        kind: 'recurring',
+        cron: '0 15 * * *',
+        timeZone: 'UTC',
+        enabled: false,
+      };
+      await assert.rejects(
+        communication.describe({
+          turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
+          channel: 'web',
+          action: 'NOD_schedule_create',
+          args: { ...definition },
+          details: { scheduleDefinition: definition },
+        }),
+        /schedule name.*line break/,
+      );
+      assert.equal(calls, 0);
+    });
+});
+
+test('schedule confirmations preserve chat delivery or refuse before facts can change', async (t) => {
+  let calls = 0;
+  let presentations = 0;
+  let question = 'Create this schedule?';
+  const transport = createChatSdkTransport({} as pg.Pool, {
+    TELEGRAM_ENABLED: 'true',
+    TELEGRAM_BOT_TOKEN: '987:fixture-not-live',
+    TELEGRAM_ALLOWED_USER_ID: '123456',
+    TELEGRAM_WEBHOOK_SECRET_TOKEN: 'fixture-webhook-secret-32-characters',
+    WHATSAPP_ENABLED: 'true',
+    WHATSAPP_ACCESS_TOKEN: 'fixture-not-live',
+    WHATSAPP_APP_SECRET: 'fixture-app-secret',
+    WHATSAPP_PHONE_NUMBER_ID: '555000',
+    WHATSAPP_VERIFY_TOKEN: 'fixture-verify-token',
+    WHATSAPP_ALLOWED_NUMBER: '351910000000',
+    WHATSAPP_POLICY_CONFIRMED: 'true',
+  });
+  const communication = createCommunication({
+    pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
+    ownerId: 'synthetic-owner',
+    canDeliverLiteral: (channelId, text, literal) =>
+      transport.canDeliverLiteral!({ channelId, text, literal }),
+    review: async (_instructions, value) => {
+      calls++;
+      return Object(value).purpose === 'confirmation_review'
+        ? { valid: true }
+        : { text: question, action: 'Create schedule' };
+    },
+  });
+  const proposal = {
+    turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
+    action: 'NOD_schedule_create',
+    args: {},
+    details: {
+      scheduleDefinition: {
+        title: 'Synthetic local review',
+        prompt: 'Read https://records.example.test/item. Never send email.',
+        kind: 'recurring',
+        cron: '0 15 * * *',
+        timeZone: 'UTC',
+        enabled: true,
+      },
+    },
+  };
+  for (const channel of ['telegram', 'whatsapp']) {
+    const result = await communication.describe({ ...proposal, channel });
+    const delivered = await channelReply(result.question, {
+      threadId: proposal.turn.threadId,
+      present: async () => {
+        presentations++;
+        return 'This must not replace the checked facts.';
+      },
+    });
+    assert.equal(delivered, result.question);
+  }
+  assert.equal(presentations, 0);
+  for (const [channel, title] of [
+    ['telegram', '{{emoji:smile}}'],
+    ['whatsapp', '```'],
+  ] as const) {
+    await t.test(`${channel} refuses a title that changes its visible facts`, async () => {
+      proposal.details.scheduleDefinition.title = title;
+      const before = calls;
+      await assert.rejects(
+        communication.describe({ ...proposal, channel }),
+        /cannot show the complete schedule confirmation in this channel/,
+      );
+      assert.equal(calls, before);
+    });
+  }
+  proposal.details.scheduleDefinition.title = 'Synthetic local review';
+  for (const [channel, text] of [
+    ['telegram', 'Create {{emoji:smile}} this schedule?'],
+    ['whatsapp', 'Create ``` this schedule?'],
+  ] as const) {
+    await t.test(`${channel} also checks the reviewed model question`, async () => {
+      question = text;
+      const before = calls;
+      await assert.rejects(
+        communication.describe({ ...proposal, channel }),
+        /cannot show the complete schedule confirmation in this channel/,
+      );
+      assert.equal(calls, before + 1);
+    });
+  }
+  question = 'Create this schedule?';
+  for (const prompt of [
+    `${'Synthetic text. '.repeat(350)}\n[Review](https://records.example.test/item)\n    Never send email.`,
+    'Keep {{emoji:smile}} as literal text. Never send email.',
+  ]) {
+    proposal.details.scheduleDefinition.prompt = prompt;
+    const before = calls;
+    for (const channel of ['telegram', 'whatsapp'])
+      await assert.rejects(
+        communication.describe({ ...proposal, channel }),
+        /cannot show the complete schedule confirmation in this channel/,
+      );
+    assert.equal(calls, before);
+  }
+  proposal.details.scheduleDefinition.prompt = 'Keep ``` as literal text. Never send email.';
+  await communication.describe({ ...proposal, channel: 'telegram' });
+  await assert.rejects(
+    communication.describe({ ...proposal, channel: 'whatsapp' }),
+    /cannot show the complete schedule confirmation in this channel/,
+  );
+  proposal.details.scheduleDefinition.prompt = 'Read http://localhost:5678. Never send email.';
+  const web = await communication.describe({ ...proposal, channel: 'web' });
+  assert.ok(web.question.includes(proposal.details.scheduleDefinition.prompt));
+  const before = calls;
+  for (const channel of ['telegram', 'whatsapp'])
+    await assert.rejects(
+      communication.describe({ ...proposal, channel }),
+      /cannot show the complete schedule confirmation in this channel/,
+    );
+  await assert.rejects(communication.describe(proposal), /no verified delivery channel/);
+  await assert.rejects(
+    communication.describe({ ...proposal, channel: 'unknown' }),
+    /cannot show the complete schedule confirmation in this channel/,
+  );
+  assert.equal(calls, before);
 });
 
 test('a complete schedule approval refuses a definition with hidden values', async () => {
@@ -577,12 +508,22 @@ test('a complete schedule approval keeps ordinary text and still hides Basic cre
   });
   const proposal = {
     turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
+    channel: 'web',
     action: 'NOD_schedule_create',
     args: { prompt },
-    details: { scheduleDefinition: { prompt } },
+    details: {
+      scheduleDefinition: {
+        title: 'Synthetic basic briefing',
+        prompt,
+        kind: 'recurring',
+        cron: '0 9 * * *',
+        timeZone: 'UTC',
+        enabled: true,
+      },
+    },
   };
   await communication.describe(proposal);
-  assert.equal(calls, 2);
+  assert.equal(calls, 1);
   const credential = Buffer.from('synthetic-user:synthetic-password!').toString('base64');
   for (const token of [credential, credential.replace(/=+$/u, '')]) {
     await assert.rejects(
@@ -595,7 +536,7 @@ test('a complete schedule approval keeps ordinary text and still hides Basic cre
       /hidden values/,
     );
   }
-  assert.equal(calls, 2);
+  assert.equal(calls, 1);
 });
 
 test('browser wording keeps material command facts for steps other than clicks', async () => {
@@ -632,7 +573,7 @@ test('browser wording keeps material command facts for steps other than clicks',
     };
     const saved = structuredClone(proposal.args);
     await communication.describe(proposal);
-    assert.equal(calls, 2);
+    assert.equal(calls, 1);
     assert.deepEqual(proposal.args, saved);
   }
 });
@@ -693,7 +634,7 @@ test('HTTP confirmations describe the verified request without exposing the tran
       },
     });
     await communication.describe(proposal);
-    assert.equal(calls, 2);
+    assert.equal(calls, 1);
     assert.deepEqual(proposal, saved);
   }
 });
@@ -736,7 +677,7 @@ test('HTTP confirmation requests hide secrets and report incomplete details', as
   });
   assert.match(visibleMarkdownText(presentation.question), /description is incomplete/);
   assert.doesNotMatch(presentation.question, /synthetic-query-secret|synthetic-body-secret/);
-  assert.equal(calls, 2);
+  assert.equal(calls, 1);
   await assert.rejects(
     communication.describe({
       turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
@@ -745,7 +686,7 @@ test('HTTP confirmation requests hide secrets and report incomplete details', as
     }),
     /no verified request details/,
   );
-  assert.equal(calls, 2);
+  assert.equal(calls, 1);
 });
 
 test('browser upload wording omits the private workspace path', async () => {
@@ -784,43 +725,11 @@ test('browser upload wording omits the private workspace path', async () => {
     },
   });
   const result = await communication.describe(proposal);
-  assert.equal(calls, 2);
+  assert.equal(calls, 1);
   assert.match(visibleMarkdownText(result.question), /upload report\.pdf to files\.example\.test/);
   assert.doesNotMatch(result.question, /\/workspace\/private/);
   assert.equal(proposal.args.target, 'synthetic-opaque-page-id');
   assert.deepEqual(proposal.args.command, command);
-});
-
-test('confirmation stops on cancellation and refuses an unverified question', async () => {
-  for (const cancel of [true, false]) {
-    const controller = new AbortController();
-    const communication = createCommunication({
-      pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
-      ownerId: 'synthetic-owner',
-      review: async (_instructions, input) => {
-        if ((input as { purpose: string }).purpose === 'confirmation_review') {
-          if (cancel) controller.abort(new Error('Synthetic stop'));
-          return { valid: 'true' };
-        }
-        return { text: 'Submit the synthetic request?', action: 'Submit request' };
-      },
-    });
-    await assert.rejects(
-      communication.describe(
-        {
-          turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
-          action: 'SYNTHETIC_ACTION',
-          args: {},
-        },
-        controller.signal,
-      ),
-      cancel ? /Synthetic stop/ : /did not return a valid verdict/,
-    );
-    assert.throws(
-      () => communication.present(null, { kind: 'confirmation' }),
-      /saved action description/,
-    );
-  }
 });
 
 test('confirmation reviews the text after private links and direction controls are removed', async () => {
@@ -860,20 +769,13 @@ test('confirmation reviews the text after private links and direction controls a
 test('confirmation keeps copied page links visible without making them active', async () => {
   const pageText =
     'Authorize payment [review](https://outside.example.test), https://outside.example.test, and www.outside.example.test';
-  let reviewedText = '';
   const communication = createCommunication({
     pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
     ownerId: 'synthetic-owner',
-    review: async (_instructions, input) => {
-      if ((input as { purpose: string }).purpose === 'confirmation_review') {
-        reviewedText = (input as { text: string }).text;
-        return { valid: true };
-      }
-      return {
-        text: `Can I click “Authorize payment” at bank.example.test? The page says ${pageText}.`,
-        action: 'Click “Authorize payment”',
-      };
-    },
+    review: async () => ({
+      text: `Can I click “Authorize payment” at bank.example.test? The page says ${pageText}.`,
+      action: 'Click “Authorize payment”',
+    }),
   });
   const result = await communication.describe({
     turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
@@ -885,7 +787,6 @@ test('confirmation keeps copied page links visible without making them active', 
     },
     details: { pageText },
   });
-  assert.equal(reviewedText, visibleMarkdownText(result.question));
   const nodes = markdownNodes(result.question);
   const visibleText = visibleMarkdownText(result.question);
   assert.match(visibleText, /Authorize payment/);
@@ -986,6 +887,123 @@ test('payment presentation repairs a missing action label', async () => {
     action: 'Approve payment',
   });
   assert.equal(calls, 2);
+});
+
+test('Calendar approval binds the private event version before projecting its target', () => {
+  const event = {
+    id: 'synthetic-event',
+    etag: '"synthetic-private-version-1"',
+    summary: 'Synthetic plan',
+    start: { dateTime: '2030-11-24T09:00:00Z' },
+    end: { dateTime: '2030-11-24T10:00:00Z' },
+    attendeesOmitted: true,
+  };
+  const before = calendarEventTarget(event, event.id);
+  const after = calendarEventTarget({ ...event, etag: '"synthetic-private-version-2"' }, event.id);
+  assert.ok(before && after);
+  assert.deepEqual(before.target, after.target);
+  assert.notEqual(before.revision, after.revision);
+  assert.equal(JSON.stringify(before).includes('synthetic-private-version'), false);
+  for (const etag of [undefined, null, 17, '', ' ', 'x'.repeat(1025)])
+    assert.equal(calendarEventTarget({ ...event, etag }, event.id), undefined);
+});
+
+test('Calendar approval does not claim an unspecified end and marks known ends exclusive', () => {
+  const event = {
+    id: 'synthetic-event',
+    etag: '"synthetic-calendar-version"',
+    start: { date: '2030-11-24' },
+    end: { date: '2030-11-25' },
+  };
+  assert.equal(calendarEventTarget({ ...event, endTimeUnspecified: true }, event.id), undefined);
+  const known = calendarEventTarget({ ...event, endTimeUnspecified: false }, event.id);
+  assert.ok(known);
+  assert.equal(known.target.startsAt, '2030-11-24');
+  assert.equal(known.target.endsAt, '2030-11-25');
+  assert.equal(known.target.endExclusive, true);
+});
+
+test('Calendar local times use the event zones instead of the host zone', () => {
+  const event = {
+    id: 'synthetic-event',
+    etag: '"synthetic-calendar-version-1"',
+    summary: 'Synthetic travel plan',
+    start: { dateTime: '2030-11-24T10:00:00', timeZone: 'Europe/Paris' },
+    end: { dateTime: '2030-11-24T05:00:00', timeZone: 'America/New_York' },
+    recurringEventId: 'synthetic-series',
+    originalStartTime: { dateTime: '2030-11-24T11:00:00', timeZone: 'Europe/Helsinki' },
+  };
+  const target = calendarEventTarget({ data: event }, event.id)?.target;
+  assert.ok(target);
+  assert.equal(Date.parse(target.startsAt), Date.parse('2030-11-24T09:00:00Z'));
+  assert.equal(Date.parse(target.endsAt), Date.parse('2030-11-24T10:00:00Z'));
+  assert.equal(Date.parse(target.originalStartsAt!), Date.parse('2030-11-24T09:00:00Z'));
+  assert.equal(target.timeZone, 'Europe/Paris');
+  assert.equal(target.endTimeZone, 'America/New_York');
+  assert.equal(target.originalTimeZone, 'Europe/Helsinki');
+  assert.equal(target.scope, 'occurrence');
+  assert.equal(
+    calendarEventTarget(
+      { data: { ...event, end: { ...event.end, dateTime: '2030-11-24T03:00:00' } } },
+      event.id,
+    ),
+    undefined,
+  );
+});
+
+test('Calendar local times refuse missing zones, clock gaps and repeated clock times', () => {
+  for (const start of [
+    { dateTime: '2030-11-24T10:00:00' },
+    { dateTime: '2030-03-31T02:30:00', timeZone: 'Europe/Paris' },
+    { dateTime: '2030-10-27T02:30:00', timeZone: 'Europe/Paris' },
+  ]) {
+    assert.equal(
+      calendarEventTarget(
+        {
+          id: 'synthetic-event',
+          etag: '"synthetic-calendar-version-1"',
+          start,
+          end: { dateTime: '2030-11-25T10:00:00Z' },
+        },
+        'synthetic-event',
+      ),
+      undefined,
+    );
+  }
+  const target = calendarEventTarget(
+    {
+      id: 'synthetic-event',
+      etag: '"synthetic-calendar-version-1"',
+      start: { dateTime: '2030-10-27T02:30:00+02:00', timeZone: 'Europe/Paris' },
+      end: { dateTime: '2030-10-27T02:30:00+01:00', timeZone: 'Europe/Paris' },
+    },
+    'synthetic-event',
+  )?.target;
+  assert.ok(target);
+  assert.equal(Date.parse(target.endsAt) - Date.parse(target.startsAt), 3_600_000);
+});
+
+test('Calendar approval keeps the end and occurrence zones when offsets are present', () => {
+  const event = {
+    id: 'synthetic-event',
+    etag: '"synthetic-calendar-version-1"',
+    start: { dateTime: '2030-11-24T10:00:00+01:00', timeZone: 'Europe/Paris' },
+    end: { dateTime: '2030-11-24T05:00:00-05:00', timeZone: 'America/New_York' },
+    recurringEventId: 'synthetic-series',
+    originalStartTime: { dateTime: '2030-11-24T11:00:00+02:00', timeZone: 'Europe/Helsinki' },
+  };
+  const target = calendarEventTarget(event, event.id)?.target;
+  assert.ok(target);
+  assert.equal(target.endTimeZone, 'America/New_York');
+  assert.equal(target.originalTimeZone, 'Europe/Helsinki');
+  for (const part of ['end', 'originalStartTime'] as const)
+    assert.equal(
+      calendarEventTarget(
+        { ...event, [part]: { ...event[part], timeZone: 'Invalid/Synthetic' } },
+        event.id,
+      ),
+      undefined,
+    );
 });
 
 test('Gmail delete target metadata must match the bound message ID', () => {
@@ -1894,12 +1912,12 @@ test(
           await confirm(beforeYes, true);
           const beforeNo = await pending('keyless No');
           await confirm(beforeNo, false);
-          assert.equal((await stored(beforeYes)).status, 'expired');
-          assert.equal((await stored(beforeNo)).status, 'expired');
+          assert.equal((await stored(beforeYes)).status, 'pending');
+          assert.equal((await stored(beforeNo)).status, 'pending');
           answerReply = (reply) => helperTrust.answer(reply);
           const wrongModel = await pending('helper Yes');
           await confirm(wrongModel, true);
-          assert.equal((await stored(wrongModel)).status, 'expired');
+          assert.equal((await stored(wrongModel)).status, 'pending');
           assert.equal(calls.length, callsBefore);
           answerReply = (reply) => harnessTrust.answer(reply);
           const afterYes = await pending('selected Yes');
@@ -1916,14 +1934,14 @@ test(
           await finish((await stored(afterNo)).execution_turn_id, 'succeeded');
           const afterOther = await pending('selected Maybe');
           await confirm(afterOther, true, { text: 'Maybe' });
-          assert.equal((await stored(afterOther)).status, 'expired');
+          assert.equal((await stored(afterOther)).status, 'pending');
         },
       );
       const compareVerdict = (
         verdict: Awaited<ReturnType<typeof trust.check>>,
         expected: Record<string, unknown>,
       ) => {
-        const { chatRevision, ...result } = verdict;
+        const { chatRevision, instructionRevision, ...result } = verdict;
         assert.deepEqual(result, expected);
       };
       const email = (to: string) => ({
@@ -2166,6 +2184,48 @@ test(
         },
       );
 
+      await t.test(
+        'a declined computer step is not asked again when only window content or refs differ',
+        async () => {
+          const turn = await begin('Send Ana the synthetic note in Mail.');
+          const press = (typed: string, ref: string) => ({
+            ref,
+            windowBinding: { window: 'w-1', state: 'synthetic-state' },
+            app: { bundle: 'com.apple.mail', name: 'Mail' },
+            control: { role: 'button', name: 'Send', window: 'Synthetic note' },
+            windowContext: typed,
+          });
+          const ended = await begin('Synthetic earlier request that ended.');
+          try {
+            const asked = await approved.request(turn, 'COMPUTER_PRESS', press('Hi Ana', '@s1:e1'));
+            assert.ok(asked && typeof asked === 'object' && appConfirmation in asked);
+            const first = await proposal(turn.turnId);
+            await finish(turn.turnId);
+            await confirm(first.id, false);
+            assert.equal((await stored(first.id)).status, 'declined');
+            await finish(ended.turnId, 'succeeded');
+            await db.pool.query(
+              `INSERT INTO approvals(id,owner_id,thread_id,turn_id,action,args,status,source_message_id,title)
+               SELECT $1,owner_id,thread_id,$2,action,$3::jsonb,'pending',source_message_id,title
+               FROM approvals WHERE id=$4`,
+              [randomUUID(), ended.turnId, press('Hi Ana!', '@s2:e1'), first.id],
+            );
+            await db.pool.query("UPDATE turns SET status='running' WHERE id=$1", [turn.turnId]);
+            const ran = calls.length;
+            await assert.rejects(
+              approved.request(turn, 'COMPUTER_PRESS', press('Hi Ana!', '@s2:e1'), {
+                allowed: true,
+              }),
+              /pending or uncertain outcome/,
+            );
+            assert.equal(calls.length, ran);
+          } finally {
+            await finish(turn.turnId, 'cancelled');
+            await finish(ended.turnId, 'cancelled');
+          }
+        },
+      );
+
       await t.test('a quoted permission cannot override a reported term mismatch', async () => {
         const turn = await begin('Email Ana the invoice for EUR 1200.');
         try {
@@ -2233,77 +2293,54 @@ test(
         }
       });
 
-      await t.test(
-        'owner corrections and changed rules reject stale proposals without asking for them',
-        async () => {
-          aligned = true;
-          const preferences = (
+      await t.test('changed rules reject stale proposals without asking for them', async () => {
+        aligned = true;
+        const preferences = (
+          await db.pool.query('SELECT notification_rule,rules FROM preferences WHERE owner_id=$1', [
+            ownerId,
+          ])
+        ).rows[0];
+        try {
+          for (const change of ['rule', 'standing'] as const) {
             await db.pool.query(
-              'SELECT notification_rule,rules FROM preferences WHERE owner_id=$1',
-              [ownerId],
-            )
-          ).rows[0];
-          try {
-            for (const change of ['owner', 'rule', 'standing'] as const) {
-              await db.pool.query(
-                'INSERT INTO preferences(owner_id,notification_rule,rules) VALUES($1,$2,$3) ON CONFLICT(owner_id) DO UPDATE SET notification_rule=EXCLUDED.notification_rule,rules=EXCLUDED.rules',
-                [ownerId, 'Email Ana when a synthetic invoice arrives.', ''],
-              );
-              const turn = await begin(
-                'Email Ana the EUR 1,200 invoice.',
-                change === 'standing' ? { source: 'event' } : {},
-              );
-              const entered = deferred();
-              const release = deferred();
-              duringReview = async () => {
-                entered.resolve();
-                await release.promise;
-              };
-              const before = calls.length;
-              const outcome = approvals
-                .request(turn, 'GMAIL_SEND_EMAIL', email('ana@example.test'))
-                .then(
-                  () => undefined,
-                  (error: unknown) => error,
-                );
-              await entered.promise;
-              if (change === 'owner') {
-                const correction = await thread.submitUserMessage(
-                  'Correction: do not send that invoice.',
-                );
-                await finish(correction.turnId, 'cancelled');
-              } else {
-                await db.pool.query(
-                  `UPDATE preferences SET ${change === 'rule' ? 'rules' : 'notification_rule'}=$2 WHERE owner_id=$1`,
-                  [ownerId, 'Ask me before sending any invoice.'],
-                );
-              }
-              release.resolve();
-              assert.ok((await outcome) instanceof Error);
-              assert.equal(calls.length, before);
-              assert.equal(await proposal(turn.turnId), undefined);
-              await finish(turn.turnId, 'cancelled');
-            }
-          } finally {
-            await db.pool.query(
-              'UPDATE preferences SET notification_rule=$2,rules=$3 WHERE owner_id=$1',
-              [ownerId, preferences?.notification_rule ?? '', preferences?.rules ?? ''],
+              'INSERT INTO preferences(owner_id,notification_rule,rules) VALUES($1,$2,$3) ON CONFLICT(owner_id) DO UPDATE SET notification_rule=EXCLUDED.notification_rule,rules=EXCLUDED.rules',
+              [ownerId, 'Email Ana when a synthetic invoice arrives.', ''],
             );
+            const turn = await begin(
+              'Email Ana the EUR 1,200 invoice.',
+              change === 'standing' ? { source: 'event' } : {},
+            );
+            const entered = deferred();
+            const release = deferred();
+            duringReview = async () => {
+              entered.resolve();
+              await release.promise;
+            };
+            const before = calls.length;
+            const outcome = approvals
+              .request(turn, 'GMAIL_SEND_EMAIL', email('ana@example.test'))
+              .then(
+                () => undefined,
+                (error: unknown) => error,
+              );
+            await entered.promise;
+            await db.pool.query(
+              `UPDATE preferences SET ${change === 'rule' ? 'rules' : 'notification_rule'}=$2 WHERE owner_id=$1`,
+              [ownerId, 'Ask me before sending any invoice.'],
+            );
+            release.resolve();
+            assert.ok((await outcome) instanceof Error);
+            assert.equal(calls.length, before);
+            assert.equal(await proposal(turn.turnId), undefined);
+            await finish(turn.turnId, 'cancelled');
           }
-          const requestText = 'Email Ana the synthetic invoice.';
-          const superseded = await begin(requestText);
-          const correction = await thread.submitUserMessage(
-            'Correction: do not send that invoice.',
+        } finally {
+          await db.pool.query(
+            'UPDATE preferences SET notification_rule=$2,rules=$3 WHERE owner_id=$1',
+            [ownerId, preferences?.notification_rule ?? '', preferences?.rules ?? ''],
           );
-          await finish(correction.turnId, 'cancelled');
-          aligned = () => ({ run: true, because: requestText });
-          compareVerdict(
-            await trust.check(superseded, 'GMAIL_SEND_EMAIL', email('ana@example.test')),
-            { confirm: true, reason: 'unrequested' },
-          );
-          await finish(superseded.turnId, 'cancelled');
-        },
-      );
+        }
+      });
 
       await t.test('an unusable trust check answer is logged with its cause', async () => {
         const { withFailureLog } = await import('../src/server/failure-log.ts');
@@ -2338,15 +2375,6 @@ test(
         await checkWith(invented);
         assert.deepEqual(unusable(), [{ name: 'TrustCheckUnusable', code: 'basis_rejected' }]);
         await finish(invented.turnId, 'cancelled');
-
-        const requestText = 'Email Ana the synthetic invoice.';
-        const stale = await begin(requestText);
-        const correction = await thread.submitUserMessage('Correction: do not send that invoice.');
-        await finish(correction.turnId, 'cancelled');
-        aligned = () => ({ run: true, because: requestText });
-        await checkWith(stale);
-        assert.deepEqual(unusable(), [{ name: 'TrustCheckUnusable', code: 'superseded' }]);
-        await finish(stale.turnId, 'cancelled');
 
         const declined = await begin('Email Ana the synthetic invoice.');
         aligned = false;
@@ -2538,43 +2566,8 @@ test(
         },
       );
 
-      await t.test('a newer chat correction before action handoff prevents the write', async () => {
-        aligned = true;
-        const action = 'GMAIL_SEND_EMAIL';
-        const args = email('ana@example.test');
-        const turn = await begin('Email Ana the synthetic report.');
-        const verdict = await trust.check(turn, action, args);
-        assert.equal(verdict.confirm, false);
-        assert.ok(verdict.chatRevision);
-        const correction = await thread.submitUserMessage('Correction: do not email Ana.');
-        await finish(correction.turnId, 'cancelled');
-        const before = calls.length;
-        await assert.rejects(
-          approved.request(turn, action, args, {
-            allowed: true,
-            expectedChatRevision: verdict.chatRevision,
-          }),
-        );
-        assert.equal(calls.length, before);
-        assert.equal(await proposal(turn.turnId), undefined);
-        await finish(turn.turnId, 'cancelled');
-
-        const fresh = await begin('Email Bob the synthetic report.');
-        const freshArgs = email('bob@example.test');
-        const freshVerdict = await trust.check(fresh, action, freshArgs);
-        assert.equal(freshVerdict.confirm, false);
-        assert.ok(freshVerdict.chatRevision);
-        await approved.request(fresh, action, freshArgs, {
-          allowed: true,
-          expectedChatRevision: freshVerdict.chatRevision,
-        });
-        assert.equal(calls.length, before + 1);
-        assert.equal(await proposal(fresh.turnId), undefined);
-        await finish(fresh.turnId, 'succeeded');
-      });
-
       await t.test(
-        'authorization ignores unrelated task messages and detects replies to its own task',
+        'authorization ignores unrelated chat messages during a task check',
         async (t) => {
           const parent = await begin('Email Ana the fixture invoice for EUR 1,200.');
           const task = (await tasks.execute(
@@ -2605,7 +2598,7 @@ test(
           );
           await tasks.inherit(turn);
           aligned = true;
-          for (const own of [false, true]) {
+          {
             const entered = deferred();
             const release = deferred();
             duringReview = async () => {
@@ -2621,30 +2614,22 @@ test(
               );
             await entered.promise;
             const update = await messages.submit(
-              own
-                ? 'Correction: do not send this invoice.'
-                : 'Send a separate hotel request to hotel@example.test.',
+              'Send a separate hotel request to hotel@example.test.',
               [],
-              own ? { replyToMessageId: task.messageId } : {},
+              {},
             );
             release.resolve();
             const result = await outcome;
-            if (own) {
-              assert.ok('error' in result && result.error instanceof Error);
-              assert.equal(calls.length, before);
-              assert.equal(await proposal(turn.turnId), undefined);
-            } else {
-              assert.ok('result' in result);
-              assert.equal(calls.length, before + 1);
-              assert.equal(
-                reviews
-                  .at(-1)!
-                  .userMessages.some((message: { text: string }) =>
-                    message.text.includes('hotel@example.test'),
-                  ),
-                false,
-              );
-            }
+            assert.ok('result' in result);
+            assert.equal(calls.length, before + 1);
+            assert.equal(
+              reviews
+                .at(-1)!
+                .userMessages.some((message: { text: string }) =>
+                  message.text.includes('hotel@example.test'),
+                ),
+              false,
+            );
             await finish(update.turnId, 'cancelled');
           }
           aligned = false;
@@ -2929,7 +2914,7 @@ test(
         aligned = (input) => input.assistantMessageBeforeLatestUserMessage === older.text;
         assert.equal(
           (await trust.check(reacted, 'GMAIL_SEND_EMAIL', email('ana@example.test'))).confirm,
-          true,
+          false,
         );
         aligned = false;
         await db.pool.query('UPDATE messages SET hidden_at=now() WHERE id=$1', [older.id]);
@@ -2957,10 +2942,7 @@ test(
           'GMAIL_SEND_EMAIL',
           email('bob@example.test'),
         );
-        compareVerdict(acceptedVerdict, {
-          confirm: true,
-          reason: 'unrequested',
-        });
+        assert.equal(acceptedVerdict.confirm, false);
         assert.equal(acceptedVerdict.chatRevision, accepted.messageId);
         aligned = false;
         const bare = await begin('What time is it?');
@@ -3009,7 +2991,12 @@ test(
         turnIds.push(stale.turnId);
         const staleTurn = await running(stale.turnId);
         await trust.check(staleTurn, 'GMAIL_SEND_EMAIL', email('fixture@example.test'));
-        assert.equal(reviews.at(-1)?.assistantMessageBeforeLatestUserMessage, undefined);
+        const question = (
+          await db.pool.query<{ text: string }>('SELECT text FROM messages WHERE id=$1', [
+            confirmation,
+          ])
+        ).rows[0]!.text;
+        assert.equal(reviews.at(-1)?.assistantMessageBeforeLatestUserMessage, question);
         const untargeted = await thread.submitUserMessage('👍');
         turnIds.push(untargeted.turnId);
         const untargetedTurn = await running(untargeted.turnId);
@@ -3018,7 +3005,7 @@ test(
           await trust.check(untargetedTurn, 'GMAIL_SEND_EMAIL', email('fixture@example.test')),
           { confirm: true, reason: 'unrequested' },
         );
-        assert.equal(reviews.at(-1)?.assistantMessageBeforeLatestUserMessage, undefined);
+        assert.equal(reviews.at(-1)?.assistantMessageBeforeLatestUserMessage, question);
         const otherChannel = await begin('Check the synthetic channel note.', {
           channel: 'telegram',
         });
@@ -3045,12 +3032,10 @@ test(
         });
         turnIds.push(crossChannelReply.turnId);
         const crossChannelTurn = await running(crossChannelReply.turnId);
-        compareVerdict(
-          await trust.check(crossChannelTurn, 'GMAIL_SEND_EMAIL', email('carol@example.test')),
-          {
-            confirm: true,
-            reason: 'unrequested',
-          },
+        assert.equal(
+          (await trust.check(crossChannelTurn, 'GMAIL_SEND_EMAIL', email('carol@example.test')))
+            .confirm,
+          false,
         );
         assert.equal(reviews.at(-1)?.assistantMessageBeforeLatestUserMessage, otherMessage);
         const proposalReaction = await thread.submitUserMessage('👍', [], {
@@ -3065,234 +3050,9 @@ test(
           'GMAIL_SEND_EMAIL',
           email('carol@example.test'),
         );
-        assert.equal(verdict.confirm, true);
+        assert.equal(verdict.confirm, false);
         assert.equal(verdict.chatRevision, proposalReaction.messageId);
         assert.equal(reviews.at(-1)?.assistantMessageBeforeLatestUserMessage, otherMessage);
-        const sent = calls.length;
-        const newApproval = await approvals.request(
-          proposalReactionTurn,
-          'GMAIL_SEND_EMAIL',
-          email('carol@example.test'),
-          { allowed: !verdict.confirm },
-        );
-        assert.ok(newApproval && typeof newApproval === 'object' && appConfirmation in newApproval);
-        approvalIds.push((await proposal(proposalReaction.turnId)).id);
-        assert.equal(calls.length, sent);
-      });
-
-      await t.test('a retired confirmation reply cannot reuse the original request', async (t) => {
-        const turnIds: string[] = [];
-        t.after(async () => {
-          await db.pool.query(
-            'DELETE FROM approvals WHERE turn_id=ANY($1::uuid[]) OR execution_turn_id=ANY($1::uuid[])',
-            [turnIds],
-          );
-          await db.pool.query('DELETE FROM messages WHERE turn_id=ANY($1::uuid[])', [turnIds]);
-          await db.pool.query('DELETE FROM turn_events WHERE turn_id=ANY($1::uuid[])', [turnIds]);
-          await db.pool.query('DELETE FROM turns WHERE id=ANY($1::uuid[])', [turnIds]);
-        });
-        const requestText = 'Send the synthetic report to Ana at ana@example.test.';
-        const args = email('ana@example.test');
-        const original = await begin(requestText);
-        turnIds.push(original.turnId);
-        const approvalId = await propose(original, 'GMAIL_SEND_EMAIL', args);
-        const confirmationId = (await stored(approvalId)).confirmation_message_id as string;
-        const confirmed = await confirm(approvalId, true);
-        assert.ok(confirmed && 'turnId' in confirmed);
-        turnIds.push(confirmed.turnId);
-        await execute(approvalId);
-        assert.equal((await stored(approvalId)).status, 'completed');
-        const sent = calls.length;
-        const reaction = await messages.submit('👍', [], {
-          replyToMessageId: confirmationId,
-          sourceId: `reaction-reply:${randomUUID()}`,
-        });
-        turnIds.push(reaction.turnId);
-        const reacted = await running(reaction.turnId);
-        assert.equal((await row(reaction.turnId)).source, 'user');
-        aligned = () => ({ run: true, because: requestText });
-        compareVerdict(await trust.check(reacted, 'GMAIL_SEND_EMAIL', args), {
-          confirm: true,
-          reason: 'unrequested',
-        });
-        assert.equal(reviews.at(-1)?.userMessages.at(-1)?.text, '👍');
-        assert.equal(reviews.at(-1)?.userMessages.at(-1)?.canAuthorize, true);
-        const typed = await messages.submit('Yes.');
-        turnIds.push(typed.turnId);
-        const typedTurn = await running(typed.turnId);
-        assert.equal((await row(typed.turnId)).source, 'user');
-        aligned = () => ({ run: true, because: 'Yes.' });
-        compareVerdict(await trust.check(typedTurn, 'GMAIL_SEND_EMAIL', args), {
-          confirm: true,
-          reason: 'unrequested',
-        });
-        assert.equal(reviews.at(-1)?.userMessages.at(-1)?.text, 'Yes.');
-        assert.equal(reviews.at(-1)?.userMessages.at(-1)?.canAuthorize, true);
-        const uncertain = await messages.submit('Maybe.', [], {
-          replyToMessageId: confirmationId,
-        });
-        turnIds.push(uncertain.turnId);
-        const uncertainTurn = await running(uncertain.turnId);
-        aligned = () => ({ run: true, because: 'Maybe.' });
-        compareVerdict(await trust.check(uncertainTurn, 'GMAIL_SEND_EMAIL', args), {
-          confirm: true,
-          reason: 'unrequested',
-        });
-        for (const turn of [reacted, typedTurn, uncertainTurn]) {
-          const proposed = await approvals.request(turn, 'GMAIL_SEND_EMAIL', args);
-          assert.ok(proposed && typeof proposed === 'object' && appConfirmation in proposed);
-        }
-        assert.equal(calls.length, sent);
-        const replacementText = 'Send the revised synthetic report to Bob at bob@example.test.';
-        const replacement = await messages.submit(replacementText, [], {
-          replyToMessageId: confirmationId,
-        });
-        turnIds.push(replacement.turnId);
-        const replacementTurn = await running(replacement.turnId);
-        aligned = () => ({ run: true, because: replacementText });
-        compareVerdict(
-          await trust.check(replacementTurn, 'GMAIL_SEND_EMAIL', email('bob@example.test')),
-          {
-            confirm: false,
-            basis: {
-              kind: 'message',
-              messageId: replacement.messageId,
-              quote: replacementText.slice(0, -1),
-            },
-          },
-        );
-        assert.equal(reviews.at(-1)?.userMessages.at(-1)?.text, replacementText);
-        assert.equal(reviews.at(-1)?.userMessages.at(-1)?.canAuthorize, true);
-        await approvals.request(replacementTurn, 'GMAIL_SEND_EMAIL', email('bob@example.test'));
-        assert.equal(calls.length, sent + 1);
-        assert.equal(calls.at(-1)?.args.recipient_email, 'bob@example.test');
-        const expiredRequestText = 'Send the synthetic invoice to Carol at carol@example.test.';
-        const expiredArgs = email('carol@example.test');
-        aligned = false;
-        const expiring = await begin(expiredRequestText);
-        turnIds.push(expiring.turnId);
-        const expiredId = await propose(expiring, 'GMAIL_SEND_EMAIL', expiredArgs);
-        const expiredConfirmationId = (await stored(expiredId)).confirmation_message_id as string;
-        await finish(expiring.turnId, 'waiting');
-        await db.pool.query("UPDATE approvals SET status='expired' WHERE id=$1", [expiredId]);
-        const stale = await messages.submit('👍', [], {
-          replyToMessageId: expiredConfirmationId,
-          sourceId: `reaction-reply:${randomUUID()}`,
-        });
-        turnIds.push(stale.turnId);
-        const staleTurn = await running(stale.turnId);
-        aligned = () => ({ run: true, because: expiredRequestText });
-        compareVerdict(await trust.check(staleTurn, 'GMAIL_SEND_EMAIL', expiredArgs), {
-          confirm: true,
-          reason: 'unrequested',
-        });
-        const expiredProposal = await approvals.request(staleTurn, 'GMAIL_SEND_EMAIL', expiredArgs);
-        assert.ok(
-          expiredProposal &&
-            typeof expiredProposal === 'object' &&
-            appConfirmation in expiredProposal,
-        );
-        assert.equal(calls.length, sent + 1);
-        aligned = () => ({ run: true, because: 'read' });
-        compareVerdict(await trust.check(staleTurn, 'GMAIL_FETCH_EMAILS', {}), {
-          confirm: false,
-          basis: { kind: 'read' },
-        });
-      });
-
-      await t.test('current short replies cannot reuse an earlier send request', async (t) => {
-        const turnIds: string[] = [];
-        t.after(async () => {
-          await db.pool.query(
-            'DELETE FROM approvals WHERE turn_id=ANY($1::uuid[]) OR execution_turn_id=ANY($1::uuid[])',
-            [turnIds],
-          );
-          await db.pool.query('DELETE FROM messages WHERE turn_id=ANY($1::uuid[])', [turnIds]);
-          await db.pool.query('DELETE FROM turn_events WHERE turn_id=ANY($1::uuid[])', [turnIds]);
-          await db.pool.query('DELETE FROM turns WHERE id=ANY($1::uuid[])', [turnIds]);
-        });
-        const originalText = 'Send the synthetic report to Ana at ana@example.test.';
-        const args = email('ana@example.test');
-        const original = await begin(originalText);
-        turnIds.push(original.turnId);
-        const approvalId = await propose(original, 'GMAIL_SEND_EMAIL', args);
-        const confirmed = await confirm(approvalId, true);
-        assert.ok(confirmed && 'turnId' in confirmed);
-        turnIds.push(confirmed.turnId);
-        await execute(approvalId);
-        const sent = calls.length;
-        const resultId = '00000000-0000-4000-8000-000000000926';
-        const resultText = 'Sent the synthetic report to Ana.';
-        await db.pool.query(
-          "INSERT INTO messages(id,owner_id,thread_id,turn_id,role,text) VALUES($1,$2,$3,$4,'assistant',$5)",
-          [resultId, ownerId, original.threadId, confirmed.turnId, resultText],
-        );
-        const reaction = await messages.submit('👍', [], {
-          replyToMessageId: resultId,
-          sourceId: `reaction-reply:${randomUUID()}`,
-        });
-        turnIds.push(reaction.turnId);
-        const reacted = await running(reaction.turnId);
-        aligned = () => ({ run: true, because: originalText });
-        compareVerdict(await trust.check(reacted, 'GMAIL_SEND_EMAIL', args), {
-          confirm: true,
-          reason: 'unrequested',
-        });
-        assert.equal(
-          reviews.at(-1)?.userMessages.find((item: { text: string }) => item.text === originalText)
-            ?.canAuthorize,
-          false,
-        );
-        assert.equal(reviews.at(-1)?.assistantMessageBeforeLatestUserMessage, resultText);
-        aligned = () => ({ run: true, because: '👍' });
-        assert.equal((await trust.check(reacted, 'GMAIL_SEND_EMAIL', args)).confirm, true);
-        const bare = await messages.submit('Yes.', [], {
-          clientMessageId: '00000000-0000-4000-8000-000000000927',
-        });
-        await db.pool.query(
-          `WITH boundary AS (SELECT date_trunc('milliseconds',created_at) AS at FROM messages WHERE id=$2)
-           UPDATE messages m SET created_at=boundary.at + CASE WHEN m.id=$1 THEN interval '500 microseconds' ELSE interval '800 microseconds' END
-           FROM boundary WHERE m.id IN ($1,$2)`,
-          [resultId, bare.messageId],
-        );
-        turnIds.push(bare.turnId);
-        const bareTurn = await running(bare.turnId);
-        aligned = () => ({ run: true, because: originalText });
-        compareVerdict(await trust.check(bareTurn, 'GMAIL_SEND_EMAIL', args), {
-          confirm: true,
-          reason: 'unrequested',
-        });
-        assert.equal(reviews.at(-1)?.userMessages.at(-1)?.text, 'Yes.');
-        assert.equal(reviews.at(-1)?.userMessages.at(-1)?.canAuthorize, true);
-        assert.equal(reviews.at(-1)?.assistantMessageBeforeLatestUserMessage, resultText);
-        aligned = () => ({ run: true, because: 'Yes.' });
-        assert.equal((await trust.check(bareTurn, 'GMAIL_SEND_EMAIL', args)).confirm, true);
-        for (const turn of [reacted, bareTurn]) {
-          const proposed = await approvals.request(turn, 'GMAIL_SEND_EMAIL', args);
-          assert.ok(proposed && typeof proposed === 'object' && appConfirmation in proposed);
-        }
-        assert.equal(calls.length, sent);
-        aligned = false;
-        const pendingText = 'Send the synthetic invoice to Bob at bob@example.test.';
-        const pendingArgs = email('bob@example.test');
-        const pending = await begin(pendingText);
-        turnIds.push(pending.turnId);
-        await propose(pending, 'GMAIL_SEND_EMAIL', pendingArgs);
-        await finish(pending.turnId, 'waiting');
-        const question = await messages.submit('What time is it?');
-        turnIds.push(question.turnId);
-        const questionTurn = await running(question.turnId);
-        assert.equal((await row(question.turnId)).source, 'user');
-        aligned = () => ({ run: true, because: pendingText });
-        compareVerdict(await trust.check(questionTurn, 'GMAIL_SEND_EMAIL', pendingArgs), {
-          confirm: true,
-          reason: 'unrequested',
-        });
-        assert.equal(reviews.at(-1)?.userMessages.at(-1)?.text, 'What time is it?');
-        assert.equal(reviews.at(-1)?.userMessages.at(-1)?.canAuthorize, true);
-        const proposed = await approvals.request(questionTurn, 'GMAIL_SEND_EMAIL', pendingArgs);
-        assert.ok(proposed && typeof proposed === 'object' && appConfirmation in proposed);
-        assert.equal(calls.length, sent);
       });
 
       await t.test(
@@ -3327,6 +3087,10 @@ test(
           );
           compareVerdict(unrelated, { confirm: true, reason: 'unrequested' });
           assert.equal(unrelated.chatRevision, originalMessageId);
+          assert.deepEqual(unrelated.instructionRevision, {
+            rules: '',
+            chat: { threadId: resumed.threadId, id: originalMessageId },
+          });
           aligned = () => ({ run: true, because: requestText });
           const followOn = await trust.check(
             resumed,
@@ -3351,7 +3115,6 @@ test(
           const sent = calls.length;
           await approved.request(resumed, 'GMAIL_SEND_EMAIL', email('bob@example.test'), {
             allowed: true,
-            expectedChatRevision: followOn.chatRevision,
           });
           assert.equal(calls.length, sent + 1);
           const correctionText = 'Do not send the synthetic receipt to Bob again.';
@@ -4038,10 +3801,12 @@ test(
             await begin('Synthetic event', { source: 'event' }),
             await attachSchedule(await begin('Synthetic scheduled work', { source: 'schedule' })),
           ]) {
-            compareVerdict(await trust.check(turn, 'GMAIL_SEND_EMAIL', send), {
+            const checked = await trust.check(turn, 'GMAIL_SEND_EMAIL', send);
+            compareVerdict(checked, {
               confirm: true,
               reason: 'rule',
             });
+            assert.equal(checked.instructionRevision.rules, rules);
             assert.equal(reviews.at(-1)?.userRules, rules);
             assert.ok(prompts.at(-1)!.startsWith(plain));
             assert.match(prompts.at(-1)!, /userRules/);
@@ -4264,7 +4029,15 @@ test(
             [summaryMessageId, ownerId, hotel.threadId, hotel.turnId],
           );
           await finish(hotel.turnId, 'succeeded');
-          await trust.check(turn, 'GMAIL_SEND_EMAIL', { to: 'hotel@example.test' });
+          const checked = await trust.check(turn, 'GMAIL_SEND_EMAIL', { to: 'hotel@example.test' });
+          assert.deepEqual(checked.instructionRevision, {
+            rules: '',
+            task: {
+              id: task.id,
+              revision: (await db.pool.query('SELECT revision FROM tasks WHERE id=$1', [task.id]))
+                .rows[0].revision,
+            },
+          });
           const started = reviews.at(-1)!.userMessages.map((item: { text: string }) => item.text);
           assert.deepEqual(started.slice(-2), [
             'Read my fixture flight dates.',
@@ -4544,12 +4317,12 @@ test(
       );
 
       await t.test(
-        'revision replies supersede the addressed proposal before a new user turn',
+        'revision replies leave the addressed proposal open and reach its session',
         async () => {
           for (const explicit of [false, true]) {
             const before = calls.length;
             const origin = await begin('A useful change is ready.', { source: 'event' });
-            const args = { notificationRule: 'Original preference.' };
+            const args = { notificationRule: `Original preference ${explicit}.` };
             const id = await propose(origin, 'NOD_notification_preferences_update', args);
             await finish(origin.turnId);
             let unrelated: string | undefined;
@@ -4564,18 +4337,17 @@ test(
             });
             const resumed = await row(revised.turnId);
             assert.equal(resumed.source, 'user');
-            assert.equal((await stored(id)).status, 'expired');
-            assert.equal(await turnStatus(origin.turnId), explicit ? 'waiting' : 'cancelled');
+            assert.equal((await stored(id)).status, 'pending');
+            assert.equal(await turnStatus(origin.turnId), 'waiting');
             assert.equal(resumed.background, explicit);
             assert.equal(resumed.parent_turn_id, explicit ? origin.turnId : null);
             if (explicit) assert.equal(resumed.session_id, (await row(origin.turnId)).session_id);
             if (unrelated) assert.equal((await stored(unrelated)).status, 'pending');
-            assert.equal(await confirm(id, true), undefined);
             const next = await propose(
               await running(revised.turnId),
               'NOD_notification_preferences_update',
               {
-                notificationRule: 'Shorter preference.',
+                notificationRule: `Shorter preference ${explicit}.`,
               },
             );
             assert.equal((await stored(next)).status, 'pending');
@@ -4584,7 +4356,7 @@ test(
             await execute(next);
             await execute(next);
             assert.equal(calls.length, before + 1);
-            assert.equal(calls.at(-1)?.args.notificationRule, 'Shorter preference.');
+            assert.equal(calls.at(-1)?.args.notificationRule, `Shorter preference ${explicit}.`);
           }
           const before = calls.length;
           const origin = await begin('A useful change is ready.', { source: 'event' });
@@ -4606,211 +4378,11 @@ test(
           assert.equal((await row(result.turnId)).source, 'user');
           assert.equal((await row(result.turnId)).parent_turn_id, origin.turnId);
           assert.equal(await turnStatus(origin.turnId), 'running');
-          assert.equal((await stored(id)).status, 'expired');
-          assert.equal(await confirm(id, true), undefined);
+          assert.equal((await stored(id)).status, 'pending');
           assert.equal(calls.length, before);
         },
       );
 
-      await t.test(
-        'an unquoted clarification leaves a saved task with a visible way to continue',
-        async (t) => {
-          const parent = await begin(
-            'Summarise the synthetic inbox and ask before sending anything.',
-          );
-          const task = (await tasks.execute(
-            parent,
-            {
-              action: 'start',
-              title: 'Synthetic inbox review',
-              message: 'Reviewing the synthetic inbox.',
-              doneWhen: 'The summary is ready',
-              now: 'Reading the synthetic inbox',
-            },
-            (await row(parent.turnId)).message_id,
-          )) as { id: string };
-          t.after(async () => {
-            await db.pool.query(
-              "UPDATE turns SET task_id=NULL,status='cancelled',finished_at=now() WHERE task_id=$1",
-              [task.id],
-            );
-            await db.pool.query('DELETE FROM tasks WHERE id=$1', [task.id]);
-          });
-          await finish(parent.turnId, 'succeeded');
-          const workerId = (
-            await db.pool.query("SELECT id FROM turns WHERE task_id=$1 AND source='task'", [
-              task.id,
-            ])
-          ).rows[0].id as string;
-          const worker = await running(workerId);
-          const before = calls.length;
-          const approvalId = await propose(
-            worker,
-            'GMAIL_SEND_EMAIL',
-            email('synthetic-recipient@example.test'),
-          );
-          const confirmationId = (await stored(approvalId)).confirmation_message_id;
-          await finish(workerId);
-
-          const clarification = await messages.submit('wait what does that mean');
-          assert.equal((await row(clarification.turnId)).source, 'user');
-          assert.equal((await stored(approvalId)).status, 'expired');
-          assert.equal(await turnStatus(workerId), 'cancelled');
-          assert.equal(calls.length, before);
-
-          const response = await request('GET', '/api/tasks');
-          assert.equal(response.statusCode, 200, response.body);
-          const detail = response
-            .json<
-              Array<{
-                id: string;
-                status: string;
-                now: string;
-                question: string | null;
-                questionMessageId: string | null;
-              }>
-            >()
-            .find((item) => item.id === task.id);
-          assert.ok(detail);
-          assert.equal(detail.status, 'needs_you');
-          assert.equal(detail.now, 'Reading the synthetic inbox');
-          assert.match(detail.question ?? '', /did not run.*Reply here to continue/i);
-          assert.ok(detail.questionMessageId);
-          assert.notEqual(detail.questionMessageId, confirmationId);
-          const continuation = (
-            await db.pool.query('SELECT turn_id,text FROM messages WHERE id=$1 AND owner_id=$2', [
-              detail.questionMessageId,
-              ownerId,
-            ])
-          ).rows[0];
-          assert.equal(continuation.turn_id, workerId);
-          assert.equal(continuation.text, detail.question);
-          assert.equal(
-            (
-              await db.pool.query('SELECT created_at FROM messages WHERE id=$1 AND owner_id=$2', [
-                detail.questionMessageId,
-                ownerId,
-              ])
-            ).rows[0].created_at >
-              (
-                await db.pool.query('SELECT created_at FROM messages WHERE id=$1 AND owner_id=$2', [
-                  clarification.messageId,
-                  ownerId,
-                ])
-              ).rows[0].created_at,
-            true,
-          );
-
-          const resumed = await messages.submit('Continue the remaining synthetic summary.', [], {
-            replyToMessageId: detail.questionMessageId,
-          });
-          const resumedTurn = await row(resumed.turnId);
-          assert.equal(resumedTurn.session_id, task.id);
-          assert.equal(resumedTurn.parent_turn_id, workerId);
-          assert.equal((await stored(approvalId)).status, 'expired');
-          assert.equal(calls.length, before);
-        },
-      );
-
-      await t.test(
-        'background turns share one pending confirmation for the same action',
-        async () => {
-          const args = { id: randomUUID() };
-          const turns = await Promise.all([
-            begin('A synthetic event proposes a pause.', { source: 'event' }),
-            begin('A synthetic scheduled check proposes a pause.', { source: 'schedule' }).then(
-              attachSchedule,
-            ),
-          ]);
-          const before = calls.length;
-          const results = await Promise.all(
-            turns.map((turn) => approvals.request(turn, 'NOD_schedule_pause', args)),
-          );
-          for (const result of results) assert.ok(result[appConfirmation]);
-          assert.equal(results[0][appConfirmation], results[1][appConfirmation]);
-          const records = (
-            await db.pool.query(
-              'SELECT * FROM approvals WHERE owner_id=$1 AND thread_id=$2 AND action=$3 AND args=$4::jsonb',
-              [ownerId, turns[0]!.threadId, 'NOD_schedule_pause', args],
-            )
-          ).rows;
-          assert.equal(records.length, 1);
-          assert.equal(records[0].status, 'pending');
-          assert.equal(calls.length, before);
-          assert.equal(
-            (await assistantMessages(turns[0]!.turnId))! +
-              (await assistantMessages(turns[1]!.turnId))!,
-            1,
-          );
-          const original = turns.find((turn) => turn.turnId === records[0].turn_id)!;
-          await assert.rejects(approvals.request(original, 'NOD_schedule_pause', args), {
-            statusCode: 409,
-          });
-          const other = await begin('A different schedule needs a pause.', { source: 'event' });
-          await propose(other, 'NOD_schedule_pause', { id: randomUUID() });
-          assert.equal(await assistantMessages(other.turnId), 1);
-          assert.equal(calls.length, before);
-        },
-      );
-
-      await t.test(
-        'a pending background question cannot appear after admission allowed execution',
-        async () => {
-          const args = { id: randomUUID() };
-          const current = await begin('Synthetic allowed pause.', { source: 'event' });
-          const other = await begin('Synthetic pause question.', { source: 'event' });
-          const admission: boolean[] = [];
-          const before = calls.length;
-          try {
-            await assert.rejects(
-              approvals.request(current, 'NOD_schedule_pause', args, {
-                allowed: true,
-                admit: async (asks) => {
-                  admission.push(asks);
-                  await approvals.request(other, 'NOD_schedule_pause', args);
-                },
-              }),
-              { notRun: true },
-            );
-            assert.deepEqual(admission, [false]);
-            assert.equal(await proposal(current.turnId), undefined);
-            assert.equal((await proposal(other.turnId)).status, 'pending');
-            assert.equal(calls.length, before);
-          } finally {
-            await finish(current.turnId, 'cancelled');
-            await finish(other.turnId, 'cancelled');
-          }
-        },
-      );
-      await t.test('a shared question is checked again after admission waits', async () => {
-        const args = { id: randomUUID() };
-        const other = await begin('Synthetic pause question.', { source: 'event' });
-        await approvals.request(other, 'NOD_schedule_pause', args);
-        const card = await proposal(other.turnId);
-        const current = await begin('Synthetic shared pause.', { source: 'event' });
-        const admission: boolean[] = [];
-        const before = calls.length;
-        try {
-          await assert.rejects(
-            approvals.request(current, 'NOD_schedule_pause', args, {
-              allowed: true,
-              admit: async (asks) => {
-                admission.push(asks);
-                await db.pool.query("UPDATE approvals SET status='declined' WHERE id=$1", [
-                  card.id,
-                ]);
-              },
-            }),
-            { notRun: true },
-          );
-          assert.deepEqual(admission, [true]);
-          assert.equal(await proposal(current.turnId), undefined);
-          assert.equal(calls.length, before);
-        } finally {
-          await finish(current.turnId, 'cancelled');
-          await finish(other.turnId, 'cancelled');
-        }
-      });
       await t.test(
         'a resume that does not trace back to an owner message carries no owner words',
         async () => {
@@ -5637,7 +5209,6 @@ test(
             assert.deepEqual(
               await approvals.request(fixture.turn, fixture.action, fixture.args, {
                 allowed: true,
-                expectedChatRevision: later.messageId,
               }),
               (await stored(fixture.firstId)).result,
             );

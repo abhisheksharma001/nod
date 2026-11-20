@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { App } from './app';
 import { AppRoot } from './components/app-boundary';
 import { initializeTheme } from './lib/theme';
+import { initializeDesktopFullScreen } from './lib/desktop';
 import { initializeFocusVisibility } from './lib/focus';
 import { configureAnalytics } from './lib/analytics-client';
 import { claimAccess, sessionStore } from './lib/session';
@@ -65,6 +66,7 @@ import './components/action-menu.css';
 import './components/tooltip.css';
 
 initializeTheme();
+initializeDesktopFullScreen();
 initializeFocusVisibility();
 window.addEventListener('error', (event) =>
   recordFeedbackError('error', event.error ?? event.message),

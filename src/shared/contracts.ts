@@ -91,6 +91,7 @@ export interface Activity {
   received?: true;
   background?: true;
   runId?: string;
+  scheduleId?: string;
   recent?: Array<{ id: string; summary: string; site: string | null }>;
 }
 export interface VaultLoginEntry {
@@ -219,6 +220,7 @@ export interface PasswordManagerLogin {
 }
 export interface Connection {
   canReconnect?: boolean;
+  canRename?: boolean;
   reconnectRequired?: boolean;
   disconnectPending?: boolean;
   slug: string;

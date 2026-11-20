@@ -220,7 +220,15 @@ Select **Report bug** in the chat. When something in Nod itself fails, Nod also 
 
 If the workspace crashes, use **Report bug** on the error screen before **Reload Nod** to include the captured error.
 
-In the desktop app, if Nod's background service or its window stops, Nod shows its error screen. Select **Report bug** there: Nod restarts and opens the report as soon as it's back, with the crash in the diagnostic report. If Nod can't restart, select **Show startup log** and send it with a screenshot of the error.
+In the desktop app, if Nod's background service or its window stops, Nod shows its error screen. Select **Report bug** there. A separate report form opens without restarting the failed service. The menu bar **Report bug…** entry opens the same form while startup has failed.
+
+Describe the failure, then select **Review**. The startup report contains only fixed startup states, error classes and codes, versions, counts and event ages. Nod omits startup prose, log text, paths, URLs, account details and message content. It keeps up to 100 technical events and 48 KB in memory. It does not read a log file or earlier disk history for the report. Unknown fields are omitted. Error codes come from structured error fields, never from a message. Your description stays exactly as you wrote it. Review the exact attachment, then select **Send report**. You can untick **Include startup report** to send only your description. Keep the form open until you send it; the startup form does not save an unsent draft.
+
+If the send result is unknown, select **Check status** while the startup form is open. An unknown or rejected result shows the collector's HTTP status when it is available. The code alone does not confirm delivery. If Nod restarts into the startup error screen, reopen **Report bug** to check the saved submission instead of sending it again. **Show startup log** still opens the local log when you need it.
+
+If the description was sent without its diagnostic report, select **Send the report again** to add the same reviewed attachment to the same report. This option needs the original bytes, which the helper keeps for up to one hour. After a restart, those bytes are gone. Check the saved status or start a new report; Nod does not rebuild an attachment under the old submission reference.
+
+If Nod cannot read the saved submission status, select **Retry saved status**. Nod keeps sending blocked while that status is unknown. For a corrupt regular file, **Start a new report** warns that the previous report may already have been sent and a new one can be a duplicate. Nod first saves the original bytes in a local `startup-feedback-recovered-*.bin` file. If it cannot preserve them, sending stays blocked. After recovery, review the new report and select **Send report** yourself.
 
 Choose a feedback category and describe what happened. Include what you expected, what actually happened, and the steps that trigger the problem. **Include diagnostic report** starts selected for every category until you change it. Nod remembers your choice for your account on this device after sending or discarding a draft.
 

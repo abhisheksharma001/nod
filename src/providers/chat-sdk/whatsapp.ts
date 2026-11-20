@@ -25,7 +25,7 @@ import type {
 } from '../../ports/messaging.ts';
 import type { ChannelLinkStatus } from '../../shared/contracts.ts';
 import { contactAttachment, locationAttachment } from './content.ts';
-import { whatsappText } from './format.ts';
+import { canDeliverWhatsAppLiteral, whatsappText } from './format.ts';
 import { contactCards, sharedLocation } from '../../shared/channel-content.ts';
 
 const silent: SocketConfig['logger'] = {
@@ -665,6 +665,9 @@ export function createWhatsAppLinkedTransport(options: {
       throw new Error('The WhatsApp target is unavailable.');
   };
   return {
+    canDeliverLiteral({ channelId, text, literal }) {
+      return channelId === 'whatsapp' && canDeliverWhatsAppLiteral(text, literal);
+    },
     get channels() {
       return [channel];
     },
