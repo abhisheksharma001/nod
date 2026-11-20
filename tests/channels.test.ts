@@ -1518,6 +1518,98 @@ test(
   },
 );
 
+test('Telegram voice, contact and location replies still send when the message they answer is gone', async () => {
+  const delivered: string[] = [];
+  let nextId = 500;
+  const empty = { rows: [], rowCount: 0 };
+  const pool = {
+    query: async () => empty,
+    connect: async () => ({ query: async () => empty, release() {} }),
+    on() {},
+    end: async () => {},
+  } as unknown as pg.Pool;
+  const fakeFetch: typeof fetch = async (input, init) => {
+    const method = String(input).split('/').at(-1)!;
+    const body = init?.body;
+    const raw =
+      body instanceof FormData
+        ? body.get('reply_parameters')
+        : body
+          ? JSON.parse(String(body)).reply_parameters
+          : undefined;
+    const reply = (typeof raw === 'string' ? JSON.parse(raw) : raw) as
+      { message_id: number; allow_sending_without_reply?: boolean } | undefined;
+    if (reply?.message_id === 41 && !reply.allow_sending_without_reply)
+      return Response.json(
+        { ok: false, error_code: 400, description: 'Bad Request: message to be replied not found' },
+        { status: 400 },
+      );
+    if (method !== 'getMe') delivered.push(method);
+    return Response.json({
+      ok: true,
+      result: { message_id: ++nextId, date: 1, chat: { id: 123456, type: 'private' } },
+    });
+  };
+  const transport = createChatSdkTransport(pool, fixtureEnv, { fetch: fakeFetch });
+  const attachment = (name: string, mimeType: string, text: string) => {
+    const bytes = Buffer.from(text);
+    return { name, mimeType, size: bytes.length, read: async () => new Uint8Array(bytes) };
+  };
+  const send = (text: string, ...attachments: ReturnType<typeof attachment>[]) =>
+    transport.post({
+      channelId: 'telegram',
+      accountId: '987',
+      threadId: 'telegram:123456',
+      replyToMessageId: '123456:41',
+      text,
+      attachments,
+    });
+  const original = globalThis.fetch;
+  globalThis.fetch = fakeFetch;
+  try {
+    for (const [text, file] of [
+      ['hello'],
+      ['', attachment('reply.ogg', 'audio/ogg', 'OggS synthetic voice')],
+      [
+        '',
+        attachment(
+          'contact.vcf',
+          'text/vcard',
+          'BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Synthetic Contact\r\nTEL:+34600000000\r\nEND:VCARD',
+        ),
+      ],
+      [
+        '',
+        attachment(
+          'location.json',
+          'application/json',
+          JSON.stringify({ latitude: 41.4, longitude: 2.17 }),
+        ),
+      ],
+      [
+        '',
+        attachment(
+          'location.json',
+          'application/json',
+          JSON.stringify({ latitude: 41.4, longitude: 2.17, name: 'Synthetic park' }),
+        ),
+      ],
+    ] as const) {
+      const sent = await send(text, ...(file ? [file] : []));
+      assert.equal(sent.id, `123456:${nextId}`);
+    }
+  } finally {
+    globalThis.fetch = original;
+  }
+  assert.deepEqual(delivered, [
+    'sendMessage',
+    'sendVoice',
+    'sendContact',
+    'sendLocation',
+    'sendVenue',
+  ]);
+});
+
 test('WhatsApp bot mode accepts a confirmed private ID when mapping lookups miss', async (t) => {
   type Factory = NonNullable<Parameters<typeof createWhatsAppLinkedTransport>[0]['createSocket']>;
   const events = new EventEmitter();
@@ -2172,6 +2264,70 @@ test('Telegram refusing a file still delivers the reply and passes on its reason
   } finally {
     globalThis.fetch = original;
   }
+});
+
+test('WhatsApp Cloud API never posts an empty text body before a file or a failed-file notice', async (t) => {
+  const png = Buffer.from('89504e470d0a1a0a', 'hex');
+  const bodies: { type: string; text?: { body: string } }[] = [];
+  t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (!String(input).startsWith('https://graph.facebook.com/'))
+      throw new Error('Unexpected fixture provider call.');
+    if (String(input).endsWith('/media')) return Response.json({ id: 'fixture-media' });
+    bodies.push(JSON.parse(String(init?.body)));
+    return Response.json({ messages: [{ id: `wamid.fixture-${bodies.length}` }] });
+  });
+  const idle = { rows: [], rowCount: 0 };
+  const pool = {
+    query: async () => idle,
+    connect: async () => ({ query: async () => idle, release() {} }),
+    on() {},
+    end: async () => {},
+  } as unknown as pg.Pool;
+  const transport = createChatSdkTransport(pool, fixtureEnv);
+  const target = {
+    channelId: 'whatsapp',
+    accountId: '555000',
+    threadId: 'whatsapp:555000:351910000000',
+  };
+  const image = {
+    name: 'chart.png',
+    mimeType: 'image/png',
+    size: png.length,
+    read: async () => new Uint8Array(png),
+  };
+  const recording = {
+    name: 'reply.wav',
+    mimeType: 'audio/wav',
+    size: 10,
+    read: async () => new Uint8Array(10),
+  };
+  await transport.post({ ...target, text: '', attachments: [image] });
+  assert.deepEqual(
+    bodies.map((body) => body.type),
+    ['image'],
+  );
+  bodies.length = 0;
+  await assert.rejects(
+    transport.post({
+      ...target,
+      text: '',
+      attachments: [recording],
+      attachmentFailure: async () => undefined,
+    }),
+    /Channel delivery was not confirmed/,
+  );
+  assert.equal(bodies.length, 0);
+  bodies.length = 0;
+  await transport.post({
+    ...target,
+    text: '',
+    attachments: [recording],
+    attachmentFailure: async () => 'The file is in Nod.',
+  });
+  assert.deepEqual(
+    bodies.map((body) => body.text?.body),
+    ['The file is in Nod.'],
+  );
 });
 
 test('Telegram downloads stop at 20 MB whatever size the sender, Bot API or file server reports', async () => {

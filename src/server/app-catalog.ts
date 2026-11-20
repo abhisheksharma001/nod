@@ -314,7 +314,11 @@ export function loadAppCatalog(directory = fileURLToPath(new URL('../apps/', imp
       ...(icon ? { icon } : {}),
       ...(skills ? { skills } : {}),
     };
-    if (!definition.instancePath) appAccessSchema.parse(appAccessPath(definition));
+    if (!definition.instancePath) {
+      const access = appAccessSchema.safeParse(appAccessPath(definition));
+      if (!access.success)
+        throw new Error(`App ${entry.name}: invalid connection: ${access.error.message}`);
+    }
     result.set(manifest.name, definition);
   }
   return result;

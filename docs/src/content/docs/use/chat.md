@@ -15,7 +15,7 @@ Nod follows your latest clear message's language, spoken or typed, including que
 
 ## Send a message
 
-Type in the message box and press Enter. Press Shift+Enter for a new line.
+Type in the message box and press Enter. Press Shift+Enter for a new line. On a phone, or a tablet without a trackpad, Return adds a new line, and the send button sends. On an iPad with a keyboard, Command+Return also sends.
 
 Pasted text stays literal by default. Nod uses the clipboard's plain text even when the source also offers formatting. Line breaks, indentation and Markdown-looking characters such as `*priority*`, `# call` and `<u>text</u>` stay as written in the composer, the sent message and Nod's request. If plain text in the same paragraph would change it, such as a `!` before a link or a `*` that pairs with italic text, the sent message adds backslashes: before that `!`, or before every `*`, `_`, `~` and backtick in the paragraph's plain text. A web or email address typed directly against formatting is sent as a link, such as `<https://example.com>`. An unsent pasted draft keeps them after a reload.
 

@@ -124,11 +124,21 @@ export const appOAuthMetadataSchema = z.strictObject({
 });
 export type AppOAuthMetadata = z.output<typeof appOAuthMetadataSchema>;
 
+export const appScopeMaxLength = 500;
+const oauthScopes = z
+  .array(text(100))
+  .max(30)
+  .refine(
+    (scopes) => scopes.join(' ').length <= appScopeMaxLength,
+    `Keep the scopes to ${appScopeMaxLength} characters or fewer when joined with spaces.`,
+  )
+  .optional();
+
 export const appConnectionSchema = z.union([
   z.strictObject({
     ...fixedServer,
     authentication: z.tuple([z.literal('oauth2')]),
-    scopes: z.array(text(100)).max(30).optional(),
+    scopes: oauthScopes,
   }),
   z.strictObject({
     ...fixedServer,
@@ -148,7 +158,7 @@ export const appConnectionSchema = z.union([
     type: z.literal('http'),
     url: httpsUrl,
     authentication: z.tuple([z.literal('oauth2')]),
-    scopes: z.array(text(100)).max(30).optional(),
+    scopes: oauthScopes,
     oauth: appOAuthMetadataSchema.optional(),
     clientIdRequired: z.boolean().optional(),
     hints: hints('clientId'),

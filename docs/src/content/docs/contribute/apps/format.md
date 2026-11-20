@@ -84,7 +84,7 @@ Select one named server from `mcp.json`:
 }
 ```
 
-The `scopes` field is optional and is valid only with `oauth2`. Fixed connections select one authentication method: `oauth2`, `bearer`, or `x-api-key`. Nod sends API keys in `X-API-Key`.
+The `scopes` field is optional and is valid only with `oauth2`. Its limits are under [OAuth scopes](#oauth-scopes). Fixed connections select one authentication method: `oauth2`, `bearer`, or `x-api-key`. Nod sends API keys in `X-API-Key`.
 
 `mcp.json` must target the matching Agent Plugins schema version. It must contain exactly one server, named as in the connection's `server` field, with `type: "streamable-http"`. Its address must be public HTTPS without credentials, a query, or a fragment. DNS and network checks also run when Nod connects.
 
@@ -120,6 +120,10 @@ API and CLI folders omit `mcp.json`. Unknown fields, extra transports, app-folde
 Fixed server addresses and CLI download addresses must use public HTTPS on port 80 or 443. OAuth endpoints use port 443. Owner-supplied n8n instance addresses follow the separate instance policy.
 
 See the complete [API and CLI examples](/contribute/apps/api-and-cli/).
+
+## OAuth scopes
+
+Fixed MCP and HTTP API connections that use `oauth2` share the same `scopes` limits: up to 30 scopes of up to 100 characters each, and at most 500 characters when joined with spaces. Editors don't check the joined length; `pnpm check:apps` does.
 
 ## Connect form hints
 

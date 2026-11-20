@@ -13865,6 +13865,136 @@ test(
   },
 );
 
+test('transaction runs afterRollback callbacks when aborted before commit', async () => {
+  const { afterCommit, afterRollback, transaction } = await import('../src/server/transaction.ts');
+  const controller = new AbortController();
+  const reason = new Error('cancelled');
+  const released: Array<boolean | undefined> = [];
+  const client = {
+    async query(_sql: string) {
+      return { rows: [] };
+    },
+    release(destroy?: boolean) {
+      released.push(destroy);
+    },
+  };
+  const database = {
+    async connect() {
+      return client;
+    },
+  } as unknown as pg.Pool;
+  let rolledBack = 0;
+  let committed = 0;
+  await assert.rejects(
+    transaction(
+      async (tx) => {
+        afterRollback(tx, () => {
+          rolledBack++;
+        });
+        afterCommit(tx, () => {
+          committed++;
+        });
+        controller.abort(reason);
+      },
+      database,
+      controller.signal,
+    ),
+    (error) => error === reason,
+  );
+  assert.equal(rolledBack, 1);
+  assert.equal(committed, 0);
+  assert.deepEqual(released, [true]);
+
+  const afterCommitController = new AbortController();
+  const releasedAfterCommit: Array<boolean | undefined> = [];
+  const commitClient = {
+    async query(_sql: string) {
+      return { rows: [] };
+    },
+    release(destroy?: boolean) {
+      releasedAfterCommit.push(destroy);
+    },
+  };
+  let postCommitRollbacks = 0;
+  await transaction(
+    async (tx) => {
+      afterRollback(tx, () => {
+        postCommitRollbacks++;
+      });
+      afterCommit(tx, () => {
+        afterCommitController.abort(reason);
+      });
+    },
+    {
+      async connect() {
+        return commitClient;
+      },
+    } as unknown as pg.Pool,
+    afterCommitController.signal,
+  );
+  assert.equal(postCommitRollbacks, 0);
+  assert.deepEqual(releasedAfterCommit, [undefined]);
+});
+
+test(
+  'a transaction stopped while its commit is pending does not run its rollback callbacks',
+  { skip: !process.env.TEST_DATABASE_URL, timeout: 30_000 },
+  async (t) => {
+    const { afterRollback, transaction } = await import('../src/server/transaction.ts');
+    const schema = `test_commit_stop_${randomUUID().replaceAll('-', '')}`;
+    const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    const pool = new pg.Pool({
+      connectionString: process.env.TEST_DATABASE_URL,
+      options: `-c search_path=${schema}`,
+    });
+    let pid = 0;
+    t.after(async () => {
+      await pool.end();
+      if (pid) await admin.query('SELECT pg_terminate_backend($1)', [pid]);
+      await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+      await admin.end();
+    });
+    await pool.query(`
+      CREATE TABLE held(id int);
+      CREATE FUNCTION hold_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN PERFORM pg_sleep(20); RETURN NULL; END $$;
+      CREATE CONSTRAINT TRIGGER hold_commit AFTER INSERT ON held
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION hold_commit();
+    `);
+    const controller = new AbortController();
+    let rolledBack = 0;
+    const pending = transaction(
+      async (client) => {
+        pid = (await client.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+        await client.query('INSERT INTO held VALUES (1)');
+        afterRollback(client, () => {
+          rolledBack++;
+        });
+      },
+      pool,
+      controller.signal,
+    );
+    const rejected = assert.rejects(pending);
+    let committing = false;
+    for (const deadline = Date.now() + 10_000; !committing && Date.now() < deadline;) {
+      committing = Boolean(
+        (
+          await admin.query(
+            "SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND state='active' AND query='COMMIT'",
+            [pid],
+          )
+        ).rowCount,
+      );
+      if (!committing) await delay(10);
+    }
+    assert.ok(committing);
+    controller.abort(new Error('Synthetic Stop'));
+    await rejected;
+    assert.equal(rolledBack, 0);
+  },
+);
+
 test('a first task stays open after its chat turn ends and follows its own saved task', () => {
   const messages = [
     { id: 'old-request', role: 'user' as const, text: 'Draft the reply', turnId: 'old-turn' },
