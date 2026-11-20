@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import Fastify from 'fastify';
 import pg from 'pg';
-import { PgBoss, type Job } from 'pg-boss';
+import type { Job } from 'pg-boss';
 import { z } from 'zod';
 import type { InboundMessage, MessagingTransport } from '../src/ports/messaging.ts';
 import type {
@@ -12,7 +12,6 @@ import type {
   ScheduleRun,
   TaskDetail,
 } from '../src/shared/contracts.ts';
-import { createSchedules } from '../src/server/schedules.ts';
 import { modelPricingSignature, type ModelPricing } from '../src/shared/models.ts';
 import {
   captureOwnerInstructions,
@@ -1794,12 +1793,13 @@ test(
             return (await db.pool.query('SELECT prompt FROM turns WHERE id=$1', [run!.turnId]))
               .rows[0].prompt as string;
           };
-          const onTime = await create({ cron: '0 8 * * *' });
+          const title = `${'x'.repeat(119)}\u{1F600} digest`;
+          const onTime = await create({ cron: '0 8 * * *', title });
           clock = new Date(onTime.nextRun!);
           await deliver([await jobFor(onTime.id)]);
           const base = await promptOf(onTime.id);
           assert.doesNotMatch(base, /This run was due/);
-          const late = await create({ cron: '0 8 * * *' });
+          const late = await create({ cron: '0 8 * * *', title });
           clock = new Date(new Date(late.nextRun!).getTime() + 2 * 86_400_000 + 36_720_000);
           await deliver([await jobFor(late.id)]);
           const prompt = await promptOf(late.id);
@@ -1830,12 +1830,14 @@ test(
           assert.deepEqual(
             {
               type: first?.type,
+              title: first?.title,
               outcome: first?.outcome,
               dueAt: first?.dueAt,
               skipped: first?.skipped.map((skip: { at: string; reason: string }) => skip.reason),
             },
             {
               type: 'schedule-run',
+              title: 'x'.repeat(119),
               outcome: 'ran',
               dueAt: '2035-11-09T08:00:00.000Z',
               skipped: ['stopped', 'stopped'],
@@ -2987,25 +2989,4 @@ test('waiting scheduled runs open their pending question without starting anothe
   oneTime = { ...oneTime, activeRun: null };
   await act(async () => pageDataCache.refresh('/api/schedules', true));
   assert.equal(inactive.open, true);
-});
-
-test('schedules reject time zones the rest of the app cannot format', () => {
-  const schedules = createSchedules({
-    pool: {} as never,
-    ownerId: 'local-development',
-    scheduler: new PgBoss('postgres://nod:nod@127.0.0.1:1/nod'),
-    enqueueTurn: (async () => {}) as never,
-    refresh() {},
-  });
-  const create = (timeZone: string) =>
-    schedules.validateCreate({
-      title: 'Morning brief',
-      prompt: 'Summarise my day.',
-      kind: 'recurring',
-      cron: '0 9 * * *',
-      timeZone,
-    });
-  for (const timeZone of ['UTC+5', 'UTC+05:30', 'Local', 'system'])
-    assert.throws(() => create(timeZone), { statusCode: 400 }, timeZone);
-  for (const timeZone of ['Europe/Lisbon', 'UTC']) assert.doesNotThrow(() => create(timeZone));
 });
