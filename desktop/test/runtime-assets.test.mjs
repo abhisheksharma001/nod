@@ -2165,7 +2165,7 @@ test('bundle copy includes explicit release assets under .local while excluding 
   ]);
 });
 
-test('engine source includes its own documentation without site dependencies or media', async (t) => {
+test('engine source includes startup reporting and documentation without site dependencies or media', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'nod-engine-docs-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const source = join(root, 'source');
@@ -2173,6 +2173,9 @@ test('engine source includes its own documentation without site dependencies or 
   const page = 'docs/src/content/docs/trust/privacy.md';
   for (const path of [
     'src/server/index.ts',
+    'src/shared/environment-secrets.mjs',
+    'src/shared/literal-masks.mjs',
+    'src/shared/startup-feedback-facts.mjs',
     page,
     'docs/package.json',
     'docs/src/assets/fixture.png',
@@ -2180,6 +2183,7 @@ test('engine source includes its own documentation without site dependencies or 
     'LICENSE',
     'NOTICE',
     'desktop/main/engine.mjs',
+    'desktop/main/feedback.mjs',
     'desktop/main/system-certificates.mjs',
     'desktop/main/onepassword.mjs',
     'desktop/runtime/index.mjs',
@@ -2199,6 +2203,13 @@ test('engine source includes its own documentation without site dependencies or 
     await readFile(join(target, 'desktop/main/system-certificates.mjs'), 'utf8'),
     'Synthetic engine fixture',
   );
+  for (const path of [
+    'desktop/main/feedback.mjs',
+    'src/shared/environment-secrets.mjs',
+    'src/shared/literal-masks.mjs',
+    'src/shared/startup-feedback-facts.mjs',
+  ])
+    assert.equal(await readFile(join(target, path), 'utf8'), 'Synthetic engine fixture');
   await assert.rejects(access(join(target, 'docs/package.json')));
   await assert.rejects(access(join(target, 'docs/src/assets/fixture.png')));
 });
@@ -2210,6 +2221,7 @@ test('engine source imports only production dependencies outside the development
   const allowed = new Set([...Object.keys(manifest.dependencies), ...builtinModules]);
   const files = [
     join(repository, 'desktop/main/engine.mjs'),
+    join(repository, 'desktop/main/feedback.mjs'),
     join(repository, 'desktop/main/system-certificates.mjs'),
     join(repository, 'desktop/main/onepassword.mjs'),
   ];
