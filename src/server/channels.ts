@@ -1444,7 +1444,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
           ...(attachments
             ? {
                 attachments,
-                attachmentFailure: async (names: string[]) => {
+                attachmentFailure: async (files: { name: string; reason?: string }[]) => {
                   const notice = await presentChannelText(
                     row.message_thread_id,
                     {
@@ -1452,7 +1452,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
                       text: '',
                       attachments: 'in_nod',
                       secureAction: false,
-                      files: names.map((name) => channelText(name).text),
+                      files: files.map(({ name }) => channelText(name).text),
                     },
                     options.present,
                   );
@@ -1463,7 +1463,12 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
                     !permitted(row)
                   )
                     return undefined;
-                  return notice;
+                  return [
+                    notice,
+                    ...files.flatMap(({ name, reason }) =>
+                      reason ? [channelText(`${name}: ${reason}`).text] : [],
+                    ),
+                  ].join('\n\n');
                 },
               }
             : {}),

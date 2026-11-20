@@ -3735,6 +3735,7 @@ test(
     const texts: string[] = [];
     const native: { method: string; data: Record<string, unknown> }[] = [];
     let failDocument = false;
+    let refuseDocument = false;
     t.mock.method(
       globalThis,
       'fetch',
@@ -3775,6 +3776,11 @@ test(
           body.get('photo') ?? body.get('document') ?? body.get('video') ?? body.get('voice');
         assert.ok(media instanceof File);
         const method = target.split('/').at(-1)!;
+        if (method === 'sendDocument' && refuseDocument)
+          return Response.json(
+            { ok: false, error_code: 400, description: 'Bad Request: fixture refusal' },
+            { status: 400 },
+          );
         sent.push({
           method,
           file: new Uint8Array(await media.arrayBuffer()),
@@ -4106,6 +4112,14 @@ test(
       assert.deepEqual(await state(foreign), { state: 'sent', reason: null });
       assert.equal(sent.length, failedCount);
       await pool.query('UPDATE artifacts SET owner_id=$2 WHERE id=$1', [image.id, ownerId]);
+      refuseDocument = true;
+      const refused = await addReply(turnId, [document], 'Document result');
+      const beforeRefused = texts.length;
+      await channels.drain();
+      assert.deepEqual(await state(refused), { state: 'sent', reason: null });
+      assert.equal(texts.length, beforeRefused + 2);
+      assert.match(texts.at(-1)!, /\n\nresult\.txt: Bad Request: fixture refusal$/);
+      refuseDocument = false;
 
       const outside = join(dataRoot, `media-fixture-${randomUUID()}`);
       filePaths.push(outside);

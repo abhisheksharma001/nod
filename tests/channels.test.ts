@@ -1253,7 +1253,7 @@ test(
                 ],
                 async attachmentFailure(names) {
                   notices++;
-                  assert.deepEqual(names, [file.name]);
+                  assert.deepEqual(names, [{ name: file.name }]);
                   return `The file ${file.name} is available in Nod.`;
                 },
               });
@@ -1292,7 +1292,7 @@ test(
                 attachment('available.png', 'image/png', 'available image'),
               ],
               async attachmentFailure(names) {
-                assert.deepEqual(names, ['missing.png']);
+                assert.deepEqual(names, [{ name: 'missing.png' }]);
                 return 'The missing.png file is available in Nod.';
               },
             });
@@ -2066,7 +2066,7 @@ test('Telegram media keeps native replies and checks the sender before any downl
   assert.equal(requests.length, 0);
 });
 
-test('Telegram refusing a file with a 400 still delivers the reply and names the file, while an unclear failure stays unconfirmed', async () => {
+test('Telegram refusing a file still delivers the reply and passes on its reason, while an unclear failure stays unconfirmed', async () => {
   const sent: { method: string; text?: string }[] = [];
   let failure: { method: string; status: number } | undefined;
   const respond = async (input: string | URL | Request, init?: RequestInit) => {
@@ -2109,10 +2109,10 @@ test('Telegram refusing a file with a 400 still delivers the reply and names the
       ['sendContact', file('contact.vcf', 'text/vcard', contact)],
     ] as const;
     for (const [method, attachment] of cases) {
-      for (const status of [400, 502]) {
+      for (const status of [400, 401, 403, 429, 502]) {
         failure = { method, status };
         sent.length = 0;
-        const notices: string[][] = [];
+        const notices: { name: string; reason?: string }[][] = [];
         const post = transport.post({
           channelId: 'telegram',
           accountId: '987',
@@ -2121,7 +2121,7 @@ test('Telegram refusing a file with a 400 still delivers the reply and names the
           attachments: [attachment],
           async attachmentFailure(names) {
             notices.push(names);
-            return `The file ${names[0]} is in Nod.`;
+            return `The file ${names[0].name} is in Nod.`;
           },
         });
         if (status === 400) {
@@ -2135,7 +2135,11 @@ test('Telegram refusing a file with a 400 still delivers the reply and names the
             messages.some((call) => call.text?.includes('is in Nod')),
             method,
           );
-          assert.deepEqual(notices, [[attachment.name]], method);
+          assert.deepEqual(
+            notices,
+            [[{ name: attachment.name, reason: 'Bad Request: fixture refusal' }]],
+            method,
+          );
           assert.equal(result.ids?.length, messages.length, method);
         } else {
           await assert.rejects(post, /delivery was not confirmed/, method);
