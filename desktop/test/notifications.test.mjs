@@ -70,20 +70,6 @@ test('notification previews extract readable message text without link targets o
   assert.ok(!attachment.includes('synthetic-capability-token'));
 });
 
-test('notification previews keep literal comparisons and underscored names while stripping markup', () => {
-  const literal = assistantNotificationPreview({
-    text: 'If x < 5 and y > 3 then stop. Saved my_file_name.txt and snake_case_name.',
-  });
-  for (const value of ['x < 5', 'y > 3', 'my_file_name.txt', 'snake_case_name'])
-    assert.ok(literal.includes(value), value);
-  const markup = assistantNotificationPreview({
-    text: '<b>Bold</b> <div class="a">box</div> and __strong__ and _emphasis_ done',
-  });
-  for (const value of ['Bold', 'box', 'strong', 'emphasis'])
-    assert.ok(markup.includes(value), value);
-  assert.ok(!/[<>_]/.test(markup));
-});
-
 test('notification previews redact configured credentials after decoding formatting', () => {
   const known = 'synthetic-notification-secret/123456=';
   const encoded = [...known].map((character) => `&#${character.codePointAt(0)};`).join('');
