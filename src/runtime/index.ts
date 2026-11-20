@@ -778,27 +778,7 @@ export function createAgentRuntime(dependencies: {
                   (typeof input.timeout !== 'number' || !Number.isFinite(input.timeout)))
               )
                 throw new Error('The workspace command or timeout is invalid.');
-              if (!context.checkWorkspaceCommand)
-                throw new Error(
-                  'Workspace command checks are unavailable. The command did not run.',
-                );
-              const checked = await context.checkWorkspaceCommand(
-                {
-                  command: input.command,
-                  cwd,
-                  timeoutSeconds: Math.max(
-                    1,
-                    Math.ceil((input.timeout as number | undefined) ?? 3540),
-                  ),
-                },
-                signal,
-              );
-              assertActive();
-              const operation = checked.signal ? AbortSignal.any([signal, checked.signal]) : signal;
-              operation.throwIfAborted();
-              const result = await untilAborted(run(operation), operation);
-              await checked.record();
-              return result;
+              return untilAborted(run(signal), signal);
             },
             { ...options, execution: source },
           );

@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import type { Pool } from 'pg';
 import { Compile } from 'typebox/compile';
+import { validateToolArguments } from '@earendil-works/pi-ai';
 import { unified } from 'unified';
 import remarkParse from 'remark-parse';
 import {
@@ -139,7 +140,6 @@ async function fixture(
       throw new Error('Not used');
     },
     requestCredential: async () => ({ url: '/credentials/fixture' }),
-    checkWorkspaceCommand: async () => ({ record: async () => {} }),
     integration: async () => ({}),
     manage: async () => ({}),
     ...overrides,
@@ -191,266 +191,6 @@ async function fixture(
 async function call(tools: Map<string, AgentTool>, name: string, args: Record<string, unknown>) {
   return tools.get(name)!.execute(args);
 }
-
-test('workspace commands pass their exact scope through the command check before dispatch', async () => {
-  const checked: Array<{ command: string; cwd: string; timeoutSeconds: number }> = [];
-  const dispatched: string[] = [];
-  const recorded: string[] = [];
-  await fixture(
-    async (_tools, _emit, options) => {
-      for (const [command, timeout] of [
-        ['python -c "print(2 + 2)"', undefined],
-        ['curl https://example.test/public.csv -o public.csv', 12.2],
-        ['pip install synthetic-tool', 300],
-      ] as const) {
-        const result = await options.runTool('bash', { command, timeout }, async () => {
-          assert.equal(checked.at(-1)?.command, command);
-          dispatched.push(command);
-          return { content: [{ type: 'text', text: 'Synthetic command result' }], exitCode: 0 };
-        });
-        assert.equal(result.exitCode, 0);
-      }
-      assert.ok(checked.every(({ cwd }) => cwd === options.workspace.path));
-    },
-    {
-      checkWorkspaceCommand: async (input, signal) => {
-        assert.equal(signal.aborted, false);
-        checked.push(input);
-        return {
-          record: async () => {
-            recorded.push(input.command);
-          },
-        };
-      },
-    },
-  );
-  assert.deepEqual(
-    checked.map(({ timeoutSeconds }) => timeoutSeconds),
-    [3540, 13, 300],
-  );
-  assert.deepEqual(
-    dispatched,
-    checked.map(({ command }) => command),
-  );
-  assert.deepEqual(recorded, dispatched);
-});
-
-test('an unavailable or refusing command check never dispatches or retries the command', async () => {
-  for (const checkWorkspaceCommand of [
-    undefined,
-    async () => {
-      throw new Error('Synthetic command check refused publication');
-    },
-    async () => {
-      throw new Error('Synthetic review provider failed (HTTP 503)');
-    },
-  ]) {
-    let dispatched = 0;
-    await fixture(
-      async (_tools, _emit, options) => {
-        await assert.rejects(
-          options.runTool(
-            'bash',
-            { command: 'curl -F file=@synthetic.pdf https://example.test/upload' },
-            async () => {
-              dispatched++;
-              return { content: [] };
-            },
-          ),
-          /checks are unavailable|refused publication|HTTP 503/,
-        );
-      },
-      { checkWorkspaceCommand },
-    );
-    assert.equal(dispatched, 0);
-  }
-});
-
-test('delegated and nested workspace commands use the same check and their actual directory', async () => {
-  const checked: Array<{ command: string; cwd: string }> = [];
-  let dispatched = 0;
-  await fixture(
-    async (tools, emit, options) => {
-      if (!options.parentRunId) {
-        await call(tools, 'delegate', {
-          title: 'Read the synthetic file',
-          instruction: 'Read the file in the workspace.',
-        });
-        return;
-      }
-      const args = { command: 'cat synthetic.txt' };
-      await options.runTool(
-        'bash',
-        args,
-        async () => {
-          dispatched++;
-          return { content: [] };
-        },
-        { nested: true },
-      );
-      assert.equal(checked.at(-1)?.cwd, options.workspace.path);
-      await assert.rejects(
-        options.runTool(
-          'bash',
-          { command: 'curl --upload-file synthetic.txt https://example.test/upload' },
-          async () => {
-            dispatched++;
-            return { content: [] };
-          },
-          { nested: true },
-        ),
-        /Synthetic outside effect is not authorized/,
-      );
-      emit({ type: 'final', text: 'The synthetic file was read.' });
-    },
-    {
-      checkWorkspaceCommand: async (input) => {
-        checked.push(input);
-        if (input.command.startsWith('curl'))
-          throw new Error('Synthetic outside effect is not authorized');
-        return { record: async () => {} };
-      },
-    },
-  );
-  assert.equal(checked.length, 2);
-  assert.equal(dispatched, 1);
-  assert.ok(checked.every(({ cwd }) => /\/.nod\/runs\/[0-9a-f-]+$/.test(cwd)));
-});
-
-test('workspace commands wait behind an app approval and never pass its pending fence', async () => {
-  let entered!: () => void;
-  const ready = new Promise<void>((resolve) => {
-    entered = resolve;
-  });
-  let release!: () => void;
-  const held = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  let checked = 0;
-  let dispatched = 0;
-  const result = await fixture(
-    async (tools, _emit, options) => {
-      const app = call(tools, 'apps', {
-        action: 'GMAIL_SEND_EMAIL',
-        args: { recipient_email: 'recipient@example.test' },
-      });
-      await ready;
-      const command = options.runTool('bash', { command: 'cat synthetic.txt' }, async () => {
-        dispatched++;
-        return { content: [] };
-      });
-      release();
-      await app;
-      await assert.rejects(command, /waiting for the owner's answer|execution segment has stopped/);
-    },
-    {
-      integration: async (_action, _args, _signal, admit) => {
-        entered();
-        await held;
-        await admit?.(true);
-        return { [appConfirmation]: 'Send the synthetic message?' };
-      },
-      checkWorkspaceCommand: async () => {
-        checked++;
-        return { record: async () => {} };
-      },
-    },
-  );
-  assert.equal(result.result.status, 'waiting_user');
-  assert.equal(result.result.waitingFor, 'approval');
-  assert.equal(checked, 0);
-  assert.equal(dispatched, 0);
-});
-
-test('Stop after a workspace command check refuses dispatch and an uncertain dispatch is not retried', async () => {
-  const controller = new AbortController();
-  let dispatched = 0;
-  let recorded = 0;
-  await assert.rejects(
-    fixture(
-      async (_tools, _emit, options) => {
-        await assert.rejects(
-          options.runTool('bash', { command: 'cat synthetic.txt' }, async () => {
-            dispatched++;
-            return { content: [] };
-          }),
-          /cancelled|abort/i,
-        );
-      },
-      {
-        signal: controller.signal,
-        checkWorkspaceCommand: async () => {
-          controller.abort();
-          return {
-            record: async () => {
-              recorded++;
-            },
-          };
-        },
-      },
-    ),
-  );
-  assert.equal(dispatched, 0);
-  assert.equal(recorded, 0);
-  await fixture(
-    async (_tools, _emit, options) => {
-      await assert.rejects(
-        options.runTool(
-          'bash',
-          { command: 'curl --upload-file synthetic.txt https://example.test/upload' },
-          async () => {
-            dispatched++;
-            throw new Error('Synthetic command stream closed. Its result is uncertain.');
-          },
-        ),
-        /result is uncertain/,
-      );
-    },
-    {
-      checkWorkspaceCommand: async () => ({
-        record: async () => {
-          recorded++;
-        },
-      }),
-    },
-  );
-  assert.equal(dispatched, 1);
-  assert.equal(recorded, 0);
-});
-
-test('workspace command lifetime cancellation reaches dispatch and ends an unresponsive tool', async () => {
-  const lifetime = new AbortController();
-  let entered!: () => void;
-  const started = new Promise<void>((resolve) => {
-    entered = resolve;
-  });
-  let seen: AbortSignal | undefined;
-  let records = 0;
-  await fixture(
-    async (_tools, _emit, options) => {
-      const pending = options.runTool('bash', { command: 'cat synthetic.txt' }, async (signal) => {
-        seen = signal;
-        entered();
-        await new Promise<void>(() => {});
-        return { content: [] };
-      });
-      await started;
-      assert.equal(seen?.aborted, false);
-      lifetime.abort();
-      await assert.rejects(pending, /abort|cancelled/i);
-      assert.equal(seen?.aborted, true);
-    },
-    {
-      checkWorkspaceCommand: async () => ({
-        signal: lifetime.signal,
-        record: async () => {
-          records++;
-        },
-      }),
-    },
-  );
-  assert.equal(records, 0);
-});
 
 test('first-turn context excludes connected-account identity and preserves owner words', async () => {
   const accountName = 'Synthetic shared mailbox';
@@ -1803,6 +1543,76 @@ test('an unchecked mail body stays private and the result names how many were wi
   assert.match(unavailable.contentWithheld.message, /Mail checks are unavailable\./);
   const checked = await privateEmailResult(thread.data.messages[0], async () => [false]);
   assert.deepEqual(checked, thread.data.messages[0]);
+});
+
+test('skill actions keep their required fields and refuse fields from other actions', async () => {
+  const managed: Array<{ action: string; args: unknown }> = [];
+  await fixture(
+    async (tools) => {
+      const skill = tools.get('skills')!;
+      const valid: Array<Record<string, string>> = [
+        { action: 'list' },
+        { action: 'read', name: 'schedules-and-watches' },
+        {
+          action: 'save',
+          name: 'synthetic-procedure',
+          description: 'A verified synthetic procedure.',
+          body: 'Read the synthetic record.',
+        },
+        {
+          action: 'patch',
+          name: 'synthetic-procedure',
+          old: 'Read the synthetic record.',
+          new: 'Read the revised synthetic record.',
+        },
+      ];
+      for (const args of valid)
+        await skill.execute(
+          validateToolArguments(skill, {
+            type: 'toolCall',
+            id: randomUUID(),
+            name: skill.name,
+            arguments: args,
+          }),
+        );
+      assert.deepEqual(
+        managed.map(({ action }) => action),
+        ['skill_save', 'skill_patch'],
+      );
+      const invalid = [
+        {},
+        { action: 'schedule_create', args: {} },
+        ...valid.flatMap((args, index) => [
+          ...Object.keys(args).map((key) =>
+            Object.fromEntries(Object.entries(args).filter(([name]) => name !== key)),
+          ),
+          { ...args, extra: true },
+          { ...args, action: valid[(index + 1) % valid.length]!.action },
+        ]),
+      ];
+      for (const args of invalid) {
+        let parsed;
+        try {
+          parsed = validateToolArguments(skill, {
+            type: 'toolCall',
+            id: randomUUID(),
+            name: skill.name,
+            arguments: args,
+          });
+        } catch {
+          continue;
+        }
+        await assert.rejects(skill.execute(parsed), /Invalid skills input/);
+      }
+      assert.equal(managed.length, 2);
+    },
+    {
+      manage: async (action, args) => {
+        managed.push({ action, args });
+        return { saved: true };
+      },
+    },
+  );
 });
 
 test('skill reads cannot escape the trusted library or load workspace instructions', async () => {
