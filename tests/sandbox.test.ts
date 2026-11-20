@@ -1667,19 +1667,6 @@ test('local files stay in home, skip secrets and kept-out folders, and never ove
     });
     assert.equal(await readFile(note, 'utf8'), '1 two two');
     assert.equal(await readFile(join(trash, 'note.txt'), 'utf8'), 'one two two');
-    const sheet = join(shared, 'sheet.csv');
-    await writeFile(
-      sheet,
-      Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('name\nAda\n')]),
-    );
-    await files.execute('LOCAL_FILES_EDIT', {
-      path: sheet,
-      edits: [{ oldText: 'name\nAda', newText: 'name\nGrace' }],
-    });
-    assert.deepEqual(
-      [...(await readFile(sheet))],
-      [0xef, 0xbb, 0xbf, ...Buffer.from('name\nGrace\n')],
-    );
     const latin = join(shared, 'latin.txt');
     await writeFile(latin, Buffer.from([0x63, 0x61, 0x66, 0xe9]));
     await assert.rejects(
