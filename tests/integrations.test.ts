@@ -11364,6 +11364,18 @@ test(
         return new Response(Buffer.from(`echo ${mixedCaseEncoded}`), {
           headers: { 'content-type': 'application/octet-stream' },
         });
+      if (String(input) === 'https://fixture.example/api/items/1/archive') {
+        const type = new Headers(init?.headers).get('content-type');
+        return init?.body === undefined && type
+          ? Response.json(
+              {
+                code: 'FST_ERR_CTP_EMPTY_JSON_BODY',
+                message: `Body cannot be empty when content-type is set to '${type}'`,
+              },
+              { status: 400 },
+            )
+          : Response.json({ archived: true, type, body: init?.body ?? null });
+      }
       if (init?.method === 'GET') return new Response(null, { status: 405 });
       const message = JSON.parse(String(init?.body));
       if (message.id === undefined) return new Response(null, { status: 202 });
@@ -11472,6 +11484,29 @@ test(
         error: 'The file was withheld because it contains the connection credential.',
       },
     });
+    for (const method of ['POST', 'PUT', 'PATCH', 'DELETE'])
+      assert.deepEqual(
+        await discovered.execute('CONNECTED_HTTP', {
+          connectionId,
+          pathId: httpPath,
+          method,
+          path: 'items/1/archive',
+        }),
+        { status: 200, body: { archived: true, type: null, body: null } },
+      );
+    assert.deepEqual(
+      await discovered.execute('CONNECTED_HTTP', {
+        connectionId,
+        pathId: httpPath,
+        method: 'POST',
+        path: 'items/1/archive',
+        body: { reason: 'done' },
+      }),
+      {
+        status: 200,
+        body: { archived: true, type: 'application/json', body: '{"reason":"done"}' },
+      },
+    );
     const input = {
       query: 'roadmap',
       page_url: 'https://www.notion.so/team/synthetic-page',

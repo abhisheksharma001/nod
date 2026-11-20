@@ -4324,9 +4324,26 @@ test('browser handoff preserves platform editing chords, text input and paste', 
         await act(async () => root.render(createElement(BrowserHandoff, { turnId: 'synthetic-turn' })));
         const frame = document.querySelector('.browser-handoff-screen img');
         assert.equal(frame.src, 'blob:synthetic-browser-frame');
+        Object.defineProperty(frame, 'naturalWidth', { value: 100 });
+        Object.defineProperty(frame, 'naturalHeight', { value: 100 });
+        frame.getBoundingClientRect = () => ({ left: 0, top: 0, width: 100, height: 100 });
         await act(async () => frame.dispatchEvent(new Event('load')));
         let screen = document.querySelector('.browser-handoff-screen');
         assert.equal(screen.getAttribute('aria-disabled'), 'false');
+        const press = async (type, button) => act(async () => frame.dispatchEvent(
+          new dom.window.MouseEvent(type, { button, clientX: 50, clientY: 50, bubbles: true }),
+        ));
+        for (const button of [3, 4]) {
+          await press('mousedown', button);
+          await press('mouseup', button);
+        }
+        assert.deepEqual(received, []);
+        await press('mousedown', 0);
+        await press('mouseup', 0);
+        assert.deepEqual(received, [
+          { type: 'mouse', event: 'down', x: 0.5, y: 0.5, button: 'left' },
+          { type: 'mouse', event: 'up', x: 0.5, y: 0.5, button: 'left' },
+        ]);
         let dispatchingKey = false;
         const key = async (key, options = {}) => {
           const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...options });

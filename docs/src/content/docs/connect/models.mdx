@@ -179,6 +179,8 @@ Nod lists the models and inference profiles Bedrock offers in that Region, such 
 
 The key needs to list models (`bedrock:ListFoundationModels` and `bedrock:ListInferenceProfiles`) and call them. Keys made in the Bedrock console get the `AmazonBedrockLimitedAccess` policy, which allows both. Nod doesn't use AWS access keys or profiles.
 
+If the model list loads but every chat fails with `http2 request did not get a response`, your network, such as a VPN or a TLS-inspecting proxy, may be blocking HTTP/2. Set `AWS_BEDROCK_FORCE_HTTP1=1` in the environment Nod starts from to send Bedrock requests over HTTP/1.1 instead. For the desktop app on macOS, run `launchctl setenv AWS_BEDROCK_FORCE_HTTP1 1`, then quit and reopen Nod. The setting lasts until you restart the Mac. On Windows, run `setx AWS_BEDROCK_FORCE_HTTP1 1`, then sign out and back in so Nod starts with it.
+
 </TabItem>
 <TabItem label="Google Vertex AI">
 

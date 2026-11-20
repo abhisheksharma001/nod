@@ -13895,6 +13895,23 @@ test('a first task stays open after its chat turn ends and follows its own saved
   assert.equal(status(), 'sent');
 });
 
+test('the onboarding brief masks each link and keeps the fields after it', async () => {
+  const { masked } = await import('../src/server/onboarding-suggestions.ts');
+  const event = {
+    htmlLink: 'https://calendar.example.test/event?eid=abc',
+    start: { dateTime: '2026-10-24T09:00:00Z' },
+    end: { dateTime: '2026-10-24T09:30:00Z' },
+    summary: 'Planning',
+  };
+  assert.deepEqual(JSON.parse(masked(JSON.stringify({ items: [event, event] }))), {
+    items: [event, event].map((item) => ({ ...item, htmlLink: '[link]' })),
+  });
+  const quoted = { note: 'Open https://files.example.test/a"b?token=zzz then reply', next: 'kept' };
+  const brief = masked(JSON.stringify(quoted));
+  assert.deepEqual(JSON.parse(brief), { note: 'Open [link] then reply', next: 'kept' });
+  assert.ok(!brief.includes('zzz'));
+});
+
 test(
   'the live line uses an active tool label, drops old steps, and keeps work Nod started apart',
   { skip: !process.env.TEST_DATABASE_URL, timeout: 30_000 },
