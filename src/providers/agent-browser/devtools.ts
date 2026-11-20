@@ -1,4 +1,5 @@
-import { BrowserActionError, type BrowserSelection } from '../../ports/computer.ts';
+import { BrowserActionError } from '../../ports/computer.ts';
+import type { BrowserSignInGuard } from '../../shared/browser-errors.ts';
 type FrameNode = {
   frame: { id: string; loaderId?: string; securityOrigin?: string };
   childFrames?: FrameNode[];
@@ -31,6 +32,10 @@ type ControlQuery = {
   control?: { role: string; name: string };
   focused?: boolean;
 };
+
+function signInFailure(guard: BrowserSignInGuard, message: string) {
+  return Object.assign(new Error(message), { signInGuard: guard });
+}
 
 const active = `(() => { if (!document.hasFocus()) return null; let node = document.activeElement; for (;;) { const root = node && (node.shadowRoot ?? (globalThis.__nodRoots ?? []).find(root => root.host === node)); if (!root?.activeElement) break; node = root.activeElement; } return node && !['IFRAME', 'FRAME', 'BODY', 'HTML'].includes(node.tagName) ? node : null; })()`;
 const focusScript = `(() => { const node = ${active}; globalThis.__nodFocused = node; return node ? node.tagName : ''; })()`;
@@ -579,7 +584,7 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
           session,
         )) as { result?: { objectId?: string }; exceptionDetails?: unknown };
         if (exceptionDetails || (result?.objectId && found))
-          throw new BrowserActionError('browser_sign_in_choice');
+          throw new BrowserActionError('browser_sign_in_choice', undefined, 'selector_rejected');
         if (result?.objectId) {
           const { node } = (await send(
             'DOM.describeNode',
@@ -902,164 +907,10 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
     async controls(query: ControlQuery) {
       return (await controlTarget(query))?.controls ?? [];
     },
-    async selections() {
-      type Node = {
-        nodeId: string;
-        parentId?: string;
-        ignored?: boolean;
-        backendDOMNodeId?: number;
-        role?: { value?: unknown };
-        name?: { value?: unknown };
-        value?: { value?: unknown };
-        properties?: Array<{ name: string; value?: { value?: unknown } }>;
-      };
-      type Selection = BrowserSelection & {
-        node: number;
-        parent?: number;
-        nativeValue?: string | number | boolean;
-        valueText?: string | number | boolean;
-      };
-      const captured = new Map<string, { frame: string; document: string; values: Selection[] }>();
-      const failures = new Map<string, unknown>();
-      const frames = new Set<string>();
-      let nodeCount = 0;
-      let selectionCount = 0;
-      let characters = 0;
-      if (sessions.size > 16) throw new Error('The page has more than 16 browser frame sessions.');
-      for (const session of sessions) {
-        for (const frame of await tree(session)) {
-          frames.add(frame.id);
-          if (frames.size > 16) throw new Error('The page has more than 16 browser frames.');
-          if (captured.has(frame.id)) continue;
-          let nodes: Node[];
-          try {
-            ({ nodes } = (await send(
-              'Accessibility.getFullAXTree',
-              { frameId: frame.id },
-              session,
-            )) as { nodes: Node[] });
-          } catch (error) {
-            failures.set(frame.id, error);
-            continue;
-          }
-          if (!frame.loaderId) throw new Error('The selected document could not be identified.');
-          if (!Array.isArray(nodes)) throw new Error('The browser returned no selection tree.');
-          nodeCount += nodes.length;
-          if (nodeCount > 10_000)
-            throw new Error('The browser selection tree exceeds 10000 nodes.');
-          const byId = new Map(nodes.map((node) => [node.nodeId, node]));
-          const property = (node: Node, name: string) =>
-            node.properties?.find((item) => item.name === name)?.value?.value;
-          const ancestors = (node: Node) => {
-            const result: Node[] = [];
-            const seen = new Set([node.nodeId]);
-            for (
-              let parent = node.parentId ? byId.get(node.parentId) : undefined;
-              parent;
-              parent = parent.parentId ? byId.get(parent.parentId) : undefined
-            ) {
-              if (seen.has(parent.nodeId) || result.length >= 32)
-                throw new Error('The browser selection ancestry is cyclic or exceeds 32 levels.');
-              seen.add(parent.nodeId);
-              result.push(parent);
-            }
-            return result;
-          };
-          const optionStates = new Map<
-            string,
-            { total: number; known: number; selected: number }
-          >();
-          for (const node of nodes) {
-            if (node.ignored || node.role?.value !== 'option') continue;
-            const selected = property(node, 'selected');
-            for (const parent of ancestors(node)) {
-              if (!['combobox', 'listbox'].includes(String(parent.role?.value))) continue;
-              const count = optionStates.get(parent.nodeId) ?? { total: 0, known: 0, selected: 0 };
-              count.total++;
-              if (typeof selected === 'boolean') count.known++;
-              if (selected === true) count.selected++;
-              optionStates.set(parent.nodeId, count);
-            }
-          }
-          const values = nodes.flatMap((node): Selection[] => {
-            const role = String(node.role?.value ?? '');
-            if (node.ignored || ['textbox', 'searchbox'].includes(role)) return [];
-            if (role === 'combobox' && property(node, 'editable') !== undefined) return [];
-            const checkedValue = String(property(node, 'checked'));
-            const checked = ['true', 'false', 'mixed'].includes(checkedValue)
-              ? (checkedValue as 'true' | 'false' | 'mixed')
-              : undefined;
-            const selected = property(node, 'selected') === true;
-            const widget = ['combobox', 'spinbutton', 'listbox', 'slider'].includes(role);
-            if (!widget && checked === undefined && !selected) {
-              if (
-                ['checkbox', 'radio', 'switch', 'menuitemcheckbox', 'menuitemradio'].includes(role)
-              )
-                throw new Error('The browser did not report a current checked state.');
-              return [];
-            }
-            if (node.backendDOMNodeId === undefined)
-              throw new Error('A current selection has no browser element identity.');
-            const primitive = (value: unknown): value is string | number | boolean =>
-              ['string', 'number', 'boolean'].includes(typeof value);
-            const nativeValue = node.value?.value;
-            const valueText = property(node, 'valuetext');
-            const raw = valueText ?? nativeValue;
-            const scalar = ['string', 'number', 'boolean'].includes(typeof raw);
-            const count = optionStates.get(node.nodeId);
-            const knownOptions = count && count.total > 0 && count.known === count.total;
-            if (widget && !scalar && !knownOptions)
-              throw new Error(
-                'The browser did not report a current value or a known empty selection.',
-              );
-            const group = ancestors(node).find(
-              (parent) =>
-                ['combobox', 'listbox', 'radiogroup'].includes(String(parent.role?.value)) &&
-                typeof parent.name?.value === 'string' &&
-                parent.name.value.trim(),
-            )?.name?.value;
-            const name = String(node.name?.value ?? '');
-            const value = scalar ? String(raw) : undefined;
-            selectionCount++;
-            characters +=
-              name.length +
-              (primitive(nativeValue) ? String(nativeValue).length : 0) +
-              (primitive(valueText) ? String(valueText).length : 0) +
-              (typeof group === 'string' ? group.length : 0) +
-              role.length;
-            if (selectionCount > 256)
-              throw new Error('The page has more than 256 native selections.');
-            if (characters > 64_000)
-              throw new Error('The native selection values exceed 64000 characters.');
-            return [
-              {
-                node: node.backendDOMNodeId,
-                ...(primitive(nativeValue) ? { nativeValue } : {}),
-                ...(primitive(valueText) ? { valueText } : {}),
-                ...(node.parentId && byId.get(node.parentId)?.backendDOMNodeId !== undefined
-                  ? { parent: byId.get(node.parentId)!.backendDOMNodeId }
-                  : {}),
-                role,
-                name,
-                ...(value === undefined ? {} : { value }),
-                ...(checked === undefined ? {} : { checked }),
-                ...(selected ? { selected: true } : {}),
-                ...(knownOptions ? { selectedCount: count.selected } : {}),
-                ...(typeof group === 'string' ? { group } : {}),
-              },
-            ];
-          });
-          captured.set(frame.id, { frame: frame.id, document: frame.loaderId, values });
-          failures.delete(frame.id);
-        }
-      }
-      if (failures.size) throw failures.values().next().value;
-      if (!captured.size) throw new Error('The current selection document is unavailable.');
-      return [...captured.values()].sort((a, b) => a.frame.localeCompare(b.frame));
-    },
     async signInControl(query: ControlQuery): Promise<BoundSignInControl> {
       const found = query.selector ? await signInSelector(query.selector) : await locate(query);
-      if (!found) throw new BrowserActionError('browser_sign_in_choice');
+      if (!found)
+        throw new BrowserActionError('browser_sign_in_choice', undefined, 'choice_missing');
       try {
         const frames = await tree(found.session);
         let frame: FrameNode['frame'] | undefined;
@@ -1081,7 +932,8 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
             break;
           }
         }
-        if (!frame?.loaderId || !objectId) throw new BrowserActionError('browser_target_changed');
+        if (!frame?.loaderId || !objectId)
+          throw new BrowserActionError('browser_target_changed', undefined, 'frame_changed');
         const { result, exceptionDetails } = (await send(
           'Runtime.callFunctionOn',
           {
@@ -1092,22 +944,23 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
           found.session,
         )) as { result?: { objectId?: string }; exceptionDetails?: unknown };
         if (exceptionDetails || !result?.objectId)
-          throw new BrowserActionError('browser_sign_in_choice');
+          throw new BrowserActionError('browser_sign_in_choice', undefined, 'choice_ineligible');
         const { node } = (await send(
           'DOM.describeNode',
           { objectId: result.objectId },
           found.session,
         )) as { node: { backendNodeId: number } };
         const snapshot = await snapshotOf(result.objectId, found.session);
-        if (!snapshot) throw new BrowserActionError('browser_sign_in_choice');
+        if (!snapshot)
+          throw new BrowserActionError('browser_sign_in_choice', undefined, 'choice_ineligible');
         const controls = await controlsFor({
           backendNodeId: node.backendNodeId,
           session: found.session,
         });
         if (!controls[0]?.name || !['button', 'link'].includes(controls[0].role))
-          throw new BrowserActionError('browser_sign_in_choice');
+          throw new BrowserActionError('browser_sign_in_choice', undefined, 'choice_accessibility');
         if ((await snapshotOf(result.objectId, found.session)) !== snapshot)
-          throw new BrowserActionError('browser_target_changed');
+          throw new BrowserActionError('browser_target_changed', undefined, 'control_changed');
         const details = JSON.parse(snapshot) as {
           origin: string;
           url: string;
@@ -1142,10 +995,11 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
           break;
         }
       }
-      if (!session) throw new Error('The sign-in document changed.');
+      if (!session) throw signInFailure('frame_changed', 'The sign-in document changed.');
       const name = `nodSignIn${crypto.randomUUID().replaceAll('-', '')}`;
       let pressed = false;
       let outcome: boolean | undefined;
+      const guardRefused = () => outcome === false;
       let timer: ReturnType<typeof setTimeout> | undefined;
       let context: number | undefined;
       try {
@@ -1158,43 +1012,66 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
           session,
         )) as { quads: number[][] };
         const quad = quads.find((value) => value.length === 8 && value.every(Number.isFinite));
-        if (!quad) throw new Error('The sign-in control is no longer visible.');
-        const point = {
+        if (!quad)
+          throw signInFailure('control_hidden', 'The sign-in control is no longer visible.');
+        const inputPoint = {
           x: (quad[0]! + quad[2]! + quad[4]! + quad[6]!) / 4,
           y: (quad[1]! + quad[3]! + quad[5]! + quad[7]!) / 4,
         };
-        if (session !== page) {
-          const { backendNodeId } = (await send(
-            'DOM.getFrameOwner',
-            { frameId: control.targetFrameId },
-            page,
-          )) as { backendNodeId: number };
-          const { model } = (await send('DOM.getBoxModel', { backendNodeId }, page)) as {
-            model: { content: number[]; border: number[]; width: number; height: number };
-          };
-          const content = model.content;
-          if (
-            content[1] !== content[3] ||
-            content[0] !== content[6] ||
-            content[2] !== content[4] ||
-            content[5] !== content[7] ||
-            model.border[2]! - model.border[0]! !== model.width ||
-            model.border[5]! - model.border[1]! !== model.height
-          )
-            throw new Error('The sign-in frame could not be located safely.');
-          point.x += content[0]!;
-          point.y += content[1]!;
-        }
         const check = async () => {
+          const point = { ...inputPoint };
+          if (session !== page) {
+            const { backendNodeId } = (await send(
+              'DOM.getFrameOwner',
+              { frameId: control.targetFrameId },
+              page,
+            )) as { backendNodeId: number };
+            const { model } = (await send('DOM.getBoxModel', { backendNodeId }, page)) as {
+              model: { content: number[]; border: number[]; width: number; height: number };
+            };
+            const content = model.content;
+            if (
+              content[1] !== content[3] ||
+              content[0] !== content[6] ||
+              content[2] !== content[4] ||
+              content[5] !== content[7] ||
+              model.border[2]! - model.border[0]! !== model.width ||
+              model.border[5]! - model.border[1]! !== model.height
+            )
+              throw signInFailure(
+                'frame_transform',
+                'The sign-in frame could not be located safely.',
+              );
+            point.x += content[0]!;
+            point.y += content[1]!;
+            const { cssVisualViewport: viewport } = (await send(
+              'Page.getLayoutMetrics',
+              {},
+              page,
+            )) as {
+              cssVisualViewport: { clientWidth: number; clientHeight: number };
+            };
+            if (
+              point.x < 0 ||
+              point.y < 0 ||
+              point.x >= viewport.clientWidth ||
+              point.y >= viewport.clientHeight
+            )
+              throw signInFailure(
+                'control_hidden',
+                'The sign-in control is outside the browser viewport.',
+              );
+          }
           if (
             (await controlSnapshot(objectId, session!)) !== control.snapshot ||
             JSON.stringify(
               await controlsFor({ backendNodeId: control.backendNodeId, session: session! }),
             ) !== JSON.stringify(control.controls)
           )
-            throw new Error('The sign-in control changed.');
+            throw signInFailure('control_changed', 'The sign-in control changed.');
           const hit = await locate({ pixel: point }, true);
-          if (!hit || hit.session !== session) throw new Error('The sign-in control is covered.');
+          if (!hit || hit.session !== session)
+            throw signInFailure('control_covered', 'The sign-in control is covered.');
           const hitId = await resolveControl(hit.backendNodeId, session!, control.frameId);
           const { result, exceptionDetails } = (await send(
             'Runtime.callFunctionOn',
@@ -1207,10 +1084,10 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
             session,
           )) as { result?: { value?: boolean }; exceptionDetails?: unknown };
           if (exceptionDetails || result?.value !== true)
-            throw new Error('The sign-in control is covered.');
+            throw signInFailure('control_covered', 'The sign-in control is covered.');
         };
         await check();
-        await send('Input.dispatchMouseEvent', { type: 'mouseMoved', ...point }, page);
+        await send('Input.dispatchMouseEvent', { type: 'mouseMoved', ...inputPoint }, session);
         await check();
         await send('Runtime.enable', {}, session);
         await send('Runtime.addBinding', { name, executionContextId: context }, session);
@@ -1243,25 +1120,33 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
         pressed = true;
         await send(
           'Input.dispatchMouseEvent',
-          { type: 'mousePressed', ...point, button: 'left', buttons: 1, clickCount: 1 },
-          page,
+          { type: 'mousePressed', ...inputPoint, button: 'left', buttons: 1, clickCount: 1 },
+          session,
         );
-        if (outcome === false) throw new Error('The sign-in control changed.');
+        if (guardRefused())
+          throw signInFailure('click_guard_changed', 'The sign-in control changed.');
         await check();
         await send(
           'Input.dispatchMouseEvent',
-          { type: 'mouseReleased', ...point, button: 'left', buttons: 0, clickCount: 1 },
-          page,
+          { type: 'mouseReleased', ...inputPoint, button: 'left', buttons: 0, clickCount: 1 },
+          session,
         );
         pressed = false;
         timer = setTimeout(() => resolveClick(false), 5000);
-        if (!(await clicked)) throw new Error('The sign-in control did not receive the click.');
+        if (!(await clicked)) {
+          if (guardRefused())
+            throw signInFailure('click_guard_changed', 'The sign-in control changed.');
+          throw signInFailure(
+            'click_not_received',
+            'The sign-in control did not receive the click.',
+          );
+        }
       } finally {
         if (pressed)
           await send(
             'Input.dispatchMouseEvent',
             { type: 'mouseReleased', x: -1, y: -1, button: 'left', buttons: 0 },
-            page,
+            session,
             true,
           ).catch(() => {});
         clearTimeout(timer);

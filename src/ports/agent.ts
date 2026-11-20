@@ -259,10 +259,6 @@ export interface RuntimeContext {
     ),
   ): Promise<{ url: string } | { filled: true } | { [appConfirmation]: string }>;
   requestPayment?(input: unknown): Promise<{ question: string; action: string; url?: string }>;
-  checkWorkspaceCommand?(
-    input: { command: string; cwd: string; timeoutSeconds: number },
-    signal: AbortSignal,
-  ): Promise<{ signal?: AbortSignal; record(): Promise<void> }>;
   integration(
     action: string,
     args: Record<string, unknown>,

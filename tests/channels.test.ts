@@ -5352,12 +5352,8 @@ test(
             pool,
             ownerId: 'local-development',
             canDeliverLiteral: channels.canDeliverLiteral,
-            review: async (_instructions, value) => {
+            review: async () => {
               wordingCalls++;
-              if (Object(value).purpose === 'confirmation_review') {
-                assert.ok(Object(value).text.includes(prompt));
-                return { valid: true };
-              }
               return { text: 'Create this schedule?', action: 'Create schedule' };
             },
           });
@@ -5408,14 +5404,14 @@ test(
             ).rows[0],
             { state: 'sent', provider_message_ids: [`123456:${before + 101}`] },
           );
-          assert.equal(wordingCalls, 2);
+          assert.equal(wordingCalls, 1);
           definition.title = '{{emoji:smile}}';
           proposal.args.title = definition.title;
           await assert.rejects(
             communication.describe(proposal),
             /cannot show the complete schedule confirmation in this channel/,
           );
-          assert.equal(wordingCalls, 2);
+          assert.equal(wordingCalls, 1);
           assert.equal(sent.length, before + 1);
         },
       );

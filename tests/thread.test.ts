@@ -12960,6 +12960,103 @@ test(
       `${new Date(Date.now() - 5000).toISOString()} update check result=offered version=9.9.9 for Marta Vidal\n`,
     );
     const scope = { turnId, sessionId, runId: childRun, parentRunId: mainRun, callId };
+    const { createBrowserWorkerFixture } = await import('./browser-fixture.ts');
+    const { withFailureLog } = await import('../src/ports/failure-log.ts');
+    let pickerGuard = 'control_covered';
+    const refusePicker = async () => {
+      throw Object.assign(new Error(privateText), {
+        signInGuard: pickerGuard,
+        cause: privateText,
+      });
+    };
+    const bridge = await createBrowserWorkerFixture({
+      computer: fakeComputer({
+        signInMethods: refusePicker,
+        selectSignInMethod: refusePicker,
+      }),
+    });
+    try {
+      const client = bridge.client('/synthetic/diagnostic-picker');
+      for (const [method, guard] of [
+        ['signInMethods', 'control_covered'],
+        ['signInMethods', 'control_changed'],
+        ['selectSignInMethod', 'control_changed'],
+      ]) {
+        pickerGuard = guard;
+        await assert.rejects(
+          withFailureLog(
+            (event, error, context) =>
+              failureJournal.record('failure', { event, error, context }, scope),
+            () =>
+              method === 'signInMethods'
+                ? client.signInMethods!('task', 'https://example.test', [
+                    { label: privateValues[0], selector: `[data-account="${privateValues[1]}"]` },
+                  ])
+                : client.selectSignInMethod!('task', {
+                    origin: 'https://example.test',
+                    document: 'synthetic-document',
+                    methodId: randomUUID(),
+                  }),
+          ),
+          (error: unknown) => {
+            assert.equal(Object(error).signInGuard, guard);
+            assert.ok(privateValues.every((value) => !Object(error).message.includes(value)));
+            return true;
+          },
+        );
+      }
+    } finally {
+      await bridge.close();
+    }
+    const { createDecisionModel } = await import('../src/providers/decisions.ts');
+    const { createMailCheck } = await import('../src/server/mail-check.ts');
+    const { privateEmailResult } = await import('../src/server/integration-result.ts');
+    for (const response of [
+      () => Response.json({ error: { message: privateText, code: privateText } }, { status: 503 }),
+      () => new Response(`{"private":${JSON.stringify(privateText)}`, { status: 200 }),
+      () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.error(new Error(privateText));
+            },
+          }),
+          { status: 200 },
+        ),
+    ]) {
+      const model = createDecisionModel({
+        resolve: async () => ({ provider: 'openrouter', key: privateText }),
+        fetch: async () => response(),
+      });
+      const check = createMailCheck({
+        decisions: model,
+        curator: {
+          id: 'unused',
+          configured: false,
+          async curate() {
+            assert.fail('A failed decision must not use another model.');
+          },
+        },
+      });
+      const result = await withFailureLog(
+        (event, error) => failureJournal.record('failure', { event, error }, scope),
+        () =>
+          privateEmailResult(
+            {
+              messages: [
+                {
+                  id: 'synthetic-mail',
+                  from: 'sender@example.test',
+                  subject: privateText,
+                  body: privateText,
+                },
+              ],
+            },
+            check,
+          ),
+      );
+      assert.ok(privateValues.every((value) => !JSON.stringify(result).includes(value)));
+    }
     for (let index = 0; index < 3; index++)
       failureJournal.record(
         'failure',
@@ -13133,11 +13230,44 @@ test(
     assert.equal(report.logs[0].data.tool, 'apps');
     assert.equal(report.logs[0].data.input.query, 'Find the failed workflow');
     assert.equal(report.logs[1].data.output.statusCode, 503);
-    assert.equal(report.failures.length, 2);
+    assert.equal(report.failures.length, 8);
+    const mailFailures = report.failures.filter(
+      (row: any) => row.data.event === 'mail_check_failed',
+    );
+    assert.equal(mailFailures.length, 3);
+    assert.deepEqual(
+      mailFailures.map((row: any) => [row.data.error.code, row.data.error.status]).sort(),
+      [
+        ['decision_http', 503],
+        ['decision_json', 200],
+        ['decision_response', 200],
+      ],
+    );
+    assert.ok(mailFailures.every((row: any) => row.runId === child.runId && row.count === 1));
     const requestFailure = report.failures.find((row: any) => row.data.event === 'request_failed');
     const bridgeFailure = report.failures.find(
-      (row: any) => row.data.event === 'browser_bridge_failed',
+      (row: any) =>
+        row.data.event === 'browser_bridge_failed' && row.data.context.reason === 'exit',
     );
+    const pickerFailure = report.failures.find(
+      (row: any) => row.data.context?.signInGuard === 'control_covered',
+    );
+    const pickerFailures = report.failures.filter((row: any) => row.data.context?.signInGuard);
+    assert.deepEqual(
+      pickerFailures
+        .map((row: any) => [row.data.context.method, row.data.context.signInGuard, row.count])
+        .sort(),
+      [
+        ['selectSignInMethod', 'control_changed', 1],
+        ['signInMethods', 'control_changed', 1],
+        ['signInMethods', 'control_covered', 1],
+      ],
+    );
+    assert.equal(pickerFailure.data.error.code, 'unavailable');
+    assert.equal(pickerFailure.data.context.method, 'signInMethods');
+    assert.equal(pickerFailure.data.context.reason, 'error_response');
+    assert.equal(pickerFailure.count, 1);
+    assert.equal(pickerFailure.runId, child.runId);
     assert.match(requestFailure.data.error.message, /Gmail fetch failed with HTTP 503/);
     assert.equal(requestFailure.count, 1);
     assert.equal(bridgeFailure.data.context.exitCode, 137);
@@ -13303,6 +13433,47 @@ test(
     );
   },
 );
+
+test('feedback original spans remove private data before journal persistence and reload', async (t) => {
+  const { createFeedbackLog } = await import('../src/server/feedback-log.ts');
+  const { createFeedbackRedactor } = await import('../src/server/feedback-redaction.ts');
+  const root = await mkdtemp(join(tmpdir(), 'feedback-original-spans-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const redactor = createFeedbackRedactor({
+    secrets: ['/', '@', 'Author'],
+    profile: { names: [] },
+  });
+  const options = { dataRoot: root, ownerId: 'synthetic-owner', sanitize: redactor.value };
+  const log = await createFeedbackLog(options);
+  t.after(() => log.close());
+  log.record('failure', {
+    status: 503,
+    reason: 'Engine request failed',
+    message: '/Users/Synthetic Owner/PrivateLedger.docx',
+    detail: 'PrivateMailbox%40synthetic.invalid',
+    headers: ['Authorization', 'PrivateOpaqueValue'],
+  });
+  const snapshot = await log.snapshot();
+  assert.equal(snapshot.entries.length, 1);
+  assert.equal((snapshot.entries[0].data as { status: number }).status, 503);
+  const parent = join(root, 'feedback-logs');
+  const [directory] = await readdir(parent);
+  const persisted = await readFile(join(parent, directory, 'journal-0.jsonl'), 'utf8');
+  for (const privatePart of [
+    'Synthetic Owner',
+    'PrivateLedger',
+    'PrivateMailbox',
+    'synthetic.invalid',
+    'PrivateOpaqueValue',
+  ]) {
+    assert.ok(!persisted.includes(privatePart), privatePart);
+    assert.ok(!JSON.stringify(snapshot).includes(privatePart), privatePart);
+  }
+  await log.close();
+  const reopened = await createFeedbackLog(options);
+  t.after(() => reopened.close());
+  assert.deepEqual((await reopened.snapshot()).entries, snapshot.entries);
+});
 
 test('feedback journal redacts before persistence, survives restart, rotates and expires within its owner', async (t) => {
   const { createFeedbackLog } = await import('../src/server/feedback-log.ts');

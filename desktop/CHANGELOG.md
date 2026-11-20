@@ -2,6 +2,81 @@
 
 Releases from before the rename to Nod are the `desktop-v*` [GitHub releases](https://github.com/n8n-io/nod/releases).
 
+## 0.9.1 - 2026-11-20
+
+### Features
+
+- **web:** Restyle the sidebars and replace collapse-to-icons with hide and resize. [#1206](https://github.com/n8n-io/nod/pull/1206) (517d7f5)
+- **apps:** Rename custom MCP connections (LAB-1203). [commit](https://github.com/n8n-io/nod/commit/563ebc20d871f18cc849bb7afd6d097b6eb2bd48) (563ebc2)
+- **schedules:** Show live activity for scheduled runs (LAB-1287). [commit](https://github.com/n8n-io/nod/commit/8d4881276c911d2b0f00fc604185117e62fc2f4a) (8d48812)
+- **chat:** Link selected text when pasting a URL (LAB-1404). [#1196](https://github.com/n8n-io/nod/pull/1196) (2f744ab)
+
+### Fixes
+
+- **models:** Preserve compatible server discovery errors. [#1247](https://github.com/n8n-io/nod/pull/1247) (96c86cc)
+- **desktop:** Preserve queued restart requests while installer runs. [commit](https://github.com/n8n-io/nod/commit/ba0700b708c2581e9ef41225a718940a2739791f) (ba0700b)
+- **workspace:** Explain how to check a named script. [#1241](https://github.com/n8n-io/nod/pull/1241) (b8bbf38)
+- **desktop:** Report startup failures without restarting the engine. [#1236](https://github.com/n8n-io/nod/pull/1236) (d7649a6)
+- **privacy:** Mask feedback from original data. [#1244](https://github.com/n8n-io/nod/pull/1244) (09a2fad)
+- **memory:** Accept a quote that differs only in curly or straight quote marks. [#1218](https://github.com/n8n-io/nod/pull/1218) (7713955)
+- **browser:** Route private frame clicks and keep refusal causes. [#1237](https://github.com/n8n-io/nod/pull/1237) (7473a45)
+- **vault:** Keep save and update failure reasons. [#1242](https://github.com/n8n-io/nod/pull/1242) (56ef6ed)
+- **trust:** Do not log stopped reviews as failures. [#1243](https://github.com/n8n-io/nod/pull/1243) (8d1f37f)
+- **trust:** Keep draft review after message edits. [#1235](https://github.com/n8n-io/nod/pull/1235) (7b6dfcb)
+- **tools:** Include all action choices in validation errors. [#1240](https://github.com/n8n-io/nod/pull/1240) (0e2d9a9)
+- **privacy:** Explain managed app data before sign-in. [#1230](https://github.com/n8n-io/nod/pull/1230) (d28d132)
+- **models:** Use the loaded Ollama context limit. [#1238](https://github.com/n8n-io/nod/pull/1238) (0db6d58)
+- **apps:** Close the connection browser attempt when an app sign-in is discarded. [#1168](https://github.com/n8n-io/nod/pull/1168) (fb8c0ce)
+- **runtime:** Preserve completed calls after a script failure. [#1229](https://github.com/n8n-io/nod/pull/1229) (208cd49)
+- **mail:** Keep bounded safety check failure details. [#1225](https://github.com/n8n-io/nod/pull/1225) (a182cdd)
+- **chat:** Keep state reads moving during server updates. [#1226](https://github.com/n8n-io/nod/pull/1226) (2d4af19)
+- **desktop:** Submit the Welcome choice once when the engine restarts during setup. [#1223](https://github.com/n8n-io/nod/pull/1223) (aa20ea4)
+- **channels:** Show approval buttons in Telegram (LAB-1520). [commit](https://github.com/n8n-io/nod/commit/f3e752a67b77a79d0bd5f0c177589114700ffe14) (f3e752a)
+- **chat:** Align the artifact file picker with its filename (LAB-1209). [commit](https://github.com/n8n-io/nod/commit/d0a8475d289b1df47215e06710ac2908feefc069) (d0a8475)
+- **chat:** Space file previews below reply text (LAB-1206). [commit](https://github.com/n8n-io/nod/commit/1ad13860d28396361fa4ced4ef61b32012f1d551) (1ad1386)
+- **models:** Forecast work at current model rates (LAB-1654). [commit](https://github.com/n8n-io/nod/commit/a9bf9adcf32632e2c1ec8d0b0f64cfb051974fae) (a9bf9ad)
+- Correct confirmation and saved-work failures. [commit](https://github.com/n8n-io/nod/commit/fda6784191cba946e636f3e48db4fdbe3a1f986c) (fda6784)
+- **traces:** Classify provider errors and preserve conversation IDs (LAB-1658). [#1199](https://github.com/n8n-io/nod/pull/1199) (83354df)
+- **evals:** Budget for cancelled memory requests (LAB-1401). [#1195](https://github.com/n8n-io/nod/pull/1195) (e2bcced)
+- **browser:** Explain invalid wait conditions (LAB-1500). [#1191](https://github.com/n8n-io/nod/pull/1191) (51a2ffe)
+- **browser:** Explain rejected snapshot selectors (LAB-1656). [#1190](https://github.com/n8n-io/nod/pull/1190) (614d1ba)
+- **traces:** Add usage joins, error types, and known costs (LAB-1658). [#1188](https://github.com/n8n-io/nod/pull/1188) (26fb141)
+- **activity:** Show each completed progress step once (LAB-1639). [#1189](https://github.com/n8n-io/nod/pull/1189) (a13c94a)
+- **pi:** Bound OpenRouter completion allowances (LAB-1607). [#1186](https://github.com/n8n-io/nod/pull/1186) (2ccf1ba)
+- **browser:** Resolve scrolled sign-in and action targets (LAB-1559). [#1183](https://github.com/n8n-io/nod/pull/1183) (af52e57)
+- **speech:** Report local pronunciation limits accurately (LAB-1547). [#1185](https://github.com/n8n-io/nod/pull/1185) (836d3ee)
+- **models:** Offer account-listed GPT-6.2 models (LAB-1647). [#1184](https://github.com/n8n-io/nod/pull/1184) (8a70880)
+- **desktop:** Keep WSL diagnostics out of runtime command results. [commit](https://github.com/n8n-io/nod/commit/0e1bf88d3b7cfbe34b7c4ef7f3eed741491aefbc) (0e1bf88)
+- **apps:** Show where to find the n8n MCP token. [#1126](https://github.com/n8n-io/nod/pull/1126) (c8a220a)
+- **desktop:** Gate update actions while Mac installer runs. [commit](https://github.com/n8n-io/nod/commit/b92d6d2e540b57a503552ef5819b96581ba22d3e) (b92d6d2)
+- **desktop:** Defer Mac update checks while ShipIt is running. [commit](https://github.com/n8n-io/nod/commit/0d4685100fb8230a8bc8473013e46b7e68be3145) (0d46851)
+
+### Documentation
+
+- **desktop:** State the conditional first update check delay. [commit](https://github.com/n8n-io/nod/commit/4f36298d8e78c466dbe8f1fb4177031cd0f4a524) (4f36298)
+- **desktop:** Show where to switch servers (LAB-1414). [#1192](https://github.com/n8n-io/nod/pull/1192) (5c15757)
+
+<details>
+<summary>Maintenance (5 changes)</summary>
+
+- **desktop:** Cover shared installer waits and restart checks. [commit](https://github.com/n8n-io/nod/commit/e0dd545a6c4c8d468a488f7b3554ede684e39514) (e0dd545)
+- **ci:** Record native app sign-in diagnostics. [#1245](https://github.com/n8n-io/nod/pull/1245) (b6686bb)
+- **desktop:** Verify update waits through the startup path. [commit](https://github.com/n8n-io/nod/commit/ce2733f72a9c10bb9226d986df7536cae1e72be1) (ce2733f)
+- Bump vite 8.3.5 → 8.3.7 (patch) in nod to clear 1 Aikido finding. [#1180](https://github.com/n8n-io/nod/pull/1180) (997adad)
+- **desktop:** Cover startup ShipIt update gating. [commit](https://github.com/n8n-io/nod/commit/e393579ec1b500a777cdf0971a56328dd5940cd3) (e393579)
+
+</details>
+
+[Full changelog](https://github.com/n8n-io/nod/compare/nod-v0.9.0...517d7f5d96fe52b3ccacc5c7ce65560dabbff07a)
+
+<details>
+<summary>Build details</summary>
+
+Source: `517d7f5d96fe52b3ccacc5c7ce65560dabbff07a`
+Previous release: `nod-v0.9.0`
+
+</details>
+
 ## 0.9.0 - 2026-11-19
 
 ### Features

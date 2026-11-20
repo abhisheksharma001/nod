@@ -42,7 +42,6 @@ import { captureConnectionInventory } from './analytics-connections.ts';
 import {
   BrowserActionError,
   type BrowserAction,
-  type BrowserPage,
   type Computer,
   type Workspace,
 } from '../ports/computer.ts';
@@ -70,7 +69,7 @@ import type { MessagingTransport } from '../ports/messaging.ts';
 import type { ChannelSetupVerifier } from '../ports/channel-settings.ts';
 import type { LinkPreviewProvider } from '../ports/link-preview.ts';
 import type { FeedbackDelivery } from '../ports/feedback.ts';
-import { createN8nFeedback } from '../providers/n8n/feedback.ts';
+import { createFeedbackDelivery } from './feedback-delivery.ts';
 import { createN8nTraces } from '../providers/n8n/traces.ts';
 import { createOtlpTelemetry } from '../providers/otlp/telemetry.ts';
 import type { UsageTelemetry } from '../ports/provider-usage.ts';
@@ -340,16 +339,6 @@ export function modelEnvironment(
 export function createDefaultAdapters(
   env: Record<string, string | undefined> = process.env,
 ): ApplicationAdapters {
-  const defaultFeedbackUrl = 'https://internal.users.n8n.cloud/webhook/nod/feedback';
-  const feedbackUrl = env.NOD_FEEDBACK_URL ?? defaultFeedbackUrl;
-  const feedbackEnabled = env.NOD_FEEDBACK_ENABLED !== 'false';
-  if (
-    feedbackEnabled &&
-    feedbackUrl &&
-    feedbackUrl !== defaultFeedbackUrl &&
-    !env.NOD_FEEDBACK_RECEIPT_URL_PREFIX
-  )
-    throw new Error('Set NOD_FEEDBACK_RECEIPT_URL_PREFIX when using a custom feedback intake.');
   const bootstrap = modelEnvironment(env);
   const { provider } = bootstrap;
   const model = bootstrap.model || agentModels[provider];
@@ -685,14 +674,7 @@ export function createDefaultAdapters(
         env.NOD_ONBOARDING_EMAIL_URL ??
         'https://internal.users.n8n.cloud/webhook/nod/onboarding-updates',
     }),
-    feedback: createN8nFeedback({
-      enabled: feedbackEnabled,
-      url: feedbackUrl,
-      token: env.NOD_FEEDBACK_TOKEN,
-      receiptUrlPrefix:
-        feedbackUrl === defaultFeedbackUrl ? undefined : env.NOD_FEEDBACK_RECEIPT_URL_PREFIX,
-      recipient: feedbackUrl === defaultFeedbackUrl ? 'n8n' : undefined,
-    }),
+    feedback: createFeedbackDelivery(env),
     traces,
     get model() {
       return models.current;
@@ -1444,7 +1426,6 @@ async function initializeApplication(
       readOnly: _readOnly,
       expectUrl: _expectUrl,
       expectTarget: _expectTarget,
-      expectSelections: _expectSelections,
       ...command
     } = step as BrowserAction;
     return {
@@ -1465,25 +1446,9 @@ async function initializeApplication(
     const form = value as { method?: unknown; to?: unknown } | string | undefined;
     return typeof form === 'object' ? `${String(form.method)} ${String(form.to)}` : String(form);
   };
-  const sameBrowserTarget = (current: BrowserPage | undefined, args: Record<string, unknown>) =>
-    current?.origin === args.website &&
-    current?.url === args.page &&
-    current?.dialog === args.dialog &&
-    current?.target === args.target &&
-    isDeepStrictEqual(current?.controls?.length ? current.controls : undefined, args.control) &&
-    isDeepStrictEqual(
-      current?.dropTarget?.length ? current.dropTarget : undefined,
-      args.dropTarget,
-    ) &&
-    formSent(current?.submits) === formSent(args.submits);
   const replayBrowserStep = async (
     args: Record<string, unknown>,
-    provenance: {
-      threadId: string;
-      turnId: string;
-      signal?: AbortSignal;
-      details?: Record<string, unknown>;
-    },
+    provenance: { threadId: string; turnId: string; signal?: AbortSignal },
   ) => {
     const command = args.command as Omit<BrowserAction, 'action'> & {
       action: BrowserAction['action'] | 'upload';
@@ -1505,26 +1470,22 @@ async function initializeApplication(
         command.action === 'upload'
           ? { action: 'click', selector: String(command.selector) }
           : (command as BrowserAction),
-        provenance.signal,
       )
       .catch(() => undefined);
-    provenance.signal?.throwIfAborted();
-    if (!sameBrowserTarget(current, args)) throw notRun();
-    const expectSelections = provenance.details?.verifiedBrowserSelections;
     if (
-      typeof expectSelections !== 'string' ||
-      current?.currentSelections?.incomplete ||
-      current?.currentSelections?.binding !== expectSelections
+      current?.origin !== expectOrigin ||
+      current.url !== args.page ||
+      current.dialog !== args.dialog ||
+      current.target !== args.target ||
+      !isDeepStrictEqual(current.controls?.length ? current.controls : undefined, args.control) ||
+      !isDeepStrictEqual(
+        current.dropTarget?.length ? current.dropTarget : undefined,
+        args.dropTarget,
+      ) ||
+      formSent(current.submits) !== formSent(args.submits)
     )
-      throw Object.assign(
-        new BrowserActionError(
-          'browser_target_changed',
-          current?.currentSelections?.incomplete ??
-            'The saved current selections could not be verified.',
-        ),
-        { notRun: true },
-      );
-    const selectionBinding = { expectSelections };
+      throw notRun();
+    if (provenance.signal?.aborted) throw notRun();
     try {
       const page =
         command.action === 'upload'
@@ -1541,7 +1502,6 @@ async function initializeApplication(
                 expectOrigin,
                 expectUrl: String(args.page),
                 ...(args.target ? { expectTarget: String(args.target) } : {}),
-                ...selectionBinding,
               },
               provenance.signal,
             )
@@ -1552,14 +1512,13 @@ async function initializeApplication(
                 expectOrigin,
                 expectUrl: String(args.page),
                 ...(args.target ? { expectTarget: String(args.target) } : {}),
-                ...selectionBinding,
               },
               provenance.signal,
             );
       return { url: page.url, page: page.text };
     } catch (error) {
       if (error instanceof BrowserActionError && error.code === 'browser_target_changed')
-        throw Object.assign(error, { notRun: true });
+        throw notRun();
       throw error;
     }
   };
@@ -2575,48 +2534,6 @@ async function initializeApplication(
         }
         return tasks.execute(turn, raw, sourceMessageId, priorMessageId, priorHandoff);
       },
-      checkWorkspaceCommand: async (turn, input, signal) => {
-        signal = AbortSignal.any([signal, closing.signal]);
-        signal.throwIfAborted();
-        const verdict = await trust
-          .check(turn, 'NOD_workspace_command', input, signal)
-          .catch((error: unknown) => {
-            signal.throwIfAborted();
-            throw Object.assign(
-              new Error(
-                `The workspace command did not run because its Trust check failed: ${safeIntegrationFailure(error)}`,
-              ),
-              { notRun: true },
-            );
-          });
-        signal.throwIfAborted();
-        if (verdict.confirm)
-          throw Object.assign(
-            new Error(
-              'The workspace command did not run. Trust could not verify permission for all of its effects. Use a connected app or browser action when an approval is needed.',
-            ),
-            { notRun: true },
-          );
-        const allowed = await approvals.request(turn, 'NOD_workspace_command', input, {
-          allowed: true,
-          basis: verdict.basis,
-          expectedChatRevision: verdict.basis.kind === 'read' ? undefined : verdict.chatRevision,
-          signal,
-          run: async () => true,
-        });
-        if (allowed !== true)
-          throw Object.assign(
-            new Error(
-              'The workspace command did not run because its permission is no longer current.',
-            ),
-            { notRun: true },
-          );
-        signal.throwIfAborted();
-        return {
-          signal,
-          record: () => ledger.action(turn.turnId, 'NOD_workspace_command', verdict.basis),
-        };
-      },
       startTurn: async (turn) => {
         const origin = await turnOrigin(turn.turnId);
         if (origin?.source === 'schedule')
@@ -2679,23 +2596,6 @@ async function initializeApplication(
               `The ${action} target is not identified. Inspect a fresh snapshot or screenshot and choose the actual control. Do not ask the owner to approve an unidentified ${action}.`,
             );
           }
-          signal?.throwIfAborted();
-          const current = turn.browserId
-            ? await computer.currentPage(
-                turn.browserId,
-                request.step.action === 'upload'
-                  ? { action: 'click', selector: request.step.selector }
-                  : request.step,
-                signal,
-              )
-            : request.page;
-          if (!sameBrowserTarget(current, args))
-            throw new BrowserActionError('browser_target_changed');
-          const selections = current.currentSelections;
-          if (!selections?.binding || selections.incomplete)
-            throw new Error(
-              selections?.incomplete ?? 'The current selections could not be verified.',
-            );
           const visible =
             turn.browserId &&
             (await computer
@@ -2720,13 +2620,9 @@ async function initializeApplication(
                 },
                 () => undefined,
               ));
-          return {
-            ...(typeof visible === 'string' && visible.trim()
-              ? { pageText: publicText(visible.slice(0, 20_000)) }
-              : {}),
-            currentSelections: selections.values,
-            verifiedBrowserSelections: selections.binding,
-          };
+          return typeof visible === 'string' && visible.trim()
+            ? { pageText: publicText(visible.slice(0, 20_000)) }
+            : {};
         };
         if (!verdict.confirm) {
           if (verdict.basis.kind === 'read') return 'run';
@@ -2741,7 +2637,6 @@ async function initializeApplication(
             admit: async (asks) => {
               if (asks && request.subagent) throw new Error('A subagent cannot ask the owner.');
             },
-            expectedChatRevision: verdict.chatRevision,
             signal,
             run: async () => 'run',
           });
@@ -2754,7 +2649,6 @@ async function initializeApplication(
         if (request.subagent) return 'refused';
         const result = await approvals.request(turn, 'NOD_browser', args, {
           signal,
-          expectedChatRevision: verdict.chatRevision,
           details: { reason: verdict.reason },
           prepareConfirmation,
         });
@@ -2825,7 +2719,6 @@ async function initializeApplication(
             signal,
             allowed: !verdict.confirm,
             ...(verdict.confirm ? {} : { basis: verdict.basis }),
-            expectedChatRevision: verdict.chatRevision,
             admit,
             details: verdict.confirm ? { reason: verdict.reason } : {},
           });
@@ -2838,7 +2731,6 @@ async function initializeApplication(
             signal,
             allowed: !verdict.confirm,
             ...(verdict.confirm ? {} : { basis: verdict.basis }),
-            expectedChatRevision: verdict.chatRevision,
             admit,
             details: {
               current: await ledger.limits(),
@@ -2903,7 +2795,6 @@ async function initializeApplication(
             signal,
             allowed: !verdict.confirm,
             ...(verdict.confirm ? {} : { basis: verdict.basis }),
-            expectedChatRevision: verdict.chatRevision,
             admit,
             instructionChange: verdict.instructionChange,
             expectedRevision: prepared?.revision,
@@ -2944,7 +2835,6 @@ async function initializeApplication(
             signal,
             allowed: !verdict.confirm,
             ...(verdict.confirm ? {} : { basis: verdict.basis }),
-            expectedChatRevision: verdict.chatRevision,
             admit,
             details: verdict.confirm ? { reason: verdict.reason } : {},
           });
@@ -3106,8 +2996,6 @@ async function initializeApplication(
           await options.admit?.(verdict.confirm);
           return approvals.request(turn, action, prepared, {
             allowed: !verdict.confirm,
-            expectedChatRevision:
-              verdict.confirm || verdict.basis.kind !== 'read' ? verdict.chatRevision : undefined,
             signal: options.signal,
             run: async () => {
               const result = await computerUse.execute(turn, action, prepared, options.signal);
@@ -3151,7 +3039,6 @@ async function initializeApplication(
             ...(verdict.confirm ? {} : { basis: verdict.basis }),
             signal: options.signal,
             admit: options.admit,
-            expectedChatRevision: verdict.chatRevision,
             details: {
               ...(typeof args.path === 'string' ? { requestedPath: args.path } : {}),
               accessScope:
@@ -3315,8 +3202,6 @@ async function initializeApplication(
         const result = await approvals.request(turn, action, prepared, {
           allowed: !verdict.confirm,
           admit: options.admit,
-          expectedChatRevision:
-            verdict.confirm || verdict.basis.kind !== 'read' ? verdict.chatRevision : undefined,
           signal: options.signal,
           validate: async (client) => {
             if (verifiedInstructionRevision)

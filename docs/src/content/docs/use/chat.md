@@ -233,11 +233,11 @@ Open the **Settings** page, then **Models** to choose the model Nod uses from yo
 
 ## Adjust the sidebar
 
-On a wide screen, move your pointer near the sidebar's right edge to reveal its middle button. Select it to expand or collapse the sidebar. You can also Tab to the button; on touch screens, it stays visible. Narrow screens use the navigation menu at the top.
+On a wide screen, select the sidebar button to hide or show the sidebar. In the desktop app it sits at the top-left of the window, beside the traffic lights on a Mac. Drag the sidebar's right edge to make it narrower or wider; drag it far to the left to hide the sidebar, and drag from the window's left edge to bring it back. Narrow screens use the navigation menu at the top.
 
 ## Desktop shortcuts
 
-In the desktop app, hold Command on a Mac or Ctrl on Windows and Linux to reveal the navigation tooltips. These are the same tooltips shown on hover. Use that key with 1–6 for Chat, Scheduled, Apps, Channels, Usage and Vault, including while the chat message box is focused; B expands or collapses the sidebar, and comma opens Settings. Web browsers keep their own shortcuts.
+In the desktop app, hold Command on a Mac or Ctrl on Windows and Linux to reveal the navigation tooltips. These are the same tooltips shown on hover. Use that key with 1–6 for Chat, Scheduled, Apps, Channels, Usage and Vault, including while the chat message box is focused; B hides or shows the sidebar, and comma opens Settings. Web browsers keep their own shortcuts.
 
 ## React to messages
 
@@ -284,6 +284,8 @@ A request, task or schedule run that stops on an unexpected error outside the mo
 In Telegram and WhatsApp, the draft arrives as text. Reply "send" to share the summary, without a diagnostic report, since you can't review one there. To add the report, send the same draft from its card in Nod on your computer. Nod sends it only when your reply clearly asks for that, and otherwise asks you to confirm first. Nothing is sent until you click **Send report** or reply to send it.
 
 **Include diagnostic report** starts selected for every feedback category until you change it. It adds recent messages, tool inputs and results, errors, and app activity to help fix problems and improve Nod. Known secrets and recognized personal details are masked, but redaction can miss information.
+
+When a private sign-in choice fails a safety check, the report can include a fixed reason, such as a changed control or a covered button. This reason contains no page text, selector, website address or account value.
 
 Select **Review** to inspect the **Chat**, **Activity** and **Connections** tabs. Tool activity groups each input with its result and status. **Download** saves the same redacted report as a JSON file. Untick the checkbox to leave it out. Nod remembers your choice for your account on this device, including after sending or discarding a draft.
 

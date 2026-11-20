@@ -1,10 +1,10 @@
 {
-  "version": "0.9.0",
-  "previousTag": "nod-v0.8.4",
-  "source": "94fe4b57b42e3a046ac8c6514cab0aa423f95409",
-  "highlights": "## 🖥️ Put Nod to work in your apps\n\nNod can now use apps on your Mac or Windows computer. Ask it to write a list in TextEdit or Notepad, fill a table in Numbers, or write a Mail draft.\n\nTry telling Nod: “Open TextEdit and write a shopping list: milk, bread, eggs. Don’t save it.”\n\nTurn it on in **Settings → Computer use**. On a Mac, also allow Accessibility. Computer use is experimental and off by default. It works only on work you start. Nod checks changes against your request, and you can select **Stop** while it works. You can also tell Nod to keep out of an app.\n\nComputer use does not work in the Linux Flatpak app yet. [See setup and limits](https://nod.n8n.io/docs/connect/computer-use/).\n\n## Also in this release\n\n- **Schedules:** Select **Stop this run** to end the current run and keep future runs enabled. Late, skipped and failed runs show what happened in chat.\n- **Fresh chat:** Send `/clear` to start fresh. Your files, apps, memory and schedules stay. Previous messages remain in chat search.\n- **Desktop updates:** Interrupted Windows downloads can resume, and downloaded updates install when you quit. Mac updates can finish if you reopen Nod during installation.\n- **Writing in chat:** Fixes for pasted links, text formatting and fast typing keep the message box working as you write.",
+  "version": "0.9.1",
+  "previousTag": "nod-v0.9.0",
+  "source": "517d7f5d96fe52b3ccacc5c7ce65560dabbff07a",
+  "highlights": "## More room for your work\n\nDrag the edge of the sidebar to change its width, or hide it for more space. Nod remembers your choice.\n\n## See what your schedules are doing\n\nOpen a scheduled run to see its current activity and completed steps. Each completed step appears once.\n\n## Also in this release\n\n- **Draft review:** If you ask to review a draft before it is sent, that review stays required after edits.\n- **Startup help:** Send a startup report even when chat cannot open.\n- **Telegram:** Approve or decline requests with buttons in Telegram.\n- **Connections:** Rename custom MCP connections. Failed model connections keep the service's reason.\n- **Privacy:** Bug reports mask more personal details. Review the report before you send it.\n- **Mac updates:** Update checks wait until an update already in progress finishes.",
   "video": {
-    "url": "https://github.com/user-attachments/assets/6bbf8708-f968-4603-9843-9c4ca5512ad9",
-    "releaseSha256": "a54d21a789573d7e17306826b7d75922d47272512d015831b0ab1a908badde49"
+    "url": "https://github.com/user-attachments/assets/8be1aa61-3119-4c1f-9c64-bdd333b07a00",
+    "releaseSha256": "691a8291464e48f10e51d7f44b5b31c8719bfa902f2fdaa4f865b99a0436a0ad"
   }
 }
