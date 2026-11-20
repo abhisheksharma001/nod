@@ -330,7 +330,7 @@ export function createTrust(options: {
       : await review(instructions, input, signal).catch((error: unknown) => {
           failed = true;
           clearedFailure = error instanceof ClearedMessageReviewError;
-          logFailure('trust_check_failed', error);
+          if (!signal?.aborted) logFailure('trust_check_failed', error);
           if (
             !clearedFailure &&
             action !== 'GMAIL_SEND_EMAIL' &&

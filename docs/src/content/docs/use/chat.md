@@ -285,6 +285,8 @@ In Telegram and WhatsApp, the draft arrives as text. Reply "send" to share the s
 
 **Include diagnostic report** starts selected for every feedback category until you change it. It adds recent messages, tool inputs and results, errors, and app activity to help fix problems and improve Nod. Known secrets and recognized personal details are masked, but redaction can miss information.
 
+When a private sign-in choice fails a safety check, the report can include a fixed reason, such as a changed control or a covered button. This reason contains no page text, selector, website address or account value.
+
 Select **Review** to inspect the **Chat**, **Activity** and **Connections** tabs. Tool activity groups each input with its result and status. **Download** saves the same redacted report as a JSON file. Untick the checkbox to leave it out. Nod remembers your choice for your account on this device, including after sending or discarding a draft.
 
 Preparing a report sends recent app activity and errors to your Nod runtime for redaction and assembly. The feedback recipient receives your submission only after you select **Send feedback**. If preparation fails, select **Continue without report**.

@@ -3023,6 +3023,58 @@ test(
         await finish(declined.turnId, 'cancelled');
       });
 
+      await t.test('stopped Trust reviews do not log provider failures', async () => {
+        const { withFailureLog } = await import('../src/server/failure-log.ts');
+        for (const action of ['GMAIL_SEND_EMAIL', 'NOD_workspace_command']) {
+          const turn = await begin('Read the synthetic workspace and email Ana the result.');
+          const controller = new AbortController();
+          const stopped = new Error('Synthetic owner Stop.');
+          const provider = Object.assign(new Error('Synthetic review failed with HTTP 503.'), {
+            providerStatus: 503,
+          });
+          let enter!: () => void;
+          let release!: () => void;
+          const entered = new Promise<void>((resolve) => {
+            enter = resolve;
+          });
+          const released = new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          const logged: Array<{ event: string; error: unknown }> = [];
+          const sink = (event: string, error: unknown) => {
+            logged.push({ event, error });
+          };
+          const checker = createTrust({
+            pool: db.pool,
+            ownerId,
+            review: async () => {
+              enter();
+              await released;
+              throw provider;
+            },
+          });
+          const args =
+            action === 'NOD_workspace_command' ? { command: 'pwd' } : email('ana@example.test');
+          const checking = withFailureLog(sink, () =>
+            checker.check(turn, action, args, controller.signal),
+          );
+          await entered;
+          controller.abort(stopped);
+          release();
+          await assert.rejects(checking, (error: unknown) => error === stopped);
+          assert.equal(logged.length, 0);
+
+          const failure = withFailureLog(sink, () => checker.check(turn, action, args));
+          if (action === 'NOD_workspace_command')
+            await assert.rejects(failure, (error: unknown) => error === provider);
+          else assert.equal((await failure).confirm, true);
+          assert.deepEqual(logged, [{ event: 'trust_check_failed', error: provider }]);
+          assert.equal(Object(logged[0]!.error).providerStatus, 503);
+          assert.match(Object(logged[0]!.error).message, /HTTP 503/);
+          await finish(turn.turnId, 'cancelled');
+        }
+      });
+
       await t.test(
         'a browser step quoted from informal owner words runs, and uncovered steps still ask',
         async () => {

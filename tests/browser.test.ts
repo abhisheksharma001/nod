@@ -58,6 +58,7 @@ import {
 import { stagedLoginBrowser } from './login-fixture.ts';
 import { fakeComputer, fakeWorkspace } from './runtime-fixtures.ts';
 import { accessCookie, accessKey } from '../src/server/access.ts';
+import { withFailureLog } from '../src/ports/failure-log.ts';
 
 // Shared helpers
 
@@ -1762,6 +1763,71 @@ test('a failed workspace browser action names only Nod-authored reasons', async 
       await assert.rejects(computer.act('task', { action: 'open', url: 'https://example.com/' }), {
         message: 'The workspace browser could not complete this action. Try again.',
       });
+  } finally {
+    await fixture.close();
+  }
+});
+
+test('sign-in refusal guards cross the worker boundary without private values or merged causes', async () => {
+  const privateValue = 'picker-private@example.test/private-selector';
+  let failure: Error;
+  const failures: unknown[] = [];
+  const fixture = await harness({
+    computer: {
+      ...syntheticComputer(),
+      signInMethods: async () => {
+        throw failure;
+      },
+    },
+  });
+  try {
+    const computer = fixture.client('/synthetic/sign-in-guard');
+    const inspect = () =>
+      withFailureLog(
+        (event, error, context) => failures.push({ event, error, context }),
+        () =>
+          computer.signInMethods!('task', 'https://example.test', [
+            { label: privateValue, selector: `[data-account="${privateValue}"]` },
+          ]),
+      );
+    for (const guard of ['control_changed', 'choice_duplicate'] as const) {
+      failure = Object.assign(new BrowserActionError('browser_target_changed', undefined, guard), {
+        cause: privateValue,
+      });
+      await assert.rejects(inspect(), (error: unknown) => {
+        assert.ok(error instanceof BrowserActionError);
+        assert.equal(error.signInGuard, guard);
+        assert.equal(error.code, 'browser_target_changed');
+        assert.equal(error.detail, undefined);
+        assert.equal(error.cause, undefined);
+        return true;
+      });
+    }
+    assert.deepEqual(
+      failures.map((failure) => Object(failure).context.signInGuard),
+      ['control_changed', 'choice_duplicate'],
+    );
+    failure = Object.assign(new Error(privateValue), { signInGuard: 'control_covered' });
+    await assert.rejects(inspect(), (error: unknown) => {
+      assert.equal(Object(error).signInGuard, 'control_covered');
+      assert.equal(
+        Object(error).message,
+        'The workspace browser could not complete this action. Try again.',
+      );
+      return true;
+    });
+    failure = Object.assign(new Error(privateValue), { signInGuard: privateValue });
+    await assert.rejects(inspect(), (error: unknown) => {
+      assert.equal(Object(error).signInGuard, undefined);
+      assert.ok(
+        !JSON.stringify(
+          Object.getOwnPropertyNames(error).map((key) => Object(error)[key]),
+        ).includes(privateValue),
+      );
+      return true;
+    });
+    assert.equal(Object(failures.at(-1)).context.signInGuard, undefined);
+    assert.ok(!JSON.stringify(failures).includes(privateValue));
   } finally {
     await fixture.close();
   }

@@ -41,6 +41,37 @@ const browserErrors = {
 } as const;
 
 export type BrowserErrorCode = keyof typeof browserErrors;
+export const browserSignInGuards = [
+  'invalid_request',
+  'browser_unavailable',
+  'navigation_failed',
+  'origin_changed',
+  'reference_missing',
+  'selector_rejected',
+  'choice_missing',
+  'choice_ineligible',
+  'choice_accessibility',
+  'choice_foreign_origin',
+  'choice_duplicate',
+  'control_changed',
+  'document_changed',
+  'frame_changed',
+  'selection_missing',
+  'selection_unknown',
+  'selection_origin_changed',
+  'selection_document_changed',
+  'control_hidden',
+  'frame_transform',
+  'control_covered',
+  'click_guard_changed',
+  'click_not_received',
+] as const;
+export type BrowserSignInGuard = (typeof browserSignInGuards)[number];
+
+export function browserSignInGuard(value: unknown): BrowserSignInGuard | undefined {
+  return browserSignInGuards.find((guard) => guard === value);
+}
+
 export const browserErrorCodes = Object.keys(browserErrors) as [
   BrowserErrorCode,
   ...BrowserErrorCode[],
