@@ -254,7 +254,9 @@ export function conversationFiles(
     const { all } = messageFiles(message.attachments);
     const parsed = presentationSchema.safeParse(message.presentation);
     const presentation: ImagePreview[] =
-      message.id && parsed.success && !['image', 'apps', 'bug-report'].includes(parsed.data.type)
+      message.id &&
+      parsed.success &&
+      !['image', 'apps', 'bug-report', 'schedule-run'].includes(parsed.data.type)
         ? [
             {
               id: `presentation:${message.id}`,

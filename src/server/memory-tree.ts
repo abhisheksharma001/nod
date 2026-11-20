@@ -35,7 +35,10 @@ export function personalSecret(text: string) {
 }
 const slugPattern = '[a-z0-9]+(?:-[a-z0-9]+)*';
 export function unsafe(...texts: Array<string | undefined>) {
-  return texts.some((text) => !!text && personalSecret(text));
+  return texts.some(
+    (text) =>
+      !!text && (personalSecret(text) || personalSecret(text.replace(/[^\S\n]*\n\s*/g, ''))),
+  );
 }
 
 export const id = z.uuid();
@@ -99,7 +102,7 @@ const entryFields = z.object({
   sources: z.array(id).max(5),
   expires: z.iso.date().optional(),
   fact: factSchema.optional().catch(undefined),
-  quote: line(400).optional().catch(undefined),
+  quote: lines(400).optional().catch(undefined),
 });
 const evidenced = (entry: z.infer<typeof entryFields>) =>
   entry.sources.length > 0 || !!entry.edited || entry.origin === 'email';
@@ -160,7 +163,10 @@ export const pathOf = (entry: { area: Area; slug: string }) => `${entry.area}/${
 const bySlug = (a: Entry, b: Entry) => a.slug.localeCompare(b.slug);
 export const locate = (tree: Tree, target: string) =>
   tree.entries.find((entry) => pathOf(entry) === target);
-export const fold = (value: string) => value.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase();
+export const fold = (value: string) =>
+  value.normalize('NFD').replace(/\p{M}/gu, '').replace(/\s+/g, ' ').toLowerCase();
+export const foldQuote = (value: string) =>
+  fold(value.replace(/[“”«»„‟]/g, '"').replace(/[‘’‚‛‹›]/g, "'"));
 const segmenter = new Intl.Segmenter(undefined, { granularity: 'word' });
 const cjk = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 const tokens = (value: string) =>
@@ -394,7 +400,7 @@ export function view(
   const sources = (entry: Entry) =>
     entry.sources.map((id) => {
       const found = source(id);
-      return entry.quote && found.text && fold(found.text).includes(fold(entry.quote))
+      return entry.quote && found.text && foldQuote(found.text).includes(foldQuote(entry.quote))
         ? { ...found, quote: entry.quote }
         : found;
     });

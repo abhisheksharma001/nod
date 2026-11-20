@@ -87,7 +87,6 @@ export function LiveLine({
   history?: boolean;
 }) {
   const labelId = useId();
-  const [closedTurn, setClosedTurn] = useState<string>();
   const step = item?.step?.trim();
   const site = item?.doing === 'tool' ? item.site : null;
   const minutes = useQuietMinutes(item?.quietSince ?? '', quiet && Boolean(item));
@@ -122,12 +121,7 @@ export function LiveLine({
   );
   if (!history || !item?.recent?.length) return current;
   return (
-    <details
-      className="live-line"
-      key={item.turnId}
-      open={closedTurn !== item.turnId}
-      onToggle={(event) => setClosedTurn(event.currentTarget.open ? undefined : item.turnId)}
-    >
+    <details className="live-line" key={item.turnId}>
       <summary aria-labelledby={labelId}>
         {current}
         <ChevronDown size={14} aria-hidden="true" />

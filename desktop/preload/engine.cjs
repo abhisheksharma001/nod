@@ -74,6 +74,8 @@ contextBridge.exposeInMainWorld('nodDesktop', {
   ready: () => invoke('nod:renderer-ready'),
   updateStatus: () => invoke('nod:updates:status'),
   dismissUpdate: (version) => invoke('nod:updates:dismiss', version),
+  retryUpdate: (id) => invoke('nod:updates:retry', id),
+  downloadUpdate: () => invoke('nod:updates:download'),
   restartUpdate: () => invoke('nod:updates:restart'),
   onUpdateStatus: (listener) => {
     const receive = (_event, value) => listener(value);
@@ -139,5 +141,11 @@ contextBridge.exposeInMainWorld('nodDesktop', {
     const receive = (_event, value) => listener(value);
     ipcRenderer.on('nod:preferences', receive);
     return () => ipcRenderer.removeListener('nod:preferences', receive);
+  },
+  getFullScreen: () => invoke('nod:fullscreen:get'),
+  onFullScreen: (listener) => {
+    const receive = (_event, value) => listener(value === true);
+    ipcRenderer.on('nod:fullscreen', receive);
+    return () => ipcRenderer.removeListener('nod:fullscreen', receive);
   },
 });

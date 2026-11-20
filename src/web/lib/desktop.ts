@@ -49,6 +49,12 @@ export type DesktopUpdateStatus = {
   progress?: number;
   readyVersion?: string;
   dismissedVersion?: string;
+  failure?: {
+    id: number;
+    phase: 'checking' | 'preparing' | 'downloading' | 'restart';
+    message: string;
+    dismissed?: boolean;
+  };
 };
 
 export type DesktopSettingsChange = Partial<
@@ -87,7 +93,9 @@ type DesktopWindow = Window & {
     onStatus?(listener: (status: DesktopStatus) => void): () => void;
     updateStatus?(): Promise<DesktopUpdateStatus>;
     onUpdateStatus?(listener: (status: DesktopUpdateStatus) => void): () => void;
-    dismissUpdate?(version: string): Promise<void>;
+    dismissUpdate?(version: string | number): Promise<void>;
+    retryUpdate?(id: number): Promise<void>;
+    downloadUpdate?(): Promise<void>;
     restartUpdate?(): Promise<void>;
     prepare?(options?: { retry: boolean }): Promise<DesktopStatus>;
     savePreferences?(input: DesktopSettingsChange): Promise<DesktopSettings>;
@@ -113,6 +121,8 @@ type DesktopWindow = Window & {
     onFeedbackRequested?(listener: () => void): () => void;
     setTheme(theme: DesktopPreferences['theme']): Promise<DesktopPreferences>;
     onPreferences(listener: (preferences: DesktopPreferences) => void): () => void;
+    getFullScreen?(): Promise<boolean>;
+    onFullScreen?(listener: (fullScreen: boolean) => void): () => void;
     onFocusMessage?(
       listener: (target: { threadId: string; messageId: string } | null) => void,
     ): () => void;
@@ -120,6 +130,18 @@ type DesktopWindow = Window & {
     setChatReadCursor?(ownerId: string, threadId: string, cursor: ChatReadCursor): Promise<void>;
   };
 };
+
+export function initializeDesktopFullScreen() {
+  const bridge = (window as DesktopWindow).nodDesktop;
+  const apply = (fullScreen: boolean) => {
+    document.documentElement.dataset.fullscreen = String(fullScreen);
+  };
+  bridge?.onFullScreen?.(apply);
+  void bridge
+    ?.getFullScreen?.()
+    .then(apply)
+    .catch(() => {});
+}
 
 export function desktopRendererReady() {
   void (window as DesktopWindow).nodDesktop?.ready?.();
@@ -327,10 +349,22 @@ export function subscribeDesktopUpdateStatus(listener: (status: DesktopUpdateSta
   return (window as DesktopWindow).nodDesktop?.onUpdateStatus?.(listener) ?? (() => {});
 }
 
-export function dismissDesktopUpdate(version: string) {
+export function dismissDesktopUpdate(version: string | number) {
   const dismiss = (window as DesktopWindow).nodDesktop?.dismissUpdate;
   if (!dismiss) return Promise.reject(new Error('Desktop updates are unavailable.'));
   return dismiss(version);
+}
+
+export function retryDesktopUpdate(id: number) {
+  const retry = (window as DesktopWindow).nodDesktop?.retryUpdate;
+  if (!retry) return Promise.reject(new Error('Desktop updates are unavailable.'));
+  return retry(id);
+}
+
+export function downloadDesktopUpdate() {
+  const download = (window as DesktopWindow).nodDesktop?.downloadUpdate;
+  if (!download) return Promise.reject(new Error('Desktop updates are unavailable.'));
+  return download();
 }
 
 export function restartDesktopUpdate() {

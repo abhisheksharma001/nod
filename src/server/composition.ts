@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
+import { isEnterKey } from '../shared/browser-keys.ts';
 import { z } from 'zod';
 import {
   appConfirmation,
@@ -18,6 +19,7 @@ import {
   modelProviderNames,
   modelProviders,
   modelSource,
+  canReuseWorkCost,
   repriceUsd,
   type ModelIssue,
   type ModelSelection,
@@ -44,6 +46,7 @@ import {
   type Workspace,
 } from '../ports/computer.ts';
 import { fileBytes } from '../shared/files.ts';
+import { localeRegion, timeZoneRegion } from '../shared/date-locale.ts';
 import type { ObservationProvider, ObservationSource } from '../ports/proactivity.ts';
 import type { IntegrationProvider } from '../ports/integrations.ts';
 import { hasWorkspaceFiles, saveIntegrationFiles } from './integration-files.ts';
@@ -52,7 +55,9 @@ import { createMailCheck } from './mail-check.ts';
 import type { CredentialKeyStore } from '../ports/key-store.ts';
 import type { PasswordManager } from '../ports/password-manager.ts';
 import type { Trash } from '../ports/trash.ts';
+import type { DesktopControl } from '../ports/desktop.ts';
 import { desktopTrash } from '../providers/trash.ts';
+import { desktopControl } from '../providers/desktop.ts';
 import type { KeepAwake } from '../ports/keep-awake.ts';
 import { desktopKeepAwake } from '../providers/keep-awake.ts';
 import type { MemoryCurator } from '../ports/memory-curator.ts';
@@ -64,7 +69,7 @@ import type { MessagingTransport } from '../ports/messaging.ts';
 import type { ChannelSetupVerifier } from '../ports/channel-settings.ts';
 import type { LinkPreviewProvider } from '../ports/link-preview.ts';
 import type { FeedbackDelivery } from '../ports/feedback.ts';
-import { createN8nFeedback } from '../providers/n8n/feedback.ts';
+import { createFeedbackDelivery } from './feedback-delivery.ts';
 import { createN8nTraces } from '../providers/n8n/traces.ts';
 import { createOtlpTelemetry } from '../providers/otlp/telemetry.ts';
 import type { UsageTelemetry } from '../ports/provider-usage.ts';
@@ -91,6 +96,7 @@ import { createDiscoveredOAuth } from '../providers/discovered/oauth.ts';
 import { createDiscoveredConnections } from './discovered-connections.ts';
 import { bundledApps } from './app-catalog.ts';
 import { createLocalFiles, isLocalFilesAction } from './local-files.ts';
+import { createComputerUse, isComputerAction } from './computer-use.ts';
 import { createAppGrantVault } from './vault-app-grants.ts';
 import { createDockerWorkspace } from '../providers/docker/index.ts';
 import { createEnvironmentKeyStore } from '../providers/environment/key-store.ts';
@@ -120,7 +126,7 @@ import { createPublicLinkPreviewProvider } from '../providers/public-web/link-pr
 import { createAgentRuntime } from '../runtime/index.ts';
 import { coreSkills } from '../runtime/prompt.ts';
 import { createApp } from './app.ts';
-import { credentialRequestKey } from './access.ts';
+import { credentialRequestKey, traceKey } from './access.ts';
 import { createWorkAdmission, createWorkConsumers } from './work-admission.ts';
 import { createWritingStyleLearning } from './writing-style.ts';
 import { createChatVerification } from './chat-verification.ts';
@@ -141,7 +147,12 @@ import { lockProactivity } from './locks.ts';
 import { createObservationSources } from './observation-sources.ts';
 import { createTaskObservations } from './task-observations.ts';
 import type { TrustBasis } from './trust-basis.ts';
-import { validateScheduledInstructions } from './owner-instructions.ts';
+import {
+  validateInstructionRevision,
+  validateScheduledInstructions,
+  instructionSourceMessageIds,
+  type InstructionRevision,
+} from './owner-instructions.ts';
 import { localArtifacts } from './artifacts.ts';
 import { memoryFileName, memoryMarkdown } from '../shared/memory-export.ts';
 import { createChannels } from './channels.ts';
@@ -160,7 +171,12 @@ import { createDocumentation } from './documentation.ts';
 import { initializeDatabase, pool } from './db.ts';
 import { events, refresh } from './events.ts';
 import { createIntegrations } from './integrations.ts';
-import { gmailDraftTarget, gmailMessageTarget } from './action-presentation.ts';
+import {
+  calendarEventTarget,
+  gmailDraftTarget,
+  gmailMessageTarget,
+  isCalendarEventChange,
+} from './action-presentation.ts';
 import {
   createErrorRedactor,
   createCommandRedactor,
@@ -207,7 +223,13 @@ import type { VaultActivityReason } from '../shared/contracts.ts';
 import { createTriage, getPreferences } from './triage.ts';
 import { createTasks } from './tasks.ts';
 import { createActivity } from './activity.ts';
-import { checkedKeyStore, createVault, credentialOrigin, sealedDataExists } from './vault.ts';
+import {
+  checkedKeyStore,
+  createVault,
+  credentialOrigin,
+  credentialOrigins,
+  sealedDataExists,
+} from './vault.ts';
 import { createVaultAccess } from './vault-access.ts';
 import { createPayments } from './payments.ts';
 import { BrowserConnectionError, createBrowserConnections } from './browser-connections.ts';
@@ -231,6 +253,7 @@ export interface ApplicationAdapters {
   keyStore: CredentialKeyStore;
   passwordManager?: PasswordManager;
   trash?: Trash;
+  desktop?: DesktopControl;
   keepAwake?: KeepAwake;
   localFilesHome?: string;
   memoryCurator?: MemoryCurator;
@@ -316,16 +339,6 @@ export function modelEnvironment(
 export function createDefaultAdapters(
   env: Record<string, string | undefined> = process.env,
 ): ApplicationAdapters {
-  const defaultFeedbackUrl = 'https://internal.users.n8n.cloud/webhook/nod/feedback';
-  const feedbackUrl = env.NOD_FEEDBACK_URL ?? defaultFeedbackUrl;
-  const feedbackEnabled = env.NOD_FEEDBACK_ENABLED !== 'false';
-  if (
-    feedbackEnabled &&
-    feedbackUrl &&
-    feedbackUrl !== defaultFeedbackUrl &&
-    !env.NOD_FEEDBACK_RECEIPT_URL_PREFIX
-  )
-    throw new Error('Set NOD_FEEDBACK_RECEIPT_URL_PREFIX when using a custom feedback intake.');
   const bootstrap = modelEnvironment(env);
   const { provider } = bootstrap;
   const model = bootstrap.model || agentModels[provider];
@@ -505,6 +518,7 @@ export function createDefaultAdapters(
       open: desktopMode ? desktopOnePassword() : forkedOnePassword(env.NOD_APP_VERSION || 'source'),
     }),
     trash: desktopMode ? desktopTrash() : undefined,
+    desktop: desktopMode ? desktopControl() : undefined,
     keepAwake: desktopMode ? desktopKeepAwake() : undefined,
     workspace: createDockerWorkspace({
       container: env.WORKSPACE_CONTAINER || 'nod-workspace',
@@ -660,14 +674,7 @@ export function createDefaultAdapters(
         env.NOD_ONBOARDING_EMAIL_URL ??
         'https://internal.users.n8n.cloud/webhook/nod/onboarding-updates',
     }),
-    feedback: createN8nFeedback({
-      enabled: feedbackEnabled,
-      url: feedbackUrl,
-      token: env.NOD_FEEDBACK_TOKEN,
-      receiptUrlPrefix:
-        feedbackUrl === defaultFeedbackUrl ? undefined : env.NOD_FEEDBACK_RECEIPT_URL_PREFIX,
-      recipient: feedbackUrl === defaultFeedbackUrl ? 'n8n' : undefined,
-    }),
+    feedback: createFeedbackDelivery(env),
     traces,
     get model() {
       return models.current;
@@ -743,12 +750,28 @@ async function initializeApplication(
     failure: FailureLogSink;
   },
 ) {
+  let traceKeyFailure: unknown;
+  if (adapters.traces) {
+    try {
+      adapters.traces.configure({
+        conversationKey: Buffer.from(await traceKey(dataRoot), 'base64url'),
+      });
+    } catch (error) {
+      traceKeyFailure = error;
+    }
+  }
   const analytics = await createAnalytics({
     provider: adapters.analytics,
     environment: analyticsEnvironment(process.env),
     dataRoot,
     installationId: process.env.NOD_ANALYTICS_ID,
     appVersion: process.env.NOD_APP_VERSION,
+    withTraceContext:
+      adapters.traces &&
+      ((operation) => {
+        const turnId = randomUUID();
+        return adapters.traces!.withTurn({ sessionId: turnId, turnId }, operation);
+      }),
   });
   let observeConnections: ((only?: 'apps' | 'models') => Promise<void>) | undefined;
   let observeChannels: (() => Promise<void>) | undefined;
@@ -845,8 +868,17 @@ async function initializeApplication(
       typeof status === 'number' && Number.isInteger(status) && status >= 400 && status <= 599
         ? `HTTP ${status}: `
         : '';
+    const upstream = (error as { upstreamStatus?: unknown } | null)?.upstreamStatus;
+    const upstreamCode =
+      typeof upstream === 'number' &&
+      Number.isInteger(upstream) &&
+      upstream >= 400 &&
+      upstream <= 599 &&
+      upstream !== status
+        ? `upstream HTTP ${upstream}: `
+        : '';
     const message = error instanceof Error ? error.message : String(error);
-    return `${code}${publicText(redactIntegrationFailure(message)).slice(0, 600)}`;
+    return `${code}${upstreamCode}${publicText(redactIntegrationFailure(message)).slice(0, 600)}`;
   };
   adapters.models?.onSecrets((values) => {
     for (const value of values) if (!secrets.includes(value)) secrets.push(value);
@@ -858,6 +890,7 @@ async function initializeApplication(
     ownerId,
     analytics: captureAnalytics,
     telemetry: adapters.telemetry,
+    pricingThresholds: () => adapters.models?.pricingThresholds() ?? [],
   });
   await ledger.initialize();
   adapters.models?.setRequestBudget?.(ledger.reserve);
@@ -883,7 +916,7 @@ async function initializeApplication(
     ),
   );
   const decisions = adapters.decisions && ledger.decisions(adapters.decisions);
-  const review: ModelReview = async (instructions, input, signal, question) => {
+  const review: ModelReview = async (instructions, input, signal, question, responseSchema) => {
     if (question) {
       const result = await decisions?.check({ instructions, input, question }, signal);
       if (result !== undefined) return result;
@@ -891,7 +924,7 @@ async function initializeApplication(
       instructions += `\nReply with only JSON with one property, ${JSON.stringify(question.name)}. Its value must be one of: ${values.map((value) => JSON.stringify(value)).join(', ')}.`;
     }
     return onboardingCurator.configured
-      ? onboardingCurator.curate({ task: 'review', instructions, input }, signal)
+      ? onboardingCurator.curate({ task: 'review', instructions, input, responseSchema }, signal)
       : undefined;
   };
   const mailCheck = createMailCheck({ curator, decisions });
@@ -1028,10 +1061,13 @@ async function initializeApplication(
   });
   const memoryRecall = createMemoryRecall({ pool, ownerId, memory, curator });
   const writingStyle = createWritingStyleLearning({ memory, curator });
+  let channels: Awaited<ReturnType<typeof createChannels>> | undefined;
   const communication = createCommunication({
     pool,
     ownerId,
     review,
+    canDeliverLiteral: (channel, text, literal) =>
+      channels?.canDeliverLiteral(channel, text, literal) ?? false,
     preferences: async () =>
       (await memory.load()).entries
         .filter(
@@ -1076,6 +1112,7 @@ async function initializeApplication(
     localFilesAvailable: Boolean(adapters.trash),
     consumers,
     stopConsumer: (id) => boss.offWork('scheduled-task', { id, wait: true }),
+    clearBrowser: (id) => adapters.computer.clear(id),
     taskModels: {
       list: () => tasks.ownModels(),
       title: (id) => tasks.modelTask(id),
@@ -1109,15 +1146,14 @@ async function initializeApplication(
           : (model ?? models.workModel(origin).selection),
       );
       if (!target) return null;
-      const withChoiceUsd =
-        spent.models.length === 1 && spent.models[0] === target.modelId
-          ? last30Usd
-          : repriceUsd(spent, target.pricing);
+      const withChoiceUsd = canReuseWorkCost(spent, target.modelId, target.pricing)
+        ? last30Usd
+        : repriceUsd(spent, target.pricing, target.audio);
       return { last30Usd, withChoiceUsd };
     },
     sessionCosts: ledger.sessionCosts,
     sessionUsage: ledger.sessionUsage,
-    recentTurnCost: ledger.recentTurnCost,
+    recentTurnUsage: ledger.recentTurnUsage,
     ...(adapters.models
       ? {
           validateModel: (choice: ModelSelection) => adapters.models!.validateChoice(choice),
@@ -1274,6 +1310,7 @@ async function initializeApplication(
   let browserConnections!: Awaited<ReturnType<typeof createBrowserConnections>>;
   const previews = adapters.linkPreviews;
   const icon = previews ? cachedIcons((origin) => previews.icon(origin)) : undefined;
+  const computerUse = createComputerUse(pool, ownerId, { desktop: adapters.desktop });
   const localFiles = createLocalFiles(pool, ownerId, {
     dataRoot,
     home: adapters.localFilesHome,
@@ -1326,6 +1363,7 @@ async function initializeApplication(
     icon,
   });
   vault = await createVault(pool, {
+    signal: closing.signal,
     analytics: captureAnalytics,
     refresh,
     keyStore: adapters.keyStore,
@@ -1410,7 +1448,7 @@ async function initializeApplication(
   };
   const replayBrowserStep = async (
     args: Record<string, unknown>,
-    provenance: { threadId: string; turnId: string },
+    provenance: { threadId: string; turnId: string; signal?: AbortSignal },
   ) => {
     const command = args.command as Omit<BrowserAction, 'action'> & {
       action: BrowserAction['action'] | 'upload';
@@ -1447,27 +1485,36 @@ async function initializeApplication(
       formSent(current.submits) !== formSent(args.submits)
     )
       throw notRun();
+    if (provenance.signal?.aborted) throw notRun();
     try {
       const page =
         command.action === 'upload'
-          ? await computer.upload(browserId, {
-              selector: String(command.selector),
-              name: basename(String(command.path)),
-              bytes: await workspace.readArtifact(
-                provenance.threadId,
-                String(command.path),
-                fileBytes,
-              ),
-              expectOrigin,
-              expectUrl: String(args.page),
-              ...(args.target ? { expectTarget: String(args.target) } : {}),
-            })
-          : await computer.act(browserId, {
-              ...(command as BrowserAction),
-              expectOrigin,
-              expectUrl: String(args.page),
-              ...(args.target ? { expectTarget: String(args.target) } : {}),
-            });
+          ? await computer.upload(
+              browserId,
+              {
+                selector: String(command.selector),
+                name: basename(String(command.path)),
+                bytes: await workspace.readArtifact(
+                  provenance.threadId,
+                  String(command.path),
+                  fileBytes,
+                ),
+                expectOrigin,
+                expectUrl: String(args.page),
+                ...(args.target ? { expectTarget: String(args.target) } : {}),
+              },
+              provenance.signal,
+            )
+          : await computer.act(
+              browserId,
+              {
+                ...(command as BrowserAction),
+                expectOrigin,
+                expectUrl: String(args.page),
+                ...(args.target ? { expectTarget: String(args.target) } : {}),
+              },
+              provenance.signal,
+            );
       return { url: page.url, page: page.text };
     } catch (error) {
       if (error instanceof BrowserActionError && error.code === 'browser_target_changed')
@@ -1500,6 +1547,21 @@ async function initializeApplication(
           ),
           { notRun: true },
         );
+      if (isComputerAction(action)) {
+        const result = await computerUse.execute(
+          { threadId: provenance.threadId, turnId: provenance.turnId },
+          action,
+          args,
+          provenance.signal,
+        );
+        await ledger.action(
+          provenance.turnId,
+          action,
+          provenance.basis ?? { kind: 'approved' },
+          actionTarget(action, args, provenance.details),
+        );
+        return result;
+      }
       const turnLock = provenance.signal
         ? { turnId: provenance.turnId, signal: provenance.signal }
         : provenance.turnId;
@@ -1569,6 +1631,16 @@ async function initializeApplication(
                         const savedBinding = provenance.details?.verifiedBinding;
                         const verifiedBinding =
                           typeof savedBinding === 'string' ? savedBinding : undefined;
+                        if (
+                          (action === 'CONNECTED_HTTP' || action === 'CONNECTED_MCP_CALL') &&
+                          !verifiedBinding
+                        )
+                          throw Object.assign(
+                            new Error(
+                              'The connected app confirmation has no saved account binding. Ask for this action again.',
+                            ),
+                            { notRun: true },
+                          );
                         if (action === 'GMAIL_DELETE_MESSAGE' || action === 'GMAIL_DELETE_DRAFT') {
                           const currentBinding = await integrations
                             .binding(String(args.connectionId ?? ''))
@@ -1676,6 +1748,124 @@ async function initializeApplication(
                           }
                         }
                         const turn = { threadId: provenance.threadId, turnId: provenance.turnId };
+                        let validateCalendar: (() => Promise<void>) | undefined;
+                        if (isCalendarEventChange(action)) {
+                          const origin = await turnOrigin(provenance.turnId);
+                          const saved = provenance.details?.target;
+                          const revision = provenance.details?.verifiedCalendarRevision;
+                          const instruction = z
+                            .object({
+                              rules: z.string(),
+                              standingInstruction: z.string().optional(),
+                              sourceMessageIds: z.array(z.uuid()).optional(),
+                              chat: z
+                                .object({ threadId: z.uuid(), id: z.uuid() })
+                                .strict()
+                                .optional(),
+                              task: z
+                                .object({ id: z.uuid(), revision: z.number().int().nonnegative() })
+                                .strict()
+                                .optional(),
+                            })
+                            .strict()
+                            .safeParse(provenance.details?.verifiedInstructionRevision);
+                          if (
+                            !origin ||
+                            !verifiedBinding ||
+                            typeof revision !== 'string' ||
+                            !/^[a-f0-9]{64}$/.test(revision) ||
+                            !instruction.success ||
+                            (origin.source === 'event' &&
+                              instruction.data.standingInstruction === undefined) ||
+                            (origin.source === 'schedule' &&
+                              (!origin.scheduleInstruction ||
+                                !isDeepStrictEqual(
+                                  instruction.data.sourceMessageIds,
+                                  instructionSourceMessageIds(origin.scheduleInstruction),
+                                ))) ||
+                            !saved ||
+                            typeof saved !== 'object' ||
+                            Array.isArray(saved) ||
+                            (saved as Record<string, unknown>).eventId !== args.event_id
+                          )
+                            throw Object.assign(
+                              new Error(
+                                'This Calendar confirmation has no verified event. Ask again before changing it.',
+                              ),
+                              { notRun: true },
+                            );
+                          try {
+                            validateCalendar = () =>
+                              transaction(
+                                async (client) => {
+                                  if ((await lockThread(client)).id !== provenance.threadId)
+                                    throw Object.assign(
+                                      new Error('This Calendar conversation is no longer active.'),
+                                      { notRun: true },
+                                    );
+                                  await withTurnLock(
+                                    turnLock,
+                                    async () => {
+                                      if (origin.source === 'schedule')
+                                        await validateScheduledInstructions(
+                                          client,
+                                          ownerId,
+                                          origin.scheduleInstruction,
+                                        );
+                                      await validateInstructionRevision(
+                                        client,
+                                        ownerId,
+                                        instruction.data,
+                                      );
+                                      if (
+                                        (await integrations.binding(
+                                          String(args.connectionId),
+                                          client,
+                                        )) !== verifiedBinding
+                                      )
+                                        throw Object.assign(
+                                          new Error(
+                                            'The selected Calendar account changed after confirmation.',
+                                          ),
+                                          { notRun: true },
+                                        );
+                                    },
+                                    client,
+                                  );
+                                },
+                                pool,
+                                provenance.signal,
+                              );
+                            await validateCalendar();
+                            const readWork =
+                              (await turnOrigin(provenance.turnId))?.source === 'user'
+                                ? 'read'
+                                : 'background';
+                            const current = await readCalendarTarget(
+                              turn,
+                              args,
+                              verifiedBinding,
+                              provenance.signal,
+                              readWork,
+                            );
+                            if (
+                              current.revision !== revision ||
+                              !isDeepStrictEqual(current.target, saved)
+                            )
+                              throw new Error(
+                                'The Calendar event changed after confirmation. Ask again before changing it.',
+                              );
+                            await validateCalendar();
+                          } catch (error) {
+                            const failed = provenance.signal?.aborted
+                              ? provenance.signal.reason
+                              : error;
+                            throw Object.assign(
+                              failed instanceof Error ? failed : new Error(String(failed)),
+                              { notRun: true },
+                            );
+                          }
+                        }
                         const ready = hasWorkspaceFiles(args)
                           ? await integrations
                               .prepare(ownerId, action, args, turn, provenance.signal)
@@ -1692,9 +1882,14 @@ async function initializeApplication(
                           ready,
                           turn,
                           provenance.signal,
-                          action === 'GMAIL_DELETE_MESSAGE' || action === 'GMAIL_DELETE_DRAFT'
+                          action === 'GMAIL_DELETE_MESSAGE' ||
+                            action === 'GMAIL_DELETE_DRAFT' ||
+                            action === 'CONNECTED_MCP_CALL' ||
+                            action === 'CONNECTED_HTTP' ||
+                            isCalendarEventChange(action)
                             ? verifiedBinding
                             : undefined,
+                          validateCalendar,
                         );
                         await ledger.action(
                           provenance.turnId,
@@ -1723,7 +1918,13 @@ async function initializeApplication(
       return result;
     },
     async (action, args, expectedRevision, client) => {
-      if (['NOD_browser', 'NOD_vault_allow', 'NOD_bug_report_send'].includes(action)) return;
+      if (
+        ['NOD_browser', 'NOD_vault_allow', 'NOD_bug_report_send', 'NOD_workspace_command'].includes(
+          action,
+        ) ||
+        isComputerAction(action)
+      )
+        return;
       if (action === 'NOD_limits_update') limitsInput.parse(args);
       else if (action.startsWith('NOD_')) {
         if (
@@ -1739,9 +1940,10 @@ async function initializeApplication(
     (reply) => ledger.forOwner(() => trust.answer(reply)),
     communication.describe,
     captureAnalytics,
+    createErrorRedactor(secrets),
+    (input, signal) => ledger.forOwner(() => trust.classifyRepeatedAction(input, signal)),
   );
   retireScheduleConfirmations = approvals.retireScheduleConfirmations;
-  let channels: Awaited<ReturnType<typeof createChannels>> | undefined;
   const reactions = createAgentReactionService({
     pool,
     ownerId,
@@ -1877,9 +2079,10 @@ async function initializeApplication(
           ? [connection.accountName]
           : [],
       ),
-      region: preferences.locale
-        ? new Intl.Locale(preferences.locale).maximize().region
-        : undefined,
+      region:
+        localeRegion(preferences.locale) ??
+        timeZoneRegion(preferences.timeZone || Intl.DateTimeFormat().resolvedOptions().timeZone) ??
+        undefined,
     };
   };
   let feedbackProfileRead: ReturnType<typeof ownerProfile> | undefined;
@@ -1917,8 +2120,11 @@ async function initializeApplication(
     name: 'failures',
     sanitize: sanitizeDiagnostics,
   });
+  if (traceKeyFailure !== undefined)
+    logFailure('trace_conversation_key_unavailable', traceKeyFailure);
   adapters.traces?.configure({
     enabled: (await localAccounts.read(ownerId)).traces,
+    userId: analytics.distinctId,
     secrets,
     profile: ownerProfile,
   });
@@ -1994,7 +2200,7 @@ async function initializeApplication(
       if (question) {
         const values = question.choices.map(({ value }) => JSON.stringify(value)).join(', ');
         instructions +=
-          question.name === 'retiredReply'
+          question.name === 'retiredReply' || question.name === 'repeatedAction'
             ? `\nReply with only JSON containing exactly two properties: ${JSON.stringify(question.name)} set to one of ${values}, and "probability" set to a number from 0 to 1 expressing confidence in that label.`
             : `\nReply with only JSON with one property, ${JSON.stringify(question.name)}. Its value must be one of: ${values}.`;
       }
@@ -2006,6 +2212,65 @@ async function initializeApplication(
       ? { decisions: ledger.decisions(adapters.trustDecisions) }
       : {}),
   });
+  async function readCalendarTarget(
+    turn: TurnRef,
+    args: Record<string, unknown>,
+    binding: string,
+    signal: AbortSignal | undefined,
+    work: 'read' | 'background',
+  ) {
+    const eventId = args.event_id;
+    const calendarId = args.calendar_id ?? 'primary';
+    if (
+      typeof eventId !== 'string' ||
+      !eventId.trim() ||
+      typeof calendarId !== 'string' ||
+      !calendarId.trim()
+    )
+      throw new Error('Nod cannot identify the Calendar event proposed for change.');
+    const readAction = 'GOOGLECALENDAR_EVENTS_GET';
+    const readArgs = {
+      connectionId: args.connectionId,
+      calendar_id: calendarId,
+      event_id: eventId,
+      max_attendees: 1,
+    };
+    await integrations.assertOffered(ownerId, readAction, signal);
+    const verdict = await trust.check(turn, readAction, readArgs, signal);
+    if (verdict.confirm)
+      throw new Error(
+        verdict.reason === 'rule'
+          ? 'Your rules require confirmation before reading this Calendar event, so Nod did not identify it or propose a change.'
+          : 'Nod could not authorize the Calendar read needed to identify this event, so it did not propose a change.',
+      );
+    let observed: unknown;
+    try {
+      observed = await integrations.execute(
+        ownerId,
+        readAction,
+        readArgs,
+        turn,
+        signal,
+        binding,
+        work,
+      );
+    } catch (error) {
+      signal?.throwIfAborted();
+      throw new Error(
+        `The Calendar event read failed: ${safeIntegrationFailure(error)} Nod did not change the event.`,
+      );
+    }
+    if ((await integrations.binding(String(args.connectionId ?? ''))) !== binding)
+      throw new Error('The selected Calendar account changed while Nod read the event.');
+    const target = calendarEventTarget(observed, eventId);
+    if (!target)
+      throw new Error(
+        'Nod cannot verify the Calendar event, its dates and its version, so it did not propose or make a change.',
+      );
+    await ledger.action(turn.turnId, readAction, verdict.basis);
+    signal?.throwIfAborted();
+    return target;
+  }
   const observations = createObservationSources(
     [
       createConnectionSources({
@@ -2092,7 +2357,7 @@ async function initializeApplication(
     capture: (threadId) => computer.checkoutImage(threadId),
     cards: () => vault.paymentCards(),
     card: (id, version, client) => vault.paymentCard(id, version, client),
-    fill: (input) => computer.fillCard(input),
+    fill: (input, signal) => computer.fillCard(input, signal),
     resume: resumeAfterPayment,
     record: (turn, entry, client) => vaultAccess.record(turn, entry, client),
   });
@@ -2127,6 +2392,7 @@ async function initializeApplication(
     wake = adapters.model.configured,
     replyChannel?: string,
   ) => reactToAssistantMessage(messageId, reaction, wake, userMessages, replyChannel);
+  let startThreadConsumers: (() => Promise<void>) | undefined;
   if (options.workers !== false) {
     if (options.heartbeat !== false) await triage.initializeHeartbeat();
     await initializeMemoryLearning({
@@ -2134,7 +2400,7 @@ async function initializeApplication(
       consumers,
       run: () => analytics.withSystemWork(ownerId, 'memory_learning', learning.run),
     });
-    await startThreadWorkers({
+    startThreadConsumers = startThreadWorkers.bind(undefined, {
       present: communication.present,
       taskChecks: tasks.resumeDue,
       analytics: captureAnalytics,
@@ -2156,24 +2422,34 @@ async function initializeApplication(
           ? `Your ${other.label} connection is also set up: you can switch to it in ${appPages['/settings/models']}.`
           : undefined;
       },
+      desktopRuntime: desktopMode,
       taskClassification: true,
-      observeTurn: (turnId, operation) =>
-        analytics
-          .withRun(ownerId, async () => {
-            try {
-              await operation();
-            } finally {
-              const consent = analytics.currentRun(ownerId)?.consent;
+      observeTurn: (turnId, operation, sessionId) => {
+        const observe = (ids?: { thread_id: string; turn_id: string }) =>
+          analytics
+            .withRun(
+              ownerId,
+              async () => {
+                try {
+                  await operation();
+                } finally {
+                  const consent = analytics.currentRun(ownerId)?.consent;
+                  void admission
+                    .run(() =>
+                      ledger.withTurn(turnId, () => taskClassification.run(turnId, consent)),
+                    )
+                    ?.catch(() => {});
+                }
+              },
+              ids,
+            )
+            .finally(() => {
               void admission
-                .run(() => ledger.withTurn(turnId, () => taskClassification.run(turnId, consent)))
-                ?.catch(() => {});
-            }
-          })
-          .finally(() => {
-            void admission
-              .run(() => proactivity.due())
-              ?.catch((error) => logFailure('proactivity_wake', error));
-          }),
+                .run(() => proactivity.due())
+                ?.catch((error) => logFailure('proactivity_wake', error));
+            });
+        return adapters.traces?.withTurn({ turnId, sessionId }, observe) ?? observe();
+      },
       consumers,
       artifacts,
       writeArtifact: workspace.writeArtifact.bind(workspace),
@@ -2292,6 +2568,62 @@ async function initializeApplication(
       browserStep: async (turn, request, signal) => {
         const args = browserStepArgs(request);
         const verdict = await trust.check(turn, 'NOD_browser', args, signal);
+        const prepareConfirmation = async () => {
+          const control = request.page.controls?.[0];
+          const namedControl =
+            control?.name.trim() && !['RootWebArea', 'WebArea', 'document'].includes(control.role);
+          const form = request.page.submits;
+          const knownForm = typeof form === 'object' && form.method.trim() && form.to.trim();
+          const enter =
+            (request.step.action === 'press' && isEnterKey(request.step.key)) ||
+            (request.step.action === 'type' && /[\r\n]/.test(request.step.text ?? ''));
+          if (
+            !namedControl &&
+            ((request.step.action === 'click' &&
+              (request.step.x !== undefined ||
+                request.step.y !== undefined ||
+                request.step.points !== undefined ||
+                !knownForm)) ||
+              (enter && !knownForm))
+          ) {
+            const action =
+              request.step.action === 'click'
+                ? 'click'
+                : request.step.action === 'type'
+                  ? 'typed line break'
+                  : 'Enter press';
+            throw new Error(
+              `The ${action} target is not identified. Inspect a fresh snapshot or screenshot and choose the actual control. Do not ask the owner to approve an unidentified ${action}.`,
+            );
+          }
+          const visible =
+            turn.browserId &&
+            (await computer
+              .act(
+                turn.browserId,
+                {
+                  action: 'evaluate',
+                  script: 'document.body.innerText',
+                  readOnly: true,
+                  expectOrigin: request.page.origin,
+                  expectUrl: request.page.url,
+                },
+                signal,
+              )
+              .then(
+                (page) => {
+                  try {
+                    return JSON.parse(page.text.slice(page.text.indexOf('\n') + 1)) as unknown;
+                  } catch {
+                    return undefined;
+                  }
+                },
+                () => undefined,
+              ));
+          return typeof visible === 'string' && visible.trim()
+            ? { pageText: publicText(visible.slice(0, 20_000)) }
+            : {};
+        };
         if (!verdict.confirm) {
           if (verdict.basis.kind === 'read') return 'run';
           const basis = verdict.basis;
@@ -2299,10 +2631,12 @@ async function initializeApplication(
             record: () =>
               ledger.action(turn.turnId, 'NOD_browser', basis, actionTarget('NOD_browser', args)),
           };
-          if (!verdict.chatRevision) return allowed;
           const handoff = await approvals.request(turn, 'NOD_browser', args, {
             allowed: true,
-            expectedChatRevision: verdict.chatRevision,
+            prepareConfirmation,
+            admit: async (asks) => {
+              if (asks && request.subagent) throw new Error('A subagent cannot ask the owner.');
+            },
             signal,
             run: async () => 'run',
           });
@@ -2312,50 +2646,11 @@ async function initializeApplication(
               ? handoff
               : { result: handoff };
         }
-        if (
-          request.step.action === 'click' &&
-          request.step.x !== undefined &&
-          !request.page.controls?.some(
-            ({ role, name }) => name && !['RootWebArea', 'WebArea', 'document'].includes(role),
-          )
-        )
-          throw new Error(
-            'The click target is not identified. Inspect a fresh snapshot or screenshot and choose the actual control. Do not ask the owner to approve an unidentified click.',
-          );
         if (request.subagent) return 'refused';
-        const visible =
-          turn.browserId &&
-          (await computer
-            .act(
-              turn.browserId,
-              {
-                action: 'evaluate',
-                script: 'document.body.innerText',
-                readOnly: true,
-                expectOrigin: request.page.origin,
-                expectUrl: request.page.url,
-              },
-              signal,
-            )
-            .then(
-              (page) => {
-                try {
-                  return JSON.parse(page.text.slice(page.text.indexOf('\n') + 1)) as unknown;
-                } catch {
-                  return undefined;
-                }
-              },
-              () => undefined,
-            ));
         const result = await approvals.request(turn, 'NOD_browser', args, {
           signal,
-          expectedChatRevision: verdict.chatRevision,
-          details: {
-            reason: verdict.reason,
-            ...(typeof visible === 'string' && visible.trim()
-              ? { pageText: publicText(visible.slice(0, 20_000)) }
-              : {}),
-          },
+          details: { reason: verdict.reason },
+          prepareConfirmation,
         });
         return result && typeof result === 'object' && appConfirmation in result
           ? result
@@ -2391,7 +2686,7 @@ async function initializeApplication(
       },
       speech,
       audioReplies: async () => (await speechPreferences.get()).speechReply,
-      manage: async (turn, action, args, { admit, ...provenance }) => {
+      manage: async (turn, action, args, { admit, signal, ...provenance }) => {
         if (action === 'prepared_list')
           return untrustedBlock('prepared work', JSON.stringify(await proactivity.prepared(args)));
         if (action === 'prepared_update') {
@@ -2418,24 +2713,24 @@ async function initializeApplication(
             );
           if (draft.sent) return { status: 'already_sent', receipt: draft.sent };
           const input = { draftId: draft.id, summary: draft.summary };
-          const verdict = await trust.check(turn, 'NOD_bug_report_send', input);
+          const verdict = await trust.check(turn, 'NOD_bug_report_send', input, signal);
           return approvals.request(turn, 'NOD_bug_report_send', input, {
             ...provenance,
+            signal,
             allowed: !verdict.confirm,
             ...(verdict.confirm ? {} : { basis: verdict.basis }),
-            expectedChatRevision: verdict.chatRevision,
             admit,
             details: verdict.confirm ? { reason: verdict.reason } : {},
           });
         }
         if (action === 'limits_update') {
           const input = limitsInput.parse(args);
-          const verdict = await trust.check(turn, 'NOD_limits_update', input);
+          const verdict = await trust.check(turn, 'NOD_limits_update', input, signal);
           return approvals.request(turn, 'NOD_limits_update', input, {
             ...provenance,
+            signal,
             allowed: !verdict.confirm,
             ...(verdict.confirm ? {} : { basis: verdict.basis }),
-            expectedChatRevision: verdict.chatRevision,
             admit,
             details: {
               current: await ledger.limits(),
@@ -2492,14 +2787,14 @@ async function initializeApplication(
               ...(rule === undefined ? {} : { currentNotificationRule: rule }),
               ...(rules === undefined ? {} : { currentRules: rules }),
             },
-            undefined,
+            signal,
             prepared,
           );
           return approvals.request(turn, `NOD_${action}`, input, {
             ...provenance,
+            signal,
             allowed: !verdict.confirm,
             ...(verdict.confirm ? {} : { basis: verdict.basis }),
-            expectedChatRevision: verdict.chatRevision,
             admit,
             instructionChange: verdict.instructionChange,
             expectedRevision: prepared?.revision,
@@ -2534,12 +2829,12 @@ async function initializeApplication(
             turnId: turn.turnId,
             ownerRooted: origin?.source === 'user',
           });
-          const verdict = await trust.check(turn, `NOD_${action}`, input);
+          const verdict = await trust.check(turn, `NOD_${action}`, input, signal);
           return approvals.request(turn, `NOD_${action}`, input, {
             ...provenance,
+            signal,
             allowed: !verdict.confirm,
             ...(verdict.confirm ? {} : { basis: verdict.basis }),
-            expectedChatRevision: verdict.chatRevision,
             admit,
             details: verdict.confirm ? { reason: verdict.reason } : {},
           });
@@ -2552,8 +2847,11 @@ async function initializeApplication(
               'Only work the owner started, in chat, a task or a schedule, can save a skill.',
             );
           await admit?.(false);
-          return learnedSkills.learn(args, turn.turnId, (write) =>
-            withTurnLock(turn.turnId, write),
+          return learnedSkills.learn(
+            args,
+            turn.turnId,
+            (write) => withTurnLock({ turnId: turn.turnId, signal }, write),
+            signal,
           );
         }
         await admit?.(false);
@@ -2561,8 +2859,11 @@ async function initializeApplication(
           const origin = await turnOrigin(turn.turnId);
           if (!origin || !['user', 'task'].includes(origin.source))
             throw new Error('Only work the owner started, in chat or a task, can save to memory.');
-          return learning.remember(args, provenance.sourceMessageId, (write) =>
-            withTurnLock(turn.turnId, write),
+          return learning.remember(
+            args,
+            provenance.sourceMessageId,
+            (write) => withTurnLock({ turnId: turn.turnId, signal }, write),
+            signal,
           );
         }
         if (action === 'usage_get')
@@ -2616,7 +2917,8 @@ async function initializeApplication(
             }
           }
         }
-        const saved = (await vault.list(ownerId)).filter((entry) => entry.origin === origin);
+        const origins = credentialOrigins(origin);
+        const saved = (await vault.list(ownerId)).filter((entry) => origins.includes(entry.origin));
         const chosen =
           savedLoginId !== undefined
             ? saved.find((entry) => entry.id === savedLoginId)
@@ -2667,7 +2969,47 @@ async function initializeApplication(
         return vault.request(turn, ownerId, request);
       },
       localFiles: localFiles.available,
+      computerUse: computerUse.available,
       integration: async (turn, action, args, options) => {
+        if (action === 'CONNECTED_HTTP') args = structuredClone(args);
+        if (isComputerAction(action)) {
+          if (action === 'COMPUTER_KEEP_OUT') {
+            await options.admit?.(false);
+            return withTurnLock(
+              { turnId: turn.turnId, signal: options.signal },
+              async (client) => ({
+                keptOut: await computerUse.keepOut(turn, String(args.bundle ?? ''), client),
+              }),
+            );
+          }
+          const prepared = await computerUse.prepare(turn, action, args, options.signal);
+          if (!computerUse.needsCheck(action, prepared)) {
+            await options.admit?.(false);
+            return computerUse.execute(turn, action, prepared, options.signal);
+          }
+          const verdict = await trust.check(
+            turn,
+            action,
+            computerUse.checked(action, prepared),
+            options.signal,
+          );
+          await options.admit?.(verdict.confirm);
+          return approvals.request(turn, action, prepared, {
+            allowed: !verdict.confirm,
+            signal: options.signal,
+            run: async () => {
+              const result = await computerUse.execute(turn, action, prepared, options.signal);
+              await ledger.action(
+                turn.turnId,
+                action,
+                verdict.confirm ? { kind: 'approved' } : verdict.basis,
+                actionTarget(action, prepared),
+              );
+              return result;
+            },
+            details: verdict.confirm ? { reason: verdict.reason } : {},
+          });
+        }
         if (action === 'LOCAL_FILES_KEEP_OUT') {
           await options.admit?.(false);
           return withTurnLock({ turnId: turn.turnId, signal: options.signal }, async (client) => ({
@@ -2697,7 +3039,6 @@ async function initializeApplication(
             ...(verdict.confirm ? {} : { basis: verdict.basis }),
             signal: options.signal,
             admit: options.admit,
-            expectedChatRevision: verdict.chatRevision,
             details: {
               ...(typeof args.path === 'string' ? { requestedPath: args.path } : {}),
               accessScope:
@@ -2705,6 +3046,7 @@ async function initializeApplication(
             },
           });
         }
+        await integrations.assertOffered(ownerId, action, options.signal);
         const prepare = () =>
           hasWorkspaceFiles(args)
             ? withTurnLock(turn.turnId, (client) =>
@@ -2713,118 +3055,132 @@ async function initializeApplication(
             : isLocalFilesAction(action)
               ? integrations.prepare(ownerId, action, args, turn, options.signal)
               : integrations.prepare(ownerId, action, args);
-        const resolved = isLocalFilesAction(action) ? await prepare() : undefined;
-        const verdict = await trust.check(turn, action, resolved ?? args, options.signal);
-        await options.admit?.(verdict.confirm);
-        const prepared = resolved ?? (await prepare());
-        const account =
-          verdict.confirm && typeof prepared.connectionId === 'string'
-            ? (await integrations.list(ownerId, { refresh: false })).find(
-                (item) => item.connectionId === prepared.connectionId,
-              )
+        const resolved =
+          isLocalFilesAction(action) || action === 'CONNECTED_HTTP' ? await prepare() : undefined;
+        const http =
+          action === 'CONNECTED_HTTP'
+            ? await discovered.approvalDetails(action, resolved!, options.signal)
             : undefined;
-        const path = account?.accessPaths?.find((item) => item.id === prepared.pathId);
-        let target:
-          | ReturnType<typeof gmailMessageTarget>
-          | {
-              draftId: string;
-              subject?: string;
-              from?: string;
-              to?: string;
-              cc?: string;
-              bcc?: string;
+        const verdict = await trust.check(turn, action, resolved ?? args, options.signal);
+        const prepared = resolved ?? (await prepare());
+        let connected = http;
+        let targetBinding: string | undefined;
+        let verifiedCalendarRevision: string | undefined;
+        let verifiedInstructionRevision: InstructionRevision | undefined;
+        const prepareConfirmation = async () => {
+          connected ??=
+            action === 'CONNECTED_MCP_CALL'
+              ? await discovered.approvalDetails(action, prepared, options.signal)
+              : undefined;
+          const account =
+            !connected && typeof prepared.connectionId === 'string'
+              ? (await integrations.list(ownerId, { refresh: false })).find(
+                  (item) => item.connectionId === prepared.connectionId,
+                )
+              : undefined;
+          const path = account?.accessPaths?.find((item) => item.id === prepared.pathId);
+          let target:
+            | ReturnType<typeof gmailMessageTarget>
+            | NonNullable<ReturnType<typeof calendarEventTarget>>['target']
+            | {
+                draftId: string;
+                subject?: string;
+                from?: string;
+                to?: string;
+                cc?: string;
+                bcc?: string;
+              };
+          let verifiedDraftMessageId: string | undefined;
+          const deletingDraft = action === 'GMAIL_DELETE_DRAFT';
+          if (action === 'GMAIL_DELETE_MESSAGE' || deletingDraft) {
+            const itemId = deletingDraft ? prepared.draft_id : prepared.message_id;
+            const item = deletingDraft ? 'draft' : 'message';
+            const connectionId = prepared.connectionId;
+            if (typeof itemId !== 'string' || !itemId.trim() || typeof connectionId !== 'string')
+              throw new Error(`Nod cannot identify the Gmail ${item} proposed for deletion.`);
+            targetBinding = await integrations.binding(connectionId);
+            if (!targetBinding)
+              throw new Error('The selected Gmail account is no longer available for deletion.');
+            let boundAccountId: unknown;
+            try {
+              boundAccountId = JSON.parse(targetBinding)[0];
+            } catch {}
+            if (!account?.accountId || account.accountId !== boundAccountId)
+              throw new Error('The selected Gmail account changed before deletion was proposed.');
+            const readAction = deletingDraft
+              ? 'GMAIL_GET_DRAFT'
+              : 'GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID';
+            const metadataArgs = {
+              connectionId,
+              format: 'metadata',
+              ...(deletingDraft ? { draft_id: itemId } : { message_id: itemId }),
+              ...(typeof prepared.user_id === 'string' ? { user_id: prepared.user_id } : {}),
             };
-        let deleteBinding: string | undefined;
-        let verifiedDraftMessageId: string | undefined;
-        const deletingDraft = action === 'GMAIL_DELETE_DRAFT';
-        if (verdict.confirm && (action === 'GMAIL_DELETE_MESSAGE' || deletingDraft)) {
-          const itemId = deletingDraft ? prepared.draft_id : prepared.message_id;
-          const item = deletingDraft ? 'draft' : 'message';
-          const connectionId = prepared.connectionId;
-          if (typeof itemId !== 'string' || !itemId.trim() || typeof connectionId !== 'string')
-            throw new Error(`Nod cannot identify the Gmail ${item} proposed for deletion.`);
-          deleteBinding = await integrations.binding(connectionId);
-          if (!deleteBinding)
-            throw new Error('The selected Gmail account is no longer available for deletion.');
-          let boundAccountId: unknown;
-          try {
-            boundAccountId = JSON.parse(deleteBinding)[0];
-          } catch {}
-          if (!account?.accountId || account.accountId !== boundAccountId)
-            throw new Error('The selected Gmail account changed before deletion was proposed.');
-          const readAction = deletingDraft
-            ? 'GMAIL_GET_DRAFT'
-            : 'GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID';
-          const metadataArgs = {
-            connectionId,
-            format: 'metadata',
-            ...(deletingDraft ? { draft_id: itemId } : { message_id: itemId }),
-            ...(typeof prepared.user_id === 'string' ? { user_id: prepared.user_id } : {}),
-          };
-          const readVerdict = await trust.check(turn, readAction, metadataArgs, options.signal);
-          if (readVerdict.confirm)
-            throw new Error(
-              readVerdict.reason === 'rule'
-                ? `Your rules require confirmation before reading this Gmail ${item}, so Nod did not identify it or propose deletion. Allow this read in your rules before asking to delete it.`
-                : deletingDraft
-                  ? 'Nod could not authorize the Gmail draft read needed to identify this draft, so it did not propose deletion.'
-                  : 'Nod could not authorize the Gmail metadata read needed to identify this message, so it did not propose deletion.',
-            );
-          let observed: unknown;
-          try {
-            observed = await integrations.execute(
-              ownerId,
-              readAction,
-              metadataArgs,
+            const readVerdict = await trust.check(turn, readAction, metadataArgs, options.signal);
+            if (readVerdict.confirm)
+              throw new Error(
+                readVerdict.reason === 'rule'
+                  ? `Your rules require confirmation before reading this Gmail ${item}, so Nod did not identify it or propose deletion. Allow this read in your rules before asking to delete it.`
+                  : deletingDraft
+                    ? 'Nod could not authorize the Gmail draft read needed to identify this draft, so it did not propose deletion.'
+                    : 'Nod could not authorize the Gmail metadata read needed to identify this message, so it did not propose deletion.',
+              );
+            let observed: unknown;
+            try {
+              observed = await integrations.execute(
+                ownerId,
+                readAction,
+                metadataArgs,
+                turn,
+                options.signal,
+                targetBinding,
+                readWork,
+              );
+            } catch (error) {
+              options.signal?.throwIfAborted();
+              throw new Error(
+                `The Gmail ${deletingDraft ? 'draft' : 'metadata'} read failed: ${safeIntegrationFailure(error)} Nod did not ask for approval or delete the ${item}.`,
+              );
+            }
+            await ledger.action(turn.turnId, readAction, readVerdict.basis);
+            if (deletingDraft) {
+              const draft = gmailDraftTarget(observed, itemId);
+              if (draft) {
+                const { messageId, ...visible } = draft;
+                verifiedDraftMessageId = messageId;
+                target = visible;
+              }
+            } else target = gmailMessageTarget(observed, itemId);
+            if (!target)
+              throw new Error(
+                `Nod cannot verify which Gmail ${item} this would delete, so it did not ask for approval or delete it.`,
+              );
+          }
+          if (isCalendarEventChange(action)) {
+            const connectionId = prepared.connectionId;
+            if (typeof connectionId !== 'string')
+              throw new Error('Nod cannot identify the Calendar account proposed for change.');
+            targetBinding = await integrations.binding(connectionId);
+            let boundAccountId: unknown;
+            try {
+              boundAccountId = targetBinding && JSON.parse(targetBinding)[0];
+            } catch {}
+            if (!targetBinding || !account?.accountId || account.accountId !== boundAccountId)
+              throw new Error(
+                'The selected Calendar account changed before the change was proposed.',
+              );
+            const current = await readCalendarTarget(
               turn,
+              prepared,
+              targetBinding,
               options.signal,
-              deleteBinding,
               readWork,
             );
-          } catch (error) {
-            options.signal?.throwIfAborted();
-            throw new Error(
-              `The Gmail ${deletingDraft ? 'draft' : 'metadata'} read failed: ${safeIntegrationFailure(error)} Nod did not ask for approval or delete the ${item}.`,
-            );
+            target = current.target;
+            verifiedCalendarRevision = current.revision;
+            verifiedInstructionRevision = verdict.instructionRevision;
           }
-          await ledger.action(turn.turnId, readAction, readVerdict.basis);
-          if (deletingDraft) {
-            const draft = gmailDraftTarget(observed, itemId);
-            if (draft) {
-              const { messageId, ...visible } = draft;
-              verifiedDraftMessageId = messageId;
-              target = visible;
-            }
-          } else target = gmailMessageTarget(observed, itemId);
-          if (!target)
-            throw new Error(
-              `Nod cannot verify which Gmail ${item} this would delete, so it did not ask for approval or delete it.`,
-            );
-        }
-        const result = await approvals.request(turn, action, prepared, {
-          allowed: !verdict.confirm,
-          expectedChatRevision:
-            verdict.confirm || verdict.basis.kind !== 'read' ? verdict.chatRevision : undefined,
-          signal: options.signal,
-          run: async () => {
-            const result = await integrations.execute(
-              ownerId,
-              action,
-              prepared,
-              turn,
-              options.signal,
-              deleteBinding,
-              !verdict.confirm && verdict.basis.kind === 'read' ? readWork : 'action',
-            );
-            await ledger.action(
-              turn.turnId,
-              action,
-              verdict.confirm ? { kind: 'approved' } : verdict.basis,
-              actionTarget(action, prepared),
-            );
-            return result;
-          },
-          details: {
+          return {
             ...(verdict.confirm ? { reason: verdict.reason } : {}),
             ...(account
               ? {
@@ -2835,10 +3191,53 @@ async function initializeApplication(
                   },
                 }
               : {}),
+            ...(connected ?? {}),
             ...(target ? { target } : {}),
-            ...(deleteBinding ? { verifiedBinding: deleteBinding } : {}),
+            ...(targetBinding ? { verifiedBinding: targetBinding } : {}),
+            ...(verifiedCalendarRevision ? { verifiedCalendarRevision } : {}),
+            ...(verifiedInstructionRevision ? { verifiedInstructionRevision } : {}),
             ...(verifiedDraftMessageId ? { verifiedDraftMessageId } : {}),
+          };
+        };
+        const result = await approvals.request(turn, action, prepared, {
+          allowed: !verdict.confirm,
+          admit: options.admit,
+          signal: options.signal,
+          validate: async (client) => {
+            if (verifiedInstructionRevision)
+              await validateInstructionRevision(client, ownerId, verifiedInstructionRevision);
+            if (
+              connected &&
+              (await discovered.binding(String(prepared.connectionId), client)) !==
+                connected.verifiedBinding
+            )
+              throw Object.assign(
+                new Error(
+                  `This connected account changed before ${verdict.confirm ? 'confirmation' : 'execution'}.`,
+                ),
+                { notRun: true },
+              );
           },
+          run: async () => {
+            const result = await integrations.execute(
+              ownerId,
+              action,
+              prepared,
+              turn,
+              options.signal,
+              connected?.verifiedBinding ?? targetBinding,
+              !verdict.confirm && verdict.basis.kind === 'read' ? readWork : 'action',
+            );
+            await ledger.action(
+              turn.turnId,
+              action,
+              verdict.confirm ? { kind: 'approved' } : verdict.basis,
+              actionTarget(action, prepared),
+            );
+            return result;
+          },
+          details: verdict.confirm ? { reason: verdict.reason } : {},
+          prepareConfirmation,
         });
         return result;
       },
@@ -2871,6 +3270,7 @@ async function initializeApplication(
         model: adapters.model.name,
         llmReady: adapters.model.configured,
         modelReconnect: adapters.model.reconnect === true,
+        ...(adapters.models?.current.checking ? { modelChecking: true } : {}),
         ...(adapters.model.issue ? { modelIssue: adapters.model.issue } : {}),
         ...(alternative ? { modelAlternative: alternative } : {}),
         integrationsReady: adapters.integrations.configured,
@@ -2881,6 +3281,7 @@ async function initializeApplication(
   proactivity.registerRoutes(app);
 
   app.addHook('preClose', async () => {
+    closing.abort();
     await adapters.models?.close();
   });
   const feedbackReportOptions: FeedbackReportOptions = {
@@ -2950,6 +3351,7 @@ async function initializeApplication(
   adapters.integrationBrowser?.registerRoutes(app);
   integrations.registerRoutes(app);
   localFiles.registerRoutes(app);
+  computerUse.registerRoutes(app);
   personal.registerRoutes(app);
   onboardingSuggestions.registerRoutes(app);
   onboardingProfile.registerRoutes(app);
@@ -3112,6 +3514,17 @@ async function initializeApplication(
       messageAccepted: ownerMessageAccepted,
       answer: (text, channel, replyToMessageId) =>
         userMessages.answer(text, { channel, replyToMessageId }),
+      acceptApproval: async (client, input) => {
+        const { threadId, messageId, approvalId, approved, channel, stopSignal } = input;
+        await userMessages.submit(approved ? 'Approve' : 'Cancel', [], {
+          client,
+          threadId,
+          channel,
+          replyToMessageId: messageId,
+          approvalAnswer: { approvalId, approved },
+          stopSignal,
+        });
+      },
     });
     channels.registerRoutes(app);
     await channelSettings?.recover();
@@ -3123,12 +3536,12 @@ async function initializeApplication(
       void observeChannels();
     }
   }
+  await startThreadConsumers?.();
   await onboardingSuggestions.initialize();
   if (adapters.model.configured)
     void admission.run(integrations.resumeWritingStyle)?.catch(() => {});
   let closingConsumers: Promise<void> | undefined;
   app.addHook('preClose', async () => {
-    closing.abort();
     admission.close();
     closingConsumers = consumers.close();
     void closingConsumers.catch(() => {});

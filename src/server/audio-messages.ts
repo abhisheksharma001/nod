@@ -6,7 +6,7 @@ import type { AppDependencies } from './app.ts';
 import { pool } from './db.ts';
 import { ownerId, configuration } from './config.ts';
 import { artifactView, localArtifacts } from './artifacts.ts';
-import { lockThread, stopSignal, submitUserMessage } from './thread.ts';
+import { lockThread, messageIntakeSignal, stopSignal, submitUserMessage } from './thread.ts';
 import { transaction } from './transaction.ts';
 import { refresh } from './events.ts';
 import { SpeechSetupError } from './speech.ts';
@@ -34,6 +34,7 @@ export const messageInput = z
     seenMessageId: z.uuid().optional(),
     clientMessageId: z.uuid().optional(),
     threadId: z.uuid().optional(),
+    chatClearedAt: z.iso.datetime().nullable().optional(),
     verificationRequestId: z.uuid().optional(),
   })
   .strict();
@@ -76,7 +77,7 @@ export function registerAudioMessages(app: FastifyInstance, dependencies: AppDep
       throw privateConflict('Work is stopping. Send the recording again when it finishes.');
     const arrival = stopSignal();
     const controller = new AbortController();
-    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(120_000)]);
+    let signal = AbortSignal.any([controller.signal, AbortSignal.timeout(120_000)]);
     active.set(controller, undefined);
     const abort = () => controller.abort();
     request.raw.once('aborted', abort);
@@ -128,6 +129,10 @@ export function registerAudioMessages(app: FastifyInstance, dependencies: AppDep
         )
         .parse(rawMessage);
       active.set(controller, input.threadId);
+      if (input.text.trim().toLowerCase() === '/clear')
+        throw invalid('Send /clear as a text message without a recording.');
+      const chatSignal = await messageIntakeSignal(arrival, input);
+      if (chatSignal) signal = AbortSignal.any([signal, chatSignal]);
       signal.throwIfAborted();
       const speech = dependencies.speech;
       const fingerprint = createHash('sha256')

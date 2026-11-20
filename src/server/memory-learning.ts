@@ -4,7 +4,7 @@ import type { PgBoss } from 'pg-boss';
 import { z } from 'zod';
 import type { MemoryCurator } from '../ports/memory-curator.ts';
 import { repair } from './memory-lint.ts';
-import { applyOps } from './memory-ops.ts';
+import { applyOps, type Rejection } from './memory-ops.ts';
 import { localTimestamp } from '../shared/date-locale.ts';
 import { indexLayout, unsafe } from './memory-tree.ts';
 import { withdrawnSql } from './turn-chain.ts';
@@ -47,6 +47,22 @@ const reflectInstructions = (sensitive: boolean) =>
 const rememberInstructions = (sensitive: boolean) =>
   `You save long-term memory for a personal assistant. The user's current message asks the assistant to remember something, or states a lasting fact, preference or routine. Input JSON: today, memory (the current index of saved entries by area; tentative entries were mentioned once), current (the user's current message) and earlier (the user's recent messages before it, and any older ones the assistant found). Each message is numbered m, with at, when the user sent it. ${quoted} Save every lasting fact, preference or routine that current asks to remember or states, one entry each, and nothing else. Use earlier only to work out what current refers to. When current asks to remember something an earlier message gave, such as "remember that address", save those details from that message, even when they came up in a one-off task. Write each entry as one specific, self-contained, declarative fact about the user as it holds beyond the task it came up in, such as "Delivery address: …", never as an instruction to the assistant, and keep names, numbers and places exactly as the user wrote them. When a fact is an event or depends on time, start its text with its date (YYYY-MM-DD), resolving words like tomorrow against the message's at, and set expires (YYYY-MM-DD) when it stops being true on a known date. Never save passwords, codes, card numbers or other secrets. Unless the current message asks to remember them, skip questions, one-off tasks and their details, guesses and anything about the assistant.${sensitive ? '' : ` Save ${sensitiveTopics} only when the current message explicitly asks to remember that information.`} If memory already has a fact the current message asks for or states, repeat its text exactly as an add with the new quote. When the messages explicitly make a saved entry untrue, add the new fact and archive that entry; never archive an entry only because a new fact differs from it. ${areas} ${facts} Ops: {"op":"add","sensitive":true when the entry is about ${sensitiveTopics}, otherwise false,"area":"...","slug":"kebab-case","text":"one short line","fact":{"kind":"fact","entities":[]},"replaces":[],"abstract":"optional, at most 120 chars","expires":"optional YYYY-MM-DD","m":[message numbers],"quote":"short verbatim quote from a cited message that supports the text"}, and every add includes sensitive; {"op":"archive","path":"area/slug","reason":"obsolete"|"contradicted","m":[...],"quote":"..."} when a cited message replaces an entry (obsolete) or says it is wrong (contradicted). Return exactly one JSON object, {"ops":[...]}, or {"ops":[]} when there is nothing lasting to save, with no other text before or after it.`;
 const recentMessages = 10;
+const rejections: Record<Rejection, string> = {
+  invalid: 'not a valid note, such as text or a quote over 4,000 characters',
+  quote: 'quote not in the cited owner message',
+  secret: 'holds a password, code, card number or other secret',
+  missing: 'note to archive or replace not found',
+  full: 'memory is full',
+};
+const notSaved = (rejected: Rejection[]) =>
+  `${rejected.length} proposed memory ${rejected.length === 1 ? 'change was' : 'changes were'} not applied: ${[
+    ...new Set(rejected),
+  ]
+    .map((reason) => {
+      const count = rejected.filter((item) => item === reason).length;
+      return `${rejections[reason]}${count > 1 ? ` (${count})` : ''}`;
+    })
+    .join('; ')}.`;
 const rememberInput = z
   .object({
     messages: z
@@ -63,7 +79,10 @@ export function createMemoryLearning(options: {
   curator: MemoryCurator;
   analytics?: CaptureAnalytics;
 }) {
-  const report = (changes: ReturnType<typeof applyOps>, actor: 'agent' | 'background') => {
+  const report = (
+    changes: ReturnType<typeof applyOps>['applied'],
+    actor: 'agent' | 'background',
+  ) => {
     for (const { operation } of changes)
       options.analytics?.({
         event: 'memory_changed',
@@ -123,7 +142,7 @@ export function createMemoryLearning(options: {
     }
     const result = await options.memory.edit((fresh) => {
       if (fresh.reflected !== tree.reflected) return;
-      const operations = applyOps(fresh, ops, messages, new Date().toISOString());
+      const { applied: operations } = applyOps(fresh, ops, messages, new Date().toISOString());
       fresh.reflected = mark;
       fresh.retries = 0;
       return { operations, applied: operations.length, more: rows.length === batchSize };
@@ -136,7 +155,9 @@ export function createMemoryLearning(options: {
     raw: unknown,
     sourceMessageId: string | null,
     commit: <T>(write: () => Promise<T>) => Promise<T> = (write) => write(),
+    signal?: AbortSignal,
   ) {
+    signal?.throwIfAborted();
     const input = rememberInput.parse(raw);
     if (!sourceMessageId) throw new Error('Only a message from the owner can save to memory.');
     if (!options.curator.configured) throw new Error('Saving to memory needs the memory model.');
@@ -178,26 +199,39 @@ export function createMemoryLearning(options: {
     const said = numbered(ordered);
     const ask = async () =>
       answer.safeParse(
-        await options.curator.curate({
-          task: 'remember',
-          instructions: rememberInstructions(tree.sensitive),
-          input: {
-            today: new Date().toISOString().slice(0, 10),
-            memory: JSON.stringify(indexLayout(tree, { tentative: true })),
-            current: said.at(-1),
-            earlier: said.slice(0, -1),
+        await options.curator.curate(
+          {
+            task: 'remember',
+            instructions: rememberInstructions(tree.sensitive),
+            input: {
+              today: new Date().toISOString().slice(0, 10),
+              memory: JSON.stringify(indexLayout(tree, { tentative: true })),
+              current: said.at(-1),
+              earlier: said.slice(0, -1),
+            },
           },
-        }),
+          signal,
+        ),
       );
     let reply = await ask();
+    signal?.throwIfAborted();
     if (!reply.success) reply = await ask();
+    signal?.throwIfAborted();
     if (!reply.success)
       throw new Error('The memory model gave no usable answer. Nothing was saved.');
     const changes = await commit(() =>
       options.memory.edit((fresh) => {
         if (fresh.generation !== tree.generation)
           throw new Error('Memory changed while this note was being prepared. Save it again.');
-        return applyOps(fresh, reply.data.ops, ordered, new Date().toISOString(), 'stated');
+        const { applied, rejected } = applyOps(
+          fresh,
+          reply.data.ops,
+          ordered,
+          new Date().toISOString(),
+          'stated',
+        );
+        if (rejected.length) throw new Error(`Nothing was saved. ${notSaved(rejected)}`);
+        return applied;
       }),
     );
     report(changes, 'agent');

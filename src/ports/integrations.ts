@@ -52,6 +52,7 @@ export interface IntegrationSession {
   id: string;
   authorize(service: IntegrationService, callbackUrl: string): Promise<IntegrationAuthorization>;
   search(query: string, signal?: AbortSignal): Promise<IntegrationSearch>;
+  offers?(action: string, signal?: AbortSignal): Promise<boolean>;
   execute(
     action: string,
     args: Record<string, unknown>,
