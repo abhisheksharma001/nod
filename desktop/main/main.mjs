@@ -1957,7 +1957,13 @@ async function transferWelcome() {
         headers: { 'Content-Type': 'application/json', Origin: engineOrigin },
         body: JSON.stringify({ usageData: saved.welcome.usageData }),
       });
-      if (!response.ok) throw new Error('Nod could not save your choice. Try again.');
+      if (!response.ok) {
+        const failure = await response.json().catch(() => undefined);
+        const reason = typeof failure?.error === 'string' ? failure.error.trim() : '';
+        throw new Error(
+          `Nod could not save your choice (HTTP ${response.status})${reason ? `: ${reason.replace(/[.\s]+$/, '')}` : ''}. Try again.`,
+        );
+      }
       const result = await response.json();
       if (result.settings?.usageData !== saved.welcome.usageData)
         throw new Error('Nod could not confirm your choice. Try again.');

@@ -3162,6 +3162,37 @@ test('server model credentials reject invalid destinations and cloud accounts be
   );
 });
 
+test('adding a model key keeps the service reason and removes the key', async () => {
+  const { createModelService } = await import('../src/server/models.ts');
+  const { createPiModelBackend } = await import('../src/providers/pi/models.ts');
+  const key = 'fixture-add-key-reason';
+  const secret = randomBytes(32);
+  for (const [provider, status] of [
+    ['openrouter', 429],
+    ['mistral', 503],
+  ] as const) {
+    const service = createModelService({
+      database: {} as pg.Pool,
+      ownerId: 'fixture-add-key-owner',
+      keyStore: { id: 'fixture', configured: true, getKey: async () => secret },
+      backend: createPiModelBackend({
+        fetch: async () =>
+          Response.json(
+            { message: `Synthetic ${key}` },
+            { status, headers: { 'content-type': 'application/json' } },
+          ),
+      }),
+      origin: 'http://127.0.0.1:4310',
+    });
+    await assert.rejects(service.addKey(provider, key), (error: Error) => {
+      assert.ok(!error.message.includes(key));
+      assert.ok(error.message.includes(`HTTP ${status}`));
+      assert.match(error.message, /Synthetic \[redacted\]/);
+      return true;
+    });
+  }
+});
+
 test('secret redaction finishes for long malformed Basic credentials', async () => {
   const { execFile } = await import('node:child_process');
   const { promisify } = await import('node:util');

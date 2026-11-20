@@ -422,7 +422,7 @@ export function createDiscoveredTransport(
         headers: {
           ...headers,
           Accept: 'application/json, */*;q=0.1',
-          ...(method !== 'GET' ? { 'Content-Type': 'application/json' } : {}),
+          ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
         },
         ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
       });

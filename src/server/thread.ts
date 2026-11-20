@@ -1475,7 +1475,7 @@ async function scheduleRunNotice(
   return presentationSchema.parse({
     version: 1,
     type: 'schedule-run',
-    title: row.title.slice(0, 120),
+    title: row.title.slice(0, 120).replace(/[\uD800-\uDBFF]$/, ''),
     sources: [],
     scheduleId: row.scheduleId,
     revision: row.revision,

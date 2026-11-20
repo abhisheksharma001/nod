@@ -802,7 +802,7 @@ export function createLocalFiles(
       let text: string;
       try {
         if (bytes.includes(0)) throw new Error();
-        text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+        text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
       } catch {
         throw new IntegrationError(`${path} is not a UTF-8 text file. Nothing was changed.`);
       }

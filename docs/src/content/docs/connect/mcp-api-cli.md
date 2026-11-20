@@ -49,11 +49,11 @@ A failed tool request keeps the server's status and reason. Nod does not retry i
 
 Ask Nod to connect a service it can't find in the app catalog. Nod proposes a way in, called an access path, and sends you a link to a private setup page. There, you paste a token or sign in. The model never sees the token.
 
-| Access path | What Nod calls                                                 | How it signs in                       |
-| ----------- | -------------------------------------------------------------- | ------------------------------------- |
-| MCP server  | Tools on a public HTTPS MCP server, or a private one you enter | A token in a header, or OAuth sign-in |
-| HTTP API    | A method and path on the API                                   | A token in a header                   |
-| CLI         | A command with arguments                                       | Tokens in environment variables       |
+| Access path | What Nod calls                                                 | How it signs in                                    |
+| ----------- | -------------------------------------------------------------- | -------------------------------------------------- |
+| MCP server  | Tools on a public HTTPS MCP server, or a private one you enter | A token in a header, or OAuth sign-in              |
+| HTTP API    | A method and path on the API                                   | A token in a header, or OAuth sign-in              |
+| CLI         | A command with arguments                                       | Tokens and other settings in environment variables |
 
 Some services give each region or workspace its own MCP address, such as a separate EU address, each with its own sign-in. On those services, an account can only sign in through its own address. Nod picks the address from a workspace address you give it, or asks for your workspace address or region before it proposes a connection. If sign-in ends on the service's home page instead of returning to Nod, tell Nod your workspace address and start again, or select **Connect MCP** and enter the address for your region.
 

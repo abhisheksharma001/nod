@@ -2115,6 +2115,10 @@ test('Telegram downloads stop at 20 MB whatever size the sender, Bot API or file
     (await download(undefined, () => new Response(new Uint8Array(limit)))).byteLength,
     limit,
   );
+  await assert.rejects(
+    download(undefined, () => new Response('Not Found', { status: 404, statusText: 'Not Found' })),
+    (error: Error) => error.message === 'Telegram file download failed (HTTP 404): Not Found',
+  );
   const refused = (description: string) =>
     telegramAttachments(message, 'token', async () =>
       Response.json({ ok: false, error_code: 400, description }, { status: 400 }),
