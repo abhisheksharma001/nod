@@ -1,3 +1,4 @@
+import { isEnterKey } from '../shared/browser-keys.ts';
 import {
   Kind,
   Type,
@@ -109,7 +110,19 @@ function rootObject<P extends TSchema>(schema: P): P {
           variants.findIndex((other) => JSON.stringify(other) === JSON.stringify(variant)) ===
           index,
       );
-      const value = distinct.length === 1 ? distinct[0] : Type.Union(distinct);
+      const value =
+        distinct.length === 1
+          ? distinct[0]
+          : Type.Union(
+              distinct,
+              distinct.every(
+                (variant) =>
+                  typeof variant.const === 'string' &&
+                  Object.keys(variant).every((key) => key === 'type' || key === 'const'),
+              )
+                ? { enum: [...new Set(distinct.map((v) => v.const))] }
+                : {},
+            );
       return [key, required.has(key) ? value : Type.Optional(value)];
     }),
   );
@@ -770,6 +783,17 @@ function pageKey(url: string) {
   }
 }
 
+const inputRoles = new Set([
+  'link',
+  'tab',
+  'textbox',
+  'searchbox',
+  'combobox',
+  'spinbutton',
+  'listbox',
+  'option',
+]);
+
 const commits = (step: BrowserAction) =>
   ['click', 'press', 'drag', 'accept_dialog', 'evaluate', 'select', 'check', 'uncheck'].includes(
     step.action,
@@ -896,14 +920,15 @@ export function nodTools(
     const page = await computer.currentPage(
       browserId,
       step.action === 'upload' ? { action: 'click', selector: step.selector } : step,
-      signal,
     );
     signal.throwIfAborted();
     if (
-      step.action === 'press' &&
-      [...(step.key ?? '')].length === 1 &&
-      step.key!.trim() &&
-      ['textbox', 'searchbox', 'spinbutton'].includes(page.controls?.[0]?.role ?? '')
+      !page.submits &&
+      !page.dialog &&
+      ['click', 'press'].includes(step.action) &&
+      page.controls?.length === 1 &&
+      inputRoles.has(page.controls[0]!.role) &&
+      !(step.action === 'press' && isEnterKey(step.key))
     )
       return { binding: {} };
     const verdict = await context.browserStep({

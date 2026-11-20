@@ -354,7 +354,6 @@ export async function createApprovals(
       admit?: (asks: boolean) => Promise<void>;
       validate?: (client: PoolClient) => Promise<void>;
       expectedRevision?: number;
-      expectedChatRevision?: string;
       basis?: TrustBasis;
       instructionChange?: InstructionChange;
     } = {},
@@ -753,16 +752,6 @@ export async function createApprovals(
       options.signal?.throwIfAborted();
     }
     const saveProposal = async (client: PoolClient) => {
-      if (
-        options.expectedChatRevision !== undefined &&
-        (await ownerChatRevision(client, ownerId, turn.threadId)) !== options.expectedChatRevision
-      )
-        throw Object.assign(
-          conflict(
-            'The chat changed while this action was being checked. This action did not run. Please ask again.',
-          ),
-          { notRun: true },
-        );
       if (instructionChange) await validateInstructionChange(client, ownerId, instructionChange);
       const inspected = await inspect(client);
       if ('cached' in inspected) {
@@ -777,7 +766,18 @@ export async function createApprovals(
         throw conflict('This repeated action needs a new confirmation. This action did not run.');
       await options.validate?.(client);
       options.signal?.throwIfAborted();
-      if (!question) return { cached: false as const, authorMessageId: inspected.authorMessageId };
+      if (!question) {
+        const closed = await client.query(
+          `UPDATE approvals a SET status='expired' FROM turns u
+           WHERE u.id=a.turn_id AND u.owner_id=a.owner_id AND u.session_id=(SELECT session_id FROM turns WHERE id=$5)
+             AND a.owner_id=$1 AND a.thread_id=$2 AND a.action=$3 AND a.args=$4::jsonb AND a.status='pending'
+           RETURNING a.id`,
+          [ownerId, turn.threadId, action, snapshot, turn.turnId],
+        );
+        for (const _ of closed.rows)
+          afterCommit(client, () => changed('expired', action, inspected.source));
+        return { cached: false as const, authorMessageId: inspected.authorMessageId };
+      }
       const messageId = randomUUID();
       await client.query(
         "INSERT INTO messages(id,owner_id,thread_id,turn_id,role,text) VALUES($1,$2,$3,$4,'assistant',$5)",
@@ -805,18 +805,15 @@ export async function createApprovals(
       options.signal?.throwIfAborted();
       return { cached: false as const, approval, question, source: inspected.source };
     };
-    const proposal =
-      options.expectedChatRevision !== undefined
-        ? await transaction(
-            async (client) => {
-              if ((await lockThread(client)).id !== turn.threadId)
-                throw conflict('This conversation is no longer active.');
-              return withTurnLock(turn.turnId, saveProposal, client);
-            },
-            pool,
-            options.signal,
-          )
-        : await withTurnLock(turn.turnId, saveProposal);
+    const proposal = await transaction(
+      async (client) => {
+        if ((await lockThread(client)).id !== turn.threadId)
+          throw conflict('This conversation is no longer active.');
+        return withTurnLock(turn.turnId, saveProposal, client);
+      },
+      pool,
+      options.signal,
+    );
     if (proposal.cached) return proposal.result;
     if ('question' in proposal) {
       if ('source' in proposal && proposal.source) changed('asked', action, proposal.source);
@@ -896,52 +893,16 @@ export async function createApprovals(
     const { approved } = input.answer;
     const active = ['running', 'waiting'].includes(approval.turn_status);
     if (input.clicked && (approved === undefined || !active)) return undefined;
-    if (approved === undefined) {
-      await client.query("UPDATE approvals SET status='expired' WHERE id=$1 AND owner_id=$2", [
-        approval.id,
-        ownerId,
-      ]);
-      afterCommit(client, () => changed('expired', approval.action, approval.turn_source));
-      if (active && approval.turn_background && input.replyToMessageId)
-        return {
-          waiting: {
-            id: approval.turn_id as string,
-            session_id: approval.turn_session_id as string,
-            background: true,
-          },
-        };
-      const cancelled = await client.query(
-        "UPDATE turns SET status='cancelled',finished_at=now() WHERE id=$1 AND owner_id=$2 AND status='waiting' RETURNING id",
-        [approval.turn_id, ownerId],
-      );
-      if (cancelled.rowCount && approval.turn_background && approval.turn_task_id) {
-        const task = (
-          await client.query<{ id: string }>(
-            "SELECT id FROM tasks WHERE id=$1 AND owner_id=$2 AND turn_id=$3 AND state='open' FOR UPDATE",
-            [approval.turn_task_id, ownerId, approval.turn_id],
-          )
-        ).rows[0];
-        if (task) {
-          const messageId = randomUUID();
-          await client.query(
-            `INSERT INTO messages(id,owner_id,thread_id,turn_id,role,text,created_at)
-             VALUES($1,$2,$3,$4,'assistant',$5,clock_timestamp())`,
-            [
-              messageId,
-              ownerId,
-              input.threadId,
-              approval.turn_id,
-              'The proposed action did not run. This task is still open, but its current work stopped. Reply here to continue the remaining work.',
-            ],
-          );
-          await client.query(
-            'UPDATE tasks SET continuation_message_id=$3,updated_at=now() WHERE id=$1 AND owner_id=$2',
-            [task.id, ownerId, messageId],
-          );
-        }
-      }
-      return undefined;
-    }
+    if (approved === undefined)
+      return active && approval.turn_background && input.replyToMessageId
+        ? {
+            waiting: {
+              id: approval.turn_id as string,
+              session_id: approval.turn_session_id as string,
+              background: true,
+            },
+          }
+        : undefined;
     if (!active) return undefined;
     const prompt = approved
       ? 'The user confirmed the exact saved action. The trusted worker must execute that snapshot once before continuing. Do not substitute an action or execute it yourself.'

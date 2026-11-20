@@ -43,7 +43,7 @@ flowchart TD
 
 Web search and page fetch (`web_search` and `fetch_content`) run on the server. A fetch to a named fixture host uses the local test server. Other requests can reach the public web.
 
-Checks grade the end state: the fake world, the workspace files and the trace. Ground truth includes every visible assistant message in full, with any native visual such as a chart or card, so a long background trace cannot hide a delivered answer from the judge. Action trust checks use the configured small LLM or decision model, as in production. The selected text model writes most approval wording from the proposed action and available target context, including page-visible text for browser steps, and checks its wording in a separate request. The server writes a fixed question and button label for permanent Gmail deletion. The effort selector takes the first advertised level that is `off`, `minimal`, `low` or `medium`. If none matches, it takes the first advertised level. Decision models can also classify approval replies and emails that give account access. A separate judge model grades what needs judgement, and also reads the text of any file Nod shares with the user. Every request to a lookalike website records which browser made it, so a check can tell what each browser, including a subagent's, was showing.
+Checks grade the end state: the fake world, the workspace files and the trace. Ground truth includes every visible assistant message in full, with any native visual such as a chart or card, so a long background trace cannot hide a delivered answer from the judge. Action trust checks use the configured small LLM or decision model, as in production. The selected text model writes most approval wording from the proposed action and available target context, including page-visible text for browser steps. The server writes a fixed question and button label for permanent Gmail deletion. The effort selector takes the first advertised level that is `off`, `minimal`, `low` or `medium`. If none matches, it takes the first advertised level. Decision models can also classify approval replies and emails that give account access. A separate judge model grades what needs judgement, and also reads the text of any file Nod shares with the user. Every request to a lookalike website records which browser made it, so a check can tell what each browser, including a subagent's, was showing.
 
 :::caution[The fakes are the main fidelity risk]
 The fake apps are hand-written approximations of Composio's responses, not recordings. Check a result against a real account before you trust it for a connector.
@@ -108,7 +108,7 @@ Run each command as `pnpm run eval:capability <command>`. `help` lists every opt
 | Cap the spend          | `run --budget 20`                                                                     |
 | Recover from a crash   | `run --label x --resume` redoes only incomplete attempts; `cleanup` removes leftovers |
 | Compare with a release | `gate --baseline nod-v0.1.19`: side by side, with a verdict                           |
-| Prove gate scenarios   | `promote <label>` after a run with `--repeat 5` or more                               |
+| Prove gate scenarios   | `promote <label>...` after five or more attempts, such as two nightly runs            |
 
 ## Compare decision checks
 
@@ -201,12 +201,12 @@ WhisperBench hashes complete workspace files to detect changes. It captures at m
 
 The **Evals** workflow runs the suite with a disposable PostgreSQL and images built from the code under test. Its scores don't gate CI, deployments or releases. It never runs the release suite: the workflow offers only the **pr** and **full** tiers, and release cases never join the gate.
 
-|               | Nightly                                        | On demand                                                                   |
-| ------------- | ---------------------------------------------- | --------------------------------------------------------------------------- |
-| Start         | Every day at 01:23 UTC on `main`               | **Actions → Evals → Run workflow**                                          |
-| Suite         | Full controlled suite, three attempts per case | **full** by default, or the small **pr** tier, named cases or a spend limit |
-| Compared with | Nothing; it scores `main` alone                | **baseline**: `main`, a branch, a tag or `latest-release`, or nothing       |
-| Time limit    | Six hours                                      | Six hours for **full**, 90 minutes for **pr**                               |
+|               | Nightly                                        | On demand                                                                                   |
+| ------------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| Start         | Every day at 01:23 UTC on `main`               | **Actions → Evals → Run workflow**                                                          |
+| Suite         | Full controlled suite, three attempts per case | **full** by default, or the small **pr** tier, named cases, one capability or a spend limit |
+| Compared with | Nothing; it scores `main` alone                | **baseline**: `main`, a branch, a tag or `latest-release`, or nothing                       |
+| Time limit    | Six hours                                      | Six hours for **full**, 90 minutes for **pr**                                               |
 
 In the CLI, use `--effort medium` or another supported level for a separate reasoning-effort comparison. The Actions workflow has no effort input. This changes only the main agent, including its helpers; Trust checks and approval-reply classification keep their production effort. The run manifest records the chosen effort. The default is high. Keep model and effort fixed when you compare harness changes.
 
@@ -261,7 +261,8 @@ flowchart TD
 ```
 
 - **Gate scenarios decide.** Only scenarios in [`evals/gate.json`](https://github.com/n8n-io/nod/blob/main/evals/gate.json) count towards the verdict.
-- **Scenarios earn their place.** `promote <label>` adds a calibrated scenario that passed every attempt in a run of five or more. A later failure or an edit takes it out again.
+- **Scenarios earn their place.** `promote <label>...` adds a calibrated scenario that passed every attempt across five or more, such as two downloaded nightly runs on `main`. A later failure or an edit takes it out again.
+- **The gate can't go stale silently.** CI fails when a gate scenario changed since it was proven. Prove it again in the same change, or remove it from `evals/gate.json`.
 - **The harness canary goes first.** If `harness-canary` fails twice, nothing is scored, because a broken harness would look like a regression.
 - **Faults don't count.** Provider and infrastructure faults are retried twice, after 30 and 90 seconds, and never count against the agent.
 - **Unchanged code is a GO.** In CI, if nothing the evals exercise changed, the run reports GO without running.
@@ -280,7 +281,7 @@ flowchart TD
 - The 70% floor applies only to the per-scenario test. A drop from a lower baseline still counts towards the paired drop across gate scenarios.
 - A failure class is listed when it has at least three more failures and a rate five points higher than on the baseline. This never blocks.
 - Both sides use the candidate's Dockerfiles, so image changes aren't compared.
-- A scenario joins the gate only if it's a calibrated regression scenario that passed every attempt in a run of at least five. A later proving run in which it fails removes it. Editing it, or a fake app or site file it runs, removes it until it's proven again; edits to other fakes and to the grader don't.
+- A scenario joins the gate only if it's a calibrated regression scenario that passed every attempt across at least five, from one or more runs. A later proving run in which it fails removes it. Editing it, or a fake app or site file it runs, removes it until it's proven again; edits to other fakes and to the grader don't.
 
 </details>
 

@@ -1,4 +1,8 @@
-import { browserErrorMessage, type BrowserErrorCode } from '../../shared/browser-errors.ts';
+import {
+  browserErrorMessage,
+  type BrowserErrorCode,
+  type BrowserSignInGuard,
+} from '../../shared/browser-errors.ts';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { z } from 'zod';
@@ -44,31 +48,6 @@ const pageSchema = z
       .optional(),
     dropTarget: controls.optional(),
     dialog: z.string().max(8192).optional(),
-    currentSelections: z
-      .object({
-        binding: z
-          .string()
-          .regex(/^[0-9a-f]{64}$/)
-          .optional(),
-        values: z
-          .array(
-            z
-              .object({
-                role: z.string().max(100),
-                name: z.string().max(300),
-                value: z.string().max(300).optional(),
-                checked: z.enum(['true', 'false', 'mixed']).optional(),
-                selected: z.boolean().optional(),
-                selectedCount: z.number().int().min(0).max(256).optional(),
-                group: z.string().max(300).optional(),
-              })
-              .strict(),
-          )
-          .max(20),
-        incomplete: z.string().max(1000).optional(),
-      })
-      .strict()
-      .optional(),
   })
   .strict();
 
@@ -188,7 +167,11 @@ export function createBridgeComputer(options: {
     const failed = (
       reason: string,
       error?: unknown,
-      exit: { exitCode?: number | null; signal?: string | null } = {},
+      exit: {
+        exitCode?: number | null;
+        signal?: string | null;
+        signInGuard?: BrowserSignInGuard;
+      } = {},
     ) => {
       const message = error instanceof Error ? error.message : undefined;
       const context = {
@@ -202,7 +185,7 @@ export function createBridgeComputer(options: {
       if (reason === 'error_response')
         logRepeatedFailure(
           'browser_bridge_failed',
-          `${input.method}:${message}`,
+          `${input.method}:${message}:${exit.signInGuard ?? ''}`,
           { code: message, stderr },
           context,
         );
@@ -306,20 +289,29 @@ export function createBridgeComputer(options: {
         if (cancelling || (!response.ok && response.error === 'cancelled'))
           return reject(new Error('Browser operation cancelled.'));
         if (response.ok) return resolve(response.result);
-        failed('error_response', new Error(response.error));
+        failed('error_response', new Error(response.error), {
+          ...(response.signInGuard ? { signInGuard: response.signInGuard } : {}),
+        });
         if (browserErrorMessage(response.error))
           return reject(
-            new BrowserActionError(response.error as BrowserErrorCode, response.detail),
+            new BrowserActionError(
+              response.error as BrowserErrorCode,
+              response.detail,
+              response.signInGuard,
+            ),
           );
         if (response.error === 'locked') {
           const error = new Error('Browser observations are paused during credential entry.');
           return reject(Object.assign(error, { statusCode: 423 }));
         }
         reject(
-          new Error(
-            response.detail
-              ? `The workspace browser could not complete this action: ${response.detail}`
-              : 'The workspace browser could not complete this action. Try again.',
+          Object.assign(
+            new Error(
+              response.detail
+                ? `The workspace browser could not complete this action: ${response.detail}`
+                : 'The workspace browser could not complete this action. Try again.',
+            ),
+            response.signInGuard ? { signInGuard: response.signInGuard } : {},
           ),
         );
       });
@@ -521,7 +513,6 @@ export function createBridgeComputer(options: {
               ...(input.expectOrigin ? { expectOrigin: input.expectOrigin } : {}),
               ...(input.expectUrl ? { expectUrl: input.expectUrl } : {}),
               ...(input.expectTarget ? { expectTarget: input.expectTarget } : {}),
-              ...(input.expectSelections ? { expectSelections: input.expectSelections } : {}),
             },
           },
           signal,
@@ -554,16 +545,13 @@ export function createBridgeComputer(options: {
       if (bytes.length !== result.size) throw new Error('The browser file is unavailable.');
       return { bytes, name: result.name, mimeType: result.mimeType };
     },
-    currentPage: async (id, step, signal) =>
+    currentPage: async (id, step) =>
       pageSchema.parse(
-        await call(
-          {
-            method: 'currentPage',
-            threadId: threadIdentity(id),
-            ...(step ? { input: step } : {}),
-          },
-          signal,
-        ),
+        await call({
+          method: 'currentPage',
+          threadId: threadIdentity(id),
+          ...(step ? { input: step } : {}),
+        }),
       ),
     signInMethods: async (id, origin, methods, signal) =>
       z
