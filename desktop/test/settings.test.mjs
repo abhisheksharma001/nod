@@ -5709,18 +5709,22 @@ test('server token recovery distinguishes a locked store from unreadable ciphert
 
 test('remote connection verification keeps the cause of a failed connection and never shows the token or address', async (t) => {
   const token = randomBytes(32).toString('base64url');
+  const failed = (code, message) =>
+    new TypeError('fetch failed', {
+      cause: Object.assign(new Error(message), { code, hostname: 'assistant.example.test' }),
+    });
   const causes = [
-    [Object.assign(new TypeError('fetch failed'), { cause: { code: 'ENOTFOUND' } }), 'ENOTFOUND'],
-    [Object.assign(new TypeError('fetch failed'), { cause: { code: 'EAI_AGAIN' } }), 'EAI_AGAIN'],
+    [failed('ENOTFOUND', 'getaddrinfo ENOTFOUND assistant.example.test'), 'ENOTFOUND'],
+    [failed('EAI_AGAIN', 'getaddrinfo EAI_AGAIN assistant.example.test'), 'EAI_AGAIN'],
     [
-      Object.assign(new TypeError('fetch failed'), { cause: { code: 'CERT_HAS_EXPIRED' } }),
-      'CERT_HAS_EXPIRED',
+      failed(
+        'ERR_TLS_CERT_ALTNAME_INVALID',
+        "Hostname/IP does not match certificate's altnames: Host: assistant.example.test. is not in the cert's altnames",
+      ),
+      'ERR_TLS_CERT_ALTNAME_INVALID',
     ],
     [new DOMException('The operation timed out.', 'TimeoutError'), undefined],
-    [
-      Object.assign(new TypeError('fetch failed'), { cause: { code: `Bearer ${token}` } }),
-      undefined,
-    ],
+    [failed(`Bearer ${token}`, `assistant.example.test rejected Bearer ${token}`), undefined],
   ];
   const seen = new Set();
   for (const [cause, code] of causes) {
