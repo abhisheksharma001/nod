@@ -174,7 +174,7 @@ Each session also checks in with you. When its model spend since your last messa
 
 The owner can send `/clear` through web, desktop, Telegram or WhatsApp. The server handles it without a model call.
 
-Under the thread lock, it cancels only main-chat turns, saves the command, and records new context and view boundaries. The next main-chat turn starts a fresh Pi transcript. Recent chat and automatic related-chat recall exclude earlier messages. Chat search can still read them.
+Under the thread lock, it cancels only main-chat turns, saves the command, and records new context and view boundaries. This context change does not withdraw owner requests. Saved task and schedule instructions stay valid; a request already withdrawn by Stop or a model failure stays withdrawn. The next main-chat turn starts a fresh Pi transcript. Recent chat and automatic related-chat recall exclude earlier messages. Chat search can still read them.
 
 The intake boundary changes only after commit. Main-chat input still in progress, including transcription, is cancelled before it can save a new message or file. Web requests carry the last view boundary, so a queued main-chat message is refused after another client clears the chat. Addressed task replies keep their task session.
 

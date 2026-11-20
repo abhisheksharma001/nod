@@ -33,6 +33,7 @@ import {
 } from './analytics-connections.ts';
 
 const envName = appEnvironmentNameSchema;
+const manualMcpService = /^mcp-[0-9a-f]{24}$/;
 
 const proposalSchema = z.object({
   service: z
@@ -52,6 +53,7 @@ type AccountRow = {
   owner_id: string;
   service: string;
   name: string;
+  display_name: string | null;
   account_name: string;
   account_id: string;
   paths: AccessPath[];
@@ -63,6 +65,7 @@ type ProposalRow = {
   service: string;
   name: string;
   paths: AccessPath[];
+  display_name?: string | null;
   setup_url: string | null;
   setup_text: string | null;
   account_name: string | null;
@@ -267,7 +270,8 @@ export async function createDiscoveredConnections(
     );
     ALTER TABLE discovered_connections ADD COLUMN IF NOT EXISTS account_id uuid NOT NULL DEFAULT gen_random_uuid(),
       ADD COLUMN IF NOT EXISTS reconnect_required boolean NOT NULL DEFAULT false,
-      ADD COLUMN IF NOT EXISTS replaced_at timestamptz;
+      ADD COLUMN IF NOT EXISTS replaced_at timestamptz,
+      ADD COLUMN IF NOT EXISTS display_name text;
     ALTER TABLE discovered_connection_proposals ADD COLUMN IF NOT EXISTS oauth_status text,
       ADD COLUMN IF NOT EXISTS link_hash text,
       ADD COLUMN IF NOT EXISTS callback_return_to text,
@@ -292,6 +296,12 @@ export async function createDiscoveredConnections(
     if (!result.rows[0]) throw error('This connected account is unavailable.', 404);
     return result.rows[0];
   }
+  async function lockDisplayName(client: PoolClient, service: string) {
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1),hashtext($2))', [
+      `discovered-mcp-name:${owner}`,
+      service,
+    ]);
+  }
   async function list(client?: PoolClient): Promise<Connection[]> {
     const rows = (
       await (client ?? pool).query<AccountRow>(
@@ -301,7 +311,12 @@ export async function createDiscoveredConnections(
     ).rows;
     return rows.map((row) => ({
       slug: row.service,
-      name: row.name,
+      name: row.display_name ?? row.name,
+      ...(manualMcpService.test(row.service) &&
+      !apps.has(row.service) &&
+      row.paths.some((path) => path.kind === 'mcp')
+        ? { canRename: true }
+        : {}),
       status: row.reconnect_required ? 'disconnected' : 'connected',
       ...(row.reconnect_required ? { canReconnect: true } : {}),
       connectionId: row.id,
@@ -330,9 +345,12 @@ export async function createDiscoveredConnections(
       oauth_status: ProposalRow['oauth_status'];
       oauth_error: string | null;
     }>(
-      `SELECT id,service AS slug,name,oauth_status IS NOT DISTINCT FROM 'connected' AS completed,
+      `SELECT id,service AS slug,
+       COALESCE((SELECT min(display_name) FROM discovered_connections
+                 WHERE owner_id=p.owner_id AND service=p.service),name) AS name,
+       oauth_status IS NOT DISTINCT FROM 'connected' AS completed,
        expires_at<=now() AS expired,link_hash,oauth_status,oauth_error
-       FROM discovered_connection_proposals WHERE owner_id=$1
+       FROM discovered_connection_proposals p WHERE owner_id=$1
        AND (id=ANY($2::uuid[]) OR link_hash=ANY($3::text[]))`,
       [owner, requested, hashes],
     );
@@ -673,8 +691,9 @@ export async function createDiscoveredConnections(
   async function proposal(id: string, client: Pool | PoolClient = pool, lock = false) {
     const row = (
       await client.query<ProposalRow>(
-        `SELECT id,owner_id,service,name,paths,connection_id,turn_id,setup_url,setup_text,account_name,oauth_state_hash,oauth_status,oauth_error,callback_return_to,created_at
-       FROM discovered_connection_proposals
+        `SELECT id,owner_id,service,name,paths,connection_id,turn_id,setup_url,setup_text,account_name,oauth_state_hash,oauth_status,oauth_error,callback_return_to,created_at,
+       (SELECT min(display_name) FROM discovered_connections WHERE owner_id=p.owner_id AND service=p.service) AS display_name
+       FROM discovered_connection_proposals p
        WHERE id=$1 AND owner_id=$2 AND expires_at>now()${lock ? ' FOR UPDATE' : ''}`,
         [z.uuid().parse(id), owner],
       )
@@ -726,9 +745,16 @@ export async function createDiscoveredConnections(
           ],
         );
       } else {
+        const sharesName =
+          manualMcpService.test(pending.service) &&
+          pending.paths.some((path) => path.kind === 'mcp');
+        if (sharesName) await lockDisplayName(client, pending.service);
         await client.query(
-          `INSERT INTO discovered_connections
-           (id,owner_id,service,name,account_name,paths) VALUES($1,$2,$3,$4,$5,$6)`,
+          `INSERT INTO discovered_connections (id,owner_id,service,name,account_name,paths,display_name)
+           VALUES($1,$2,$3,$4,$5,$6,
+             CASE WHEN $7 THEN
+               (SELECT min(display_name) FROM discovered_connections WHERE owner_id=$2 AND service=$3)
+             END)`,
           [
             idToSave,
             owner,
@@ -736,6 +762,7 @@ export async function createDiscoveredConnections(
             pending.name,
             accountName,
             JSON.stringify(pending.paths),
+            sharesName,
           ],
         );
       }
@@ -769,8 +796,8 @@ export async function createDiscoveredConnections(
     const { token: entered, accountName } = z
       .object({
         token: z.union([
-          z.string().min(1).max(8192),
-          z.record(envName, z.string().min(1).max(8192)),
+          z.string().trim().min(1).max(8192),
+          z.record(envName, z.string().trim().min(1).max(8192)),
         ]),
         accountName: z.string().trim().min(1).max(200),
       })
@@ -1136,10 +1163,10 @@ export async function createDiscoveredConnections(
       settled: boolean;
     }
   >();
-  async function signInRequired(id: string, required: boolean) {
+  async function signInRequired(row: AccountRow, required: boolean) {
     const changed = await pool.query(
-      'UPDATE discovered_connections SET reconnect_required=$3 WHERE id=$1 AND owner_id=$2 AND reconnect_required<>$3',
-      [id, owner, required],
+      'UPDATE discovered_connections SET reconnect_required=$3 WHERE id=$1 AND owner_id=$2 AND reconnect_required<>$3 AND account_id=$4 AND paths=$5::jsonb',
+      [row.id, owner, required, row.account_id, JSON.stringify(row.paths)],
     );
     if (changed.rowCount) options.refresh?.();
   }
@@ -1154,17 +1181,48 @@ export async function createDiscoveredConnections(
     allowStale = false,
   ): Promise<DiscoveredCatalog> {
     signal?.throwIfAborted();
-    const key = `${row.id}:${path.id}:${row.account_id}`;
+    const key = JSON.stringify([row.id, row.account_id, path]);
     const cached = catalogs.get(key);
     if (cached && Date.now() - cached.at < catalogMs)
       return allowStale && cached.ready ? cached.ready : cached.value;
     const value = (async () => {
+      await assertBinding(row);
+      signal?.throwIfAborted();
       const token = await tokenFor(row, path, signal);
-      const { tools, instructions } = await via(path).transport.listTools(
-        path.endpoint,
-        headers(path, token),
-        signal,
-      );
+      await assertBinding(row);
+      signal?.throwIfAborted();
+      const { tools, instructions } = await via(path)
+        .transport.listTools(path.endpoint, headers(path, token), signal)
+        .catch((cause: unknown) => {
+          signal?.throwIfAborted();
+          const fields =
+            cause && typeof cause === 'object' ? (cause as Record<string, unknown>) : {};
+          const status = [fields.status, fields.statusCode].find(
+            (value) =>
+              typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599,
+          );
+          const code =
+            (typeof fields.code === 'number' && Number.isFinite(fields.code)) ||
+            typeof fields.code === 'string'
+              ? String(redact(String(fields.code), token)).slice(0, 100)
+              : undefined;
+          const detail = [
+            status === undefined ? undefined : `status ${status}`,
+            code === undefined ? undefined : `code ${code}`,
+          ]
+            .filter(Boolean)
+            .join('; ');
+          throw Object.assign(
+            error(
+              `The connected MCP tool list failed${detail ? ` (${detail})` : ''}: ${String(redact(cause instanceof Error ? cause.message : String(cause), token)).slice(0, 4000)}`,
+              502,
+            ),
+            { notRun: true, ...(status === undefined ? {} : { upstreamStatus: status }) },
+          );
+        });
+      signal?.throwIfAborted();
+      await assertBinding(row);
+      signal?.throwIfAborted();
       return {
         tools: tools.map((tool) => redact(tool, token) as DiscoveredTool),
         ...(instructions
@@ -1180,12 +1238,12 @@ export async function createDiscoveredConnections(
       },
       () => {
         if (catalogs.get(key) !== entry) return;
-        if (cached) catalogs.set(key, { ...cached, at: Date.now() });
+        if (cached) catalogs.set(key, cached);
         else catalogs.delete(key);
       },
     );
     if (allowStale && entry.ready) return entry.ready;
-    return cached ? value.catch(() => cached.value) : value;
+    return cached && allowStale ? value.catch(() => cached.value) : value;
   }
   async function tokenFor(
     row: AccountRow,
@@ -1193,50 +1251,69 @@ export async function createDiscoveredConnections(
     signal?: AbortSignal,
   ): Promise<string> {
     signal?.throwIfAborted();
-    const grant = await options.grantVault.read(row.id);
+    const readGrant = () =>
+      transaction(
+        async (client) => {
+          await assertBinding(row, undefined, client);
+          return options.grantVault.read(row.id, client);
+        },
+        pool,
+        signal,
+      );
+    const grant = await readGrant();
     signal?.throwIfAborted();
     const secret = grant.value;
     if (path.auth !== 'oauth') return secret;
     const saved = JSON.parse(secret) as DiscoveredOAuthState;
     if (!saved.tokens?.access_token) {
-      await signInRequired(row.id, true);
+      await signInRequired(row, true);
       throw Object.assign(error('Connect this account again.', 409), { reason: 'authentication' });
     }
     if (!saved.expiresAt || saved.expiresAt > Date.now() + 60_000) return saved.tokens.access_token;
-    let current = refreshes.get(row.id);
+    const refreshKey = JSON.stringify([row.id, row.account_id, row.paths]);
+    let current = refreshes.get(refreshKey);
     if (!current || current.controller.signal.aborted) {
       const controller = new AbortController();
       const pending = (async () => {
+        await assertBinding(row);
+        controller.signal.throwIfAborted();
         const next = await via(path)
           .oauth.refresh(path.endpoint, saved, controller.signal)
           .catch(async (cause: unknown) => {
-            if (cause instanceof DiscoveredSignInRequired) await signInRequired(row.id, true);
+            if (cause instanceof DiscoveredSignInRequired) await signInRequired(row, true);
             throw cause;
           });
         if (!next.tokens?.access_token) throw new Error();
-        const changed = await options.grantVault.replace(
-          row.id,
-          grant.version,
-          JSON.stringify(next),
+        const token = await transaction(
+          async (client) => {
+            await assertBinding(row, undefined, client);
+            const changed = await options.grantVault.replace(
+              row.id,
+              grant.version,
+              JSON.stringify(next),
+              client,
+            );
+            if (changed) return next.tokens!.access_token!;
+            const latest = JSON.parse(
+              (await options.grantVault.read(row.id, client)).value,
+            ) as DiscoveredOAuthState;
+            if (!latest.tokens?.access_token || (latest.expiresAt ?? 0) <= Date.now())
+              throw new Error();
+            return latest.tokens.access_token;
+          },
+          pool,
+          controller.signal,
         );
-        let token = next.tokens.access_token;
-        if (!changed) {
-          const latest = JSON.parse(
-            (await options.grantVault.read(row.id)).value,
-          ) as DiscoveredOAuthState;
-          if (!latest.tokens?.access_token || (latest.expiresAt ?? 0) <= Date.now())
-            throw new Error();
-          token = latest.tokens.access_token;
-        }
-        await signInRequired(row.id, false);
+        await assertBinding(row);
+        await signInRequired(row, false);
         return token;
       })();
       const created = { promise: pending, controller, waiters: 0, settled: false };
-      refreshes.set(row.id, created);
+      refreshes.set(refreshKey, created);
       void pending
         .finally(() => {
           created.settled = true;
-          if (refreshes.get(row.id) === created) refreshes.delete(row.id);
+          if (refreshes.get(refreshKey) === created) refreshes.delete(refreshKey);
         })
         .catch(() => {});
       current = created;
@@ -1260,12 +1337,14 @@ export async function createDiscoveredConnections(
         (cause: unknown) =>
           finish(() =>
             reject(
-              Object.assign(error('Connect this account again.', 409), {
-                reason:
-                  cause instanceof DiscoveredSignInRequired
-                    ? 'authentication'
-                    : serviceFailureReason(cause),
-              }),
+              cause instanceof DiscoveredConnectionError && 'notRun' in cause
+                ? cause
+                : Object.assign(error('Connect this account again.', 409), {
+                    reason:
+                      cause instanceof DiscoveredSignInRequired
+                        ? 'authentication'
+                        : serviceFailureReason(cause),
+                  }),
             ),
           ),
       );
@@ -1356,7 +1435,7 @@ export async function createDiscoveredConnections(
       returnTo,
       localOrigin,
     );
-    return { name, url: `/apps?connect=${id}` };
+    return { name: row.display_name ?? name, url: `/apps?connect=${id}` };
   }
   async function search(query: string, connectionId?: string, signal?: AbortSignal) {
     signal?.throwIfAborted();
@@ -1398,7 +1477,8 @@ export async function createDiscoveredConnections(
               };
             try {
               const { tools: available, instructions } = await catalog(row, path, signal);
-              const accountMatch = score(row.service) || score(row.name);
+              const accountMatch =
+                score(row.service) || score(row.name) || score(row.display_name ?? '');
               const matching = available
                 .map((tool) => ({ tool, score: score(`${tool.name} ${tool.description ?? ''}`) }))
                 .filter((entry) => entry.score)
@@ -1433,6 +1513,7 @@ export async function createDiscoveredConnections(
         return {
           connectionId: row.id,
           service: row.service,
+          ...(row.display_name ? { name: row.display_name } : {}),
           accountName: row.account_name,
           ...(app ? { description: app.description, documentation: app.contract.source } : {}),
           paths,
@@ -1458,7 +1539,7 @@ export async function createDiscoveredConnections(
                     connectionId: row.id,
                     pathId: path.id,
                     service: row.service,
-                    name: row.name,
+                    name: row.display_name ?? row.name,
                     accountName: row.account_name,
                     ...(instructions ? { instructions } : {}),
                     tools,
@@ -1518,6 +1599,54 @@ export async function createDiscoveredConnections(
     ).rows[0];
     return row ? JSON.stringify([row.account_id, row.paths]) : undefined;
   }
+  async function assertBinding(
+    row: AccountRow,
+    expectedBinding = JSON.stringify([row.account_id, row.paths]),
+    client?: PoolClient,
+  ) {
+    const current = await binding(row.id, client);
+    if (current !== JSON.stringify([row.account_id, row.paths]) || current !== expectedBinding)
+      throw Object.assign(error('This connected account changed.', 409), { notRun: true });
+  }
+  async function approvalDetails(
+    action: 'CONNECTED_HTTP' | 'CONNECTED_MCP_CALL',
+    args: Record<string, unknown>,
+    signal?: AbortSignal,
+  ) {
+    args = structuredClone(args);
+    signal?.throwIfAborted();
+    const { row, call } = await selected(action, args);
+    const verifiedBinding = JSON.stringify([row.account_id, row.paths]);
+    await assertBinding(row);
+    signal?.throwIfAborted();
+    const account = { name: row.display_name ?? row.name, identity: row.account_name };
+    if (call.kind === 'http')
+      return {
+        account,
+        request: {
+          method: call.method,
+          url: call.url,
+          ...(call.method !== 'GET' && args.body !== undefined ? { body: args.body } : {}),
+        },
+        verifiedBinding,
+      };
+    if (call.kind !== 'mcp') throw error('Choose an MCP access path.');
+    const { tools } = await catalog(row, call.path, signal);
+    await assertBinding(row);
+    signal?.throwIfAborted();
+    const matches = tools.filter((tool) => tool.name === call.tool);
+    if (matches.length !== 1)
+      throw error('The selected MCP tool is unavailable in this connection’s tool list.', 409);
+    return {
+      account: {
+        ...account,
+        method: call.path.kind,
+        endpoint: call.path.endpoint,
+      },
+      tool: matches[0]!,
+      verifiedBinding,
+    };
+  }
   async function execute(
     action: string,
     args: Record<string, unknown>,
@@ -1525,7 +1654,11 @@ export async function createDiscoveredConnections(
     signal?: AbortSignal,
     expectedBinding?: string,
   ) {
-    const { row, call } = await selected(action, args);
+    const { row, call } = await selected(action, args).catch((cause: unknown) => {
+      throw Object.assign(cause instanceof Error ? cause : new Error(String(cause)), {
+        notRun: true,
+      });
+    });
     const { path } = call;
     let token: string | undefined;
     const secrets: string[] = [];
@@ -1544,13 +1677,9 @@ export async function createDiscoveredConnections(
         connection(path),
         async () => {
           signal?.throwIfAborted();
+          await assertBinding(row, expectedBinding);
           token = await tokenFor(row, path, signal);
-          const currentBinding = await binding(row.id);
-          if (
-            currentBinding !== JSON.stringify([row.account_id, row.paths]) ||
-            (expectedBinding !== undefined && currentBinding !== expectedBinding)
-          )
-            throw error('This connected account changed.', 409);
+          await assertBinding(row, expectedBinding);
           signal?.throwIfAborted();
           secrets.push(token);
           const environment =
@@ -1620,6 +1749,25 @@ export async function createDiscoveredConnections(
     return rows.rows.flatMap((row) => row.paths.map(connection));
   }
   function registerRoutes(app: FastifyInstance) {
+    app.patch<{ Params: { service: string } }>('/api/apps/mcp/:service', async (request) => {
+      const { service } = request.params;
+      if (!manualMcpService.test(service) || apps.has(service))
+        throw error('This custom MCP server is unavailable.', 404);
+      const input = z.object({ name: proposalSchema.shape.name }).strict().safeParse(request.body);
+      if (!input.success) throw error('To rename this server, enter a name of 1 to 80 characters.');
+
+      await transaction(async (client) => {
+        await lockDisplayName(client, service);
+        const result = await client.query(
+          `UPDATE discovered_connections SET display_name=$3
+           WHERE owner_id=$1 AND service=$2 AND paths @> '[{"kind":"mcp"}]'::jsonb`,
+          [owner, service, input.data.name],
+        );
+        if (!result.rowCount) throw error('This custom MCP server is unavailable.', 404);
+      }, pool);
+      options.refresh?.();
+      return { name: input.data.name };
+    });
     app.post('/api/apps/mcp', async (request, reply) => {
       const parsed = z
         .object({
@@ -1708,19 +1856,21 @@ export async function createDiscoveredConnections(
           : undefined;
       const address = apps.get(row.service)?.instancePath && !row.paths.length;
       const localAddress = address ? await nearby(row.service) : undefined;
+      const catalogApp = Boolean(
+        apps.get(row.service) &&
+        (address ||
+          row.paths.every((path) => {
+            const app = apps.get(row.service)!;
+            if (app.instancePath) return path.kind === 'mcp';
+            const { id: _id, local: _local, ...saved } = path;
+            return isDeepStrictEqual(saved, appAccessPath(app));
+          })),
+      );
       return reply.header('Cache-Control', 'no-store').send({
         service: row.service,
-        name: row.name,
-        catalogApp: Boolean(
-          apps.get(row.service) &&
-          (address ||
-            row.paths.every((path) => {
-              const app = apps.get(row.service)!;
-              if (app.instancePath) return path.kind === 'mcp';
-              const { id: _id, local: _local, ...saved } = path;
-              return isDeepStrictEqual(saved, appAccessPath(app));
-            })),
-        ),
+        name: row.display_name ?? row.name,
+        catalogApp,
+        hints: catalogApp ? apps.get(row.service)?.hints : undefined,
         credentialLabels:
           apps.get(row.service)?.kind === 'cli'
             ? (apps.get(row.service) as Extract<BundledApp, { kind: 'cli' }>).environment
@@ -1788,6 +1938,7 @@ export async function createDiscoveredConnections(
   return {
     apps,
     binding,
+    approvalDetails,
     analyticsConnections,
     list,
     setupServices,

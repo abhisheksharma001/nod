@@ -17,6 +17,7 @@ import {
   screen,
   session,
   shell,
+  systemPreferences,
   Tray,
   utilityProcess,
 } from 'electron';
@@ -42,6 +43,8 @@ import {
   watchAssistantMessages,
 } from './notifications.mjs';
 import { createAppPreferencesStore } from './app-preferences.mjs';
+import { createComputerHelper } from './computer-helper.mjs';
+import { createComputerOverlay } from './computer-overlay.mjs';
 import { createChatReadCursorStore } from './chat-read-cursors.mjs';
 import { registerArtifactFileHandlers } from './artifact-file-handlers.mjs';
 import { saveArtifactDownload } from './downloads.mjs';
@@ -57,6 +60,7 @@ import { clearInstalledWindowsUpdates, startWindowsInstall } from './windows-upd
 import { appOpenPath } from './app-links.mjs';
 import { trustSystemCertificates } from './system-certificates.mjs';
 import { opensAtLogin, setOpenAtLogin } from './login-item.mjs';
+import { createStartupFeedbackClient } from './feedback-client.mjs';
 
 trustSystemCertificates();
 
@@ -118,6 +122,46 @@ app.setPath(
   developmentDataRoot || join(app.getPath('appData'), testInstall ? 'nod Setup Test' : 'nod'),
 );
 const profileRoot = join(app.getPath('userData'), 'profiles', 'local');
+const agentDesktop = app.isPackaged
+  ? process.platform === 'darwin'
+    ? join(process.resourcesPath, '..', 'Helpers')
+    : join(process.resourcesPath, 'agent-desktop')
+  : join(desktopRoot, 'node_modules', 'agent-desktop', 'bin');
+const executable = process.platform === 'win32' ? '.exe' : '';
+const computerOverlay = createComputerOverlay({
+  onStop: () => {
+    void computerHelper.cancel();
+    void engineRequest('/api/thread/stop', { method: 'POST' }).catch(() => {});
+  },
+  focusSelf: () => showEngine(),
+});
+const computerHelper = createComputerHelper({
+  presence: computerOverlay,
+  binary: join(
+    agentDesktop,
+    app.isPackaged
+      ? `agent-desktop${executable}`
+      : `agent-desktop-${process.platform}-${process.arch}${executable}`,
+  ),
+  helper:
+    process.platform === 'darwin'
+      ? join(
+          agentDesktop,
+          app.isPackaged
+            ? 'agent-desktop-macos-helper'
+            : `agent-desktop-macos-helper-darwin-${process.arch}`,
+        )
+      : undefined,
+  home: join(profileRoot, 'computer-use'),
+  sandboxed: process.platform === 'linux' && Boolean(process.env.FLATPAK_ID),
+  requestPermission: async (which) => {
+    if (which === 'accessibility') systemPreferences.isTrustedAccessibilityClient(true);
+    else
+      await shell.openExternal(
+        'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture',
+      );
+  },
+});
 const freshLocalProfile = await stat(profileRoot).then(
   () => false,
   (error) => error.code === 'ENOENT',
@@ -156,6 +200,7 @@ let engineFocusRequested = false;
 let resumeWindow;
 let resumePort;
 let pendingFeedback = false;
+let startupFeedbackOpen = false;
 let engine;
 let engineFailure;
 let welcomePassed = false;
@@ -171,10 +216,12 @@ let guidedStartup = false;
 let quitting = false;
 let installingUpdate = false;
 let macInstallerBusy = false;
+let macInstallerWait;
 let updateSource;
 let updates;
 let checkingUpdates;
 let updateRequestedManually = false;
+let updateRestartRequested = false;
 let updateRestartConfirmed = false;
 let updatePhase = 'idle';
 let updateStep = 'checking';
@@ -215,7 +262,33 @@ let status = {
     needsRuntimeArchive: false,
   },
 };
-const knownSecrets = new Set();
+const { environmentSecrets } = await import(
+  pathToFileURL(join(engineRoot, 'src/shared/environment-secrets.mjs')).href
+);
+const { createLiteralMasker } = await import(
+  pathToFileURL(join(engineRoot, 'src/shared/literal-masks.mjs')).href
+);
+const { startupStatusFacts, startupEventFacts, startupErrorFacts } = await import(
+  pathToFileURL(join(engineRoot, 'src/shared/startup-feedback-facts.mjs')).href
+);
+const knownSecrets = new Set(environmentSecrets(process.env));
+const startupFeedback = createStartupFeedbackClient({
+  fork: (...args) => utilityProcess.fork(...args),
+  file: join(engineRoot, 'desktop', 'main', 'feedback.mjs'),
+  environment: Object.fromEntries(
+    Object.entries(baseEnvironment()).filter(
+      ([key]) => !key.startsWith('NOD_') || key.startsWith('NOD_FEEDBACK_'),
+    ),
+  ),
+  input: async () => {
+    return {
+      dataRoot: profileRoot,
+      context: await feedbackContext(),
+      status: startupStatusFacts(status),
+      startupLog: startupLogSnapshot(),
+    };
+  },
+});
 const engineWindows = new Set();
 const overlayWindows = new WeakSet();
 const zoomStates = new WeakMap();
@@ -235,7 +308,7 @@ let chatReadCursors = createChatReadCursorStore(join(profileRoot, 'chat-read-cur
 const lifecycle = createDesktopLifecycle({
   prepareRuntime: async ({ signal, onStatus, onStorageReady }) => {
     await mkdir(profileRoot, { recursive: true, mode: 0o700 });
-    await writeDiagnostic('Preparing local runtime.').catch(() => {});
+    await writeDiagnostic('Preparing local runtime.', { event: 'runtime_prepare' }).catch(() => {});
     const started = Date.now();
     let phase = 'runtime';
     let step;
@@ -261,11 +334,13 @@ const lifecycle = createDesktopLifecycle({
       });
       await writeDiagnostic(
         `Local runtime prepared. ${diagnosticFields({ ms: Date.now() - started })}`,
+        { event: 'runtime_ready', durationMs: Date.now() - started },
       ).catch(() => {});
       return prepared;
     } catch (error) {
       await writeDiagnostic(
         `Local runtime failed. ${diagnosticFields({ phase, step, code: error.code, signal: error.signal, ms: Date.now() - started })}`,
+        { event: 'runtime_failed', stage: phase, error, durationMs: Date.now() - started },
       ).catch(() => {});
       throw error;
     }
@@ -364,8 +439,17 @@ function updateReadinessNotice() {
 
 function bounded(value, limit = 2000) {
   let message = String(value || 'The operation could not be completed.');
-  for (const secret of knownSecrets)
-    if (secret.length > 7) message = message.replaceAll(secret, '[redacted]');
+  const mask = createLiteralMasker([
+    [profileRoot, '<profile>'],
+    [profileRoot.replaceAll('\\', '/'), '<profile>'],
+    [engineRoot, '<engine>'],
+    [engineRoot.replaceAll('\\', '/'), '<engine>'],
+    ...[...knownSecrets].filter(Boolean).map((secret) => [secret, '[redacted]']),
+    ['[redacted]', '[redacted]'],
+    ['<profile>', '<profile>'],
+    ['<engine>', '<engine>'],
+  ]);
+  message = mask(message);
   return message.replace(/\bsk-[A-Za-z0-9_-]+/g, '[redacted]').slice(0, limit);
 }
 
@@ -376,6 +460,7 @@ function update(value) {
     message: bounded(value.message || status.message),
   };
   if (value.phase === 'ready' || value.phase === 'error') status.unlockingKeys = false;
+  if (value.phase && value.phase !== 'error') delete status.failure;
   if (value.error) status.error = bounded(value.error);
   else if (Object.hasOwn(value, 'error') || (value.phase && value.phase !== 'error'))
     delete status.error;
@@ -648,7 +733,30 @@ function showNotificationConfirmation() {
 }
 
 let diagnosticWrites = Promise.resolve();
-function writeDiagnostic(value) {
+const startupEvents = [];
+let startupEventBytes = 0;
+let startupEventsTruncated = false;
+
+function startupLogSnapshot() {
+  const now = Date.now();
+  return {
+    entries: startupEvents.map(({ at, facts }) => ({
+      ageMs: Math.min(31_536_000_000, Math.max(0, Math.round(now - at))),
+      ...facts,
+    })),
+    truncated: startupEventsTruncated,
+  };
+}
+
+function writeDiagnostic(value, details) {
+  const facts = startupEventFacts(undefined, details);
+  const bytes = Buffer.byteLength(JSON.stringify(facts));
+  startupEvents.push({ at: Date.now(), facts });
+  startupEventBytes += bytes;
+  while (startupEvents.length > 100 || startupEventBytes > 48_000) {
+    startupEventBytes -= Buffer.byteLength(JSON.stringify(startupEvents.shift().facts));
+    startupEventsTruncated = true;
+  }
   const written = diagnosticWrites.then(async () => {
     const directory = join(profileRoot, 'logs');
     const path = join(directory, 'startup.log');
@@ -659,8 +767,6 @@ function writeDiagnostic(value) {
     }
     const home = homedir() || '<home>';
     const line = bounded(value, 256 * 1024)
-      .replaceAll(engineRoot, '<engine>')
-      .replaceAll(profileRoot, '<profile>')
       .replaceAll(home, '<home>')
       .replaceAll(home.replaceAll('\\', '/'), '<home>')
       .replace(/https?:\/\/\S+/g, '<url>')
@@ -682,7 +788,9 @@ function diagnosticFields(details) {
 }
 
 function updateEvent(stage, details = {}) {
-  return writeDiagnostic(`update ${stage} ${diagnosticFields(details)}`.trimEnd()).catch(() => {});
+  return writeDiagnostic(`update ${stage} ${diagnosticFields(details)}`.trimEnd(), {
+    event: 'update',
+  }).catch(() => {});
 }
 
 async function recordStart() {
@@ -834,6 +942,14 @@ async function openExternal(value) {
 
 function protectWindow(window, origin) {
   if (origin) trackZoomFactor(window);
+  if (origin)
+    for (const [name, fullScreen] of [
+      ['enter-full-screen', true],
+      ['leave-full-screen', false],
+    ])
+      window.on(name, () => {
+        if (!window.isDestroyed()) window.webContents.send('nod:fullscreen', fullScreen);
+      });
   window.on('focus', updateReadinessNotice);
   for (const event of ['blur', 'hide', 'closed'])
     window.on(event, () => setTimeout(updateReadinessNotice, 100));
@@ -996,6 +1112,7 @@ function showSettings(section = 'general', loading = false) {
       setupWindow = undefined;
       connectionSettingsOpen = false;
       onboardingSetupOpen = false;
+      startupFeedbackOpen = false;
     }
   });
   setupWindowLoaded = Promise.all([
@@ -1018,6 +1135,13 @@ function showSettings(section = 'general', loading = false) {
 
 function showEngine({ focus = true } = {}) {
   if (quitting) return;
+  if (startupFeedbackOpen && setupWindow && !setupWindow.isDestroyed()) {
+    if (focus) {
+      setupWindow.show();
+      setupWindow.focus();
+    }
+    return;
+  }
   if (
     (connectionSettingsOpen || onboardingSetupOpen) &&
     setupWindow &&
@@ -1154,6 +1278,19 @@ function showEngine({ focus = true } = {}) {
 
 function showFeedback() {
   if (quitting) return;
+  if (
+    !enginePreferencesReady ||
+    status.phase === 'error' ||
+    status.windowError ||
+    status.runtime?.phase === 'error'
+  ) {
+    startupFeedbackOpen = true;
+    void showSettings('general', true).then(() => {
+      if (startupFeedbackOpen && setupWindow && !setupWindow.isDestroyed())
+        setupWindow.webContents.send('nod:startup-feedback:open');
+    });
+    return;
+  }
   pendingFeedback = true;
   showEngine();
 }
@@ -1302,6 +1439,15 @@ function openOnePassword(owner) {
   helper.postMessage({ type: 'nod-1password-port' }, [port2]);
   owner.postMessage({ type: 'nod-1password-port' }, [port1]);
   owner.once('exit', () => helper.kill());
+}
+
+async function answerComputer(child, { id, request }) {
+  if (typeof id !== 'string' || !request || typeof request !== 'object') return;
+  const answer = await computerHelper.request(request).then(
+    (result) => ({ result }),
+    (error) => ({ error: error.message }),
+  );
+  if (engine === child) child.postMessage({ type: 'nod-computer-result', id, ...answer });
 }
 
 async function moveToTrash(child, { id, path }) {
@@ -1765,6 +1911,7 @@ function stayAwake(working) {
 }
 
 async function stopEngine() {
+  void computerHelper.cancel().catch(() => {});
   stayAwake(false);
   enginePreferencesReady = false;
   engineRuntimeReady = false;
@@ -2109,10 +2256,36 @@ function publishUpdateStatus() {
     if (!window.isDestroyed()) window.webContents.send('nod:updates:status', value);
 }
 
+function waitForMacInstaller() {
+  if (!macInstallerBusy || quitting) return Promise.resolve();
+  if (macInstallerWait) return macInstallerWait;
+  let waiting;
+  waiting = (async () => {
+    while (!quitting && macInstallerBusy) {
+      const running = await macInstallerRunning('dev.nod.desktop.ShipIt').catch(() => true);
+      if (!running) {
+        macInstallerBusy = false;
+        break;
+      }
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, 5_000);
+        timer.unref?.();
+      });
+    }
+  })().finally(() => {
+    if (macInstallerWait === waiting) macInstallerWait = undefined;
+    refreshUpdateMenu();
+  });
+  macInstallerWait = waiting;
+  refreshUpdateMenu();
+  return waiting;
+}
+
 function refreshUpdateMenu() {
   if (quitting) return;
-  const label =
-    updatePhase === 'downloading' && updateProgress !== undefined
+  const label = macInstallerBusy
+    ? 'Waiting for update installer…'
+    : updatePhase === 'downloading' && updateProgress !== undefined
       ? `Downloading update… ${updateProgress}%`
       : {
           checking: 'Checking for updates…',
@@ -2122,7 +2295,7 @@ function refreshUpdateMenu() {
   const item = Menu.getApplicationMenu?.()?.getMenuItemById('desktop-update');
   if (item) {
     item.label = label;
-    item.enabled = Boolean(updates) && !checkingUpdates;
+    item.enabled = Boolean(updates) && !checkingUpdates && !macInstallerBusy;
   }
   const restartLabel = updates?.ready
     ? `Restart to update to ${updates.ready.version}…`
@@ -2131,7 +2304,7 @@ function refreshUpdateMenu() {
   if (restartItem) {
     restartItem.label = restartLabel;
     restartItem.visible = Boolean(updates?.ready);
-    restartItem.enabled = Boolean(updates?.ready) && !checkingUpdates;
+    restartItem.enabled = Boolean(updates?.ready) && !checkingUpdates && !macInstallerBusy;
   }
   if (tray)
     tray.setContextMenu(
@@ -2141,13 +2314,13 @@ function refreshUpdateMenu() {
         { label: 'Report bug…', click: showFeedback },
         {
           label,
-          enabled: Boolean(updates) && !checkingUpdates,
+          enabled: Boolean(updates) && !checkingUpdates && !macInstallerBusy,
           click: () => void checkForUpdates(),
         },
         {
           label: restartLabel,
           visible: Boolean(updates?.ready),
-          enabled: Boolean(updates?.ready) && !checkingUpdates,
+          enabled: Boolean(updates?.ready) && !checkingUpdates && !macInstallerBusy,
           click: () => void checkForUpdates(true, true),
         },
         ...(process.platform === 'win32'
@@ -2164,8 +2337,32 @@ async function checkForUpdates(manual = true, restartReady = false, confirmed = 
   if (!updates || quitting) return;
   if (checkingUpdates) {
     if (manual) updateRequestedManually = true;
+    if (restartReady) updateRestartRequested = true;
     if (confirmed) updateRestartConfirmed = true;
     return checkingUpdates;
+  }
+  if (macInstallerBusy) {
+    updateRequestedManually = manual;
+    updateRestartRequested = restartReady;
+    updateRestartConfirmed = confirmed;
+    let waiting;
+    waiting = waitForMacInstaller()
+      .then(() => {
+        if (quitting) return;
+        if (checkingUpdates === waiting) checkingUpdates = undefined;
+        return checkForUpdates(
+          updateRequestedManually,
+          updateRestartRequested && Boolean(updates.ready),
+          updateRestartConfirmed,
+        );
+      })
+      .finally(() => {
+        if (checkingUpdates === waiting) checkingUpdates = undefined;
+        refreshUpdateMenu();
+      });
+    checkingUpdates = waiting;
+    refreshUpdateMenu();
+    return waiting;
   }
   updateRequestedManually = manual;
   updateRestartConfirmed = confirmed;
@@ -2305,6 +2502,8 @@ async function preloadUpdateImages(assets, signal) {
 }
 
 async function restartForUpdate() {
+  if (quitting) return;
+  if (macInstallerBusy) await waitForMacInstaller();
   if (quitting) return;
   void updateEvent('restart-requested', { version: updates?.ready?.version });
   if (!(await confirmRestart())) return updateEvent('restart-deferred');
@@ -2463,6 +2662,7 @@ async function quitApp() {
 
 async function quit(complete, failure = 'Nod could not finish shutting down.', update = false) {
   quitting = true;
+  startupFeedback.close();
   stayAwake(false);
   await persistCurrentZoomFactor().catch(
     (error) => void writeDiagnostic(error.message).catch(() => {}),
@@ -2550,6 +2750,9 @@ async function validateStart() {
 }
 
 async function startEngine({ runtime, signal, pending = false }) {
+  void writeDiagnostic('Starting the background service.', { event: 'engine_start' }).catch(
+    () => {},
+  );
   if (engineFailure) throw new Error(engineFailure);
   if (engine && enginePreferencesReady) return finishEnginePreparation(pending);
   if (engine) {
@@ -2583,7 +2786,6 @@ async function startEngine({ runtime, signal, pending = false }) {
   const owner = await profileOwner();
   if (providerEnvironment.NOD_VAULT_KEY) knownSecrets.add(providerEnvironment.NOD_VAULT_KEY);
   if (runtime.env.DATABASE_URL) knownSecrets.add(runtime.env.DATABASE_URL);
-  if (process.env.NOD_FEEDBACK_TOKEN) knownSecrets.add(process.env.NOD_FEEDBACK_TOKEN);
   const { nodBuild } = JSON.parse(await readFile(join(desktopRoot, 'package.json'), 'utf8'));
   const tracesToken =
     typeof nodBuild?.tracesToken === 'string' ? nodBuild.tracesToken : process.env.NOD_TRACES_TOKEN;
@@ -2636,6 +2838,7 @@ async function startEngine({ runtime, signal, pending = false }) {
     }
     if (engine === child && message?.type === 'nod-1password-open') openOnePassword(child);
     if (engine === child && message?.type === 'nod-trash') void moveToTrash(child, message);
+    if (engine === child && message?.type === 'nod-computer') void answerComputer(child, message);
     if (
       engine === child &&
       !closingEngine &&
@@ -2676,6 +2879,11 @@ async function startEngine({ runtime, signal, pending = false }) {
     if (!closingEngine)
       void writeDiagnostic(
         `Engine exited with code ${code}. ${diagnosticFields({ phase: enginePreferencesReady ? 'engine-running' : 'engine-spawn', ms: Date.now() - started })}`,
+        {
+          event: 'engine_exit',
+          exitCode: code,
+          durationMs: Date.now() - started,
+        },
       ).catch(() => {});
     engine = undefined;
     enginePreferencesReady = false;
@@ -2697,6 +2905,7 @@ async function startEngine({ runtime, signal, pending = false }) {
         phase: 'error',
         message: failure,
         error: failure,
+        failure: startupErrorFacts({ exitCode: code }),
       });
       showSettings('general', true);
     }
@@ -2704,9 +2913,11 @@ async function startEngine({ runtime, signal, pending = false }) {
   const deadline = started + 120_000;
   let ready = false;
   let lastFailure = 'none';
+  let lastHealthStatus;
   while (Date.now() < deadline && engine === child && !signal.aborted) {
     try {
       const response = await engineRequest('/api/health');
+      lastHealthStatus = response.status;
       if (response.ok && (await response.json()).ok === true) {
         ready = true;
         break;
@@ -2724,6 +2935,7 @@ async function startEngine({ runtime, signal, pending = false }) {
     const waited = ((Date.now() - started) / 1000).toFixed(1);
     await writeDiagnostic(
       `Background service health check timed out after ${waited}s. Engine process still running: yes. Last health check: ${lastFailure}. Engine reported its port: ${engineBound ? 'yes' : 'no'}.`,
+      { event: 'health_timeout', durationMs: Date.now() - started, httpStatus: lastHealthStatus },
     ).catch(() => {});
   }
   if (!ready || engine !== child || signal.aborted) {
@@ -2770,6 +2982,13 @@ async function prepare(options = {}) {
     .catch((error) => {
       void writeDiagnostic(
         `Startup failed. ${diagnosticFields({ phase: status.phase, stage: status.stage, code: error.code, ms: Date.now() - started })}\n${startupErrorDetails(error)}`,
+        {
+          event: 'startup_failed',
+          phase: status.phase,
+          stage: status.stage,
+          error,
+          durationMs: Date.now() - started,
+        },
       ).catch(() => {});
       const deferred =
         error.code === 'NOD_RESTART_DEFERRED' &&
@@ -2781,6 +3000,7 @@ async function prepare(options = {}) {
         phase: deferred ? 'ready' : 'error',
         message: bounded(error.message),
         error: bounded(error.message),
+        failure: startupErrorFacts(error),
         details: startupErrorDetails(error),
         needsRuntimeArchive: error.code === 'RUNTIME_ARCHIVE_REQUIRED',
         needsWsl: error.code === 'NOD_WSL_REQUIRED',
@@ -2845,6 +3065,7 @@ if (!app.requestSingleInstanceLock()) app.exit();
 else if (process.argv.includes('--quit')) app.exit();
 else if (await openedDuringUpdateRestart()) app.exit();
 else {
+  if (macInstallerBusy) void waitForMacInstaller();
   if (testInstall) process.on('SIGTERM', () => app.quit());
   app.on('second-instance', (_event, argv) => {
     if (argv.includes('--quit')) {
@@ -3017,13 +3238,14 @@ else {
               {
                 id: 'desktop-update',
                 label: 'Check for Updates…',
-                enabled: Boolean(updates),
+                enabled: Boolean(updates) && !macInstallerBusy,
                 click: () => void checkForUpdates(),
               },
               {
                 id: 'desktop-restart',
                 label: 'Restart to update…',
                 visible: false,
+                enabled: Boolean(updates?.ready) && !macInstallerBusy,
                 click: () => void checkForUpdates(true, true),
               },
               { label: 'Replay onboarding…', click: replayOnboarding },
@@ -3163,6 +3385,32 @@ else {
         if (!isEngine(event)) throw new Error('This action is unavailable.');
         return feedbackContext();
       });
+      ipcMain.handle('nod:startup-feedback:open', (event) => {
+        allowSetup(event);
+        showFeedback();
+      });
+      ipcMain.handle('nod:startup-feedback:close', (event) => {
+        allowSetup(event);
+        startupFeedbackOpen = false;
+        if (enginePreferencesReady && status.phase === 'ready') showEngine();
+      });
+      ipcMain.handle('nod:startup-feedback:action', (event, action, input) => {
+        allowSetup(event);
+        if (
+          !startupFeedbackOpen ||
+          !['context', 'review', 'send', 'status', 'repair', 'recover'].includes(action)
+        )
+          throw new Error('This report action is unavailable.');
+        return (async () => {
+          if (action === 'review') {
+            await startupFeedback.request('snapshot', {
+              status: startupStatusFacts(status),
+              startupLog: startupLogSnapshot(),
+            });
+          }
+          return startupFeedback.request(action, input);
+        })();
+      });
       ipcMain.handle('nod:feedback:capture', (event) => {
         if (!isEngine(event)) throw new Error('This action is unavailable.');
         return captureFeedbackScreenshot(event).catch(() => null);
@@ -3204,6 +3452,10 @@ else {
           appUIOpenings.set(distinctId, opening);
         }
         return opening;
+      });
+      ipcMain.handle('nod:fullscreen:get', (event) => {
+        if (!isEngine(event)) throw new Error('This action is unavailable.');
+        return BrowserWindow.fromWebContents(event.sender)?.isFullScreen() ?? false;
       });
       ipcMain.handle('nod:preferences:get', (event) => {
         if (!isSetup(event) && !isEngine(event)) throw new Error('This action is unavailable.');
@@ -3262,7 +3514,7 @@ else {
         if (!isSetup(event) && !isEngine(event)) throw new Error('This action is unavailable.');
         if (isEngine(event) && remoteConnection) throw new Error('Local setup is unavailable.');
         if (options?.retry === true && !enginePreferencesReady) welcomeTransferError = undefined;
-        if (options?.retry === true) pendingFeedback = options.report === true;
+        if (options?.retry === true) pendingFeedback = false;
         await transferWelcome();
         if (options?.retry === true && status.windowError) {
           showEngine();

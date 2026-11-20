@@ -28,7 +28,12 @@ import {
   safeMessageLink,
   setupLink,
 } from '../lib/message-links';
-import { rehypeLocalLinks, rehypeMessageBreaks, remarkLinkDestinations } from '../lib/markdown';
+import {
+  rehypeDropBlankMessage,
+  rehypeLocalLinks,
+  rehypeMessageBreaks,
+  remarkLinkDestinations,
+} from '../lib/markdown';
 import { nextReaction, reactionName } from '../lib/reactions';
 import { SetupActions } from './setup-link';
 import { TelegramChatLink, useTelegramChatUrl } from './telegram-chat-link';
@@ -216,6 +221,7 @@ export const MessageText = memo(function MessageText({
             rehypeMessageBreaks,
             rehypeLocalLinks,
             [rehypeSanitize, messageSchema],
+            rehypeDropBlankMessage,
           ]}
           components={{
             table: ({ node, ...props }) => (

@@ -1699,6 +1699,195 @@ test(
 );
 
 test(
+  'Telegram approval buttons are bound to the exact sent question and paired chat',
+  { skip: !process.env.TEST_DATABASE_URL, timeout: 15_000 },
+  async (t) => {
+    const { pool, threadId, receive, turnOf, reply, create, transport } = await outboxFixture(t);
+    const sent: Array<Parameters<MessagingTransport['post']>[0]> = [];
+    transport.post = async (input) => {
+      sent.push(input);
+      return { id: `provider-${sent.length}`, approvalButtons: input.approval };
+    };
+    const edits: string[] = [];
+    let finishProgress = () => {};
+    const progressRound = new Promise<void>((resolve) => {
+      finishProgress = resolve;
+    });
+    transport.channels[0]!.presenceMs = 1000;
+    transport.progress = async (input) => {
+      if (input.status) edits.push(input.messageId);
+    };
+    transport.presence = async () => finishProgress();
+    const acknowledgements: string[] = [];
+    let senderId = '111';
+    let chat = 'approval-chat';
+    let target = 'provider-1';
+    let approved = true;
+    transport.receive = async () => ({
+      status: 200,
+      body: {},
+      approvals: [
+        {
+          channelId: 'telegram',
+          accountId: 'bot',
+          senderId,
+          threadId: chat,
+          messageId: target,
+          approved,
+          acknowledge: async (status) => {
+            acknowledgements.push(status);
+          },
+        },
+      ],
+    });
+    const accepted: Array<{ messageId: string; approvalId: string; approved: boolean }> = [];
+    const acceptedChannels: string[] = [];
+    let work: LiveWork[] = [];
+    let beforeCommit = async () => {};
+    const channels = await create({
+      activity: async () => work,
+      messageAccepted: () => (provider) => acceptedChannels.push(provider),
+      acceptApproval: async (client, input) => {
+        const { messageId, approvalId, approved } = input;
+        accepted.push({ messageId, approvalId, approved });
+        await client.query("UPDATE approvals SET status='confirmed' WHERE id=$1", [approvalId]);
+        await beforeCommit();
+      },
+    });
+    const app = Fastify();
+    channels.registerRoutes(app);
+    try {
+      receive('111', 'approval-request', 'approval-chat');
+      await channels.drain();
+      const { turn_id: turnId, channel } = await turnOf('approval-request');
+      const messageId = randomUUID();
+      const ordinaryId = randomUUID();
+      const approvalId = randomUUID();
+      const question = 'Can I submit the synthetic form? Some details are hidden.';
+      await reply(turnId, question, messageId, 0);
+      await reply(turnId, 'The synthetic form is still open.', ordinaryId, 1);
+      await pool.query("UPDATE turns SET status='running' WHERE id=$1", [turnId]);
+      await pool.query(`CREATE TABLE approvals(
+        id uuid PRIMARY KEY, owner_id text NOT NULL, turn_id uuid NOT NULL, thread_id uuid NOT NULL,
+        confirmation_message_id uuid NOT NULL, status text NOT NULL, action text NOT NULL
+      )`);
+      await pool.query(
+        `INSERT INTO approvals(id,owner_id,turn_id,thread_id,confirmation_message_id,status,action)
+         VALUES($1,'local-development',$2,$3,$4,'pending','NOD_browser')`,
+        [approvalId, turnId, threadId, messageId],
+      );
+      await channels.drain();
+      const now = new Date().toISOString();
+      work = [messageId, ordinaryId].map((id) => ({
+        messageId: id,
+        turnId,
+        channel,
+        taskId: null,
+        title: null,
+        step: 'Checking the form',
+        site: null,
+        since: now,
+        quietSince: now,
+        doing: 'model',
+      }));
+      await channels.drain();
+      await progressRound;
+      assert.deepEqual(edits, ['provider-2']);
+      work = [];
+      const tap = async () => {
+        const response = await app.inject({ method: 'POST', url: '/api/webhooks/telegram' });
+        assert.equal(response.statusCode, 200);
+      };
+      await pool.query("UPDATE channel_outbox SET state='sending' WHERE message_id=$1", [
+        messageId,
+      ]);
+      await tap();
+      await pool.query("UPDATE channel_outbox SET state='sent' WHERE message_id=$1", [messageId]);
+      await pool.query(
+        `INSERT INTO channel_inbox(source_id,provider,account_id,sender_id,thread_id,text,received_at,owner_id)
+         VALUES('synthetic-stop','telegram','bot','111','approval-chat','/stop',now(),'local-development')`,
+      );
+      await tap();
+      assert.deepEqual(accepted, []);
+      await pool.query(
+        "UPDATE channel_inbox SET state='submitted' WHERE source_id='synthetic-stop'",
+      );
+      senderId = '222';
+      await tap();
+      senderId = '111';
+      chat = 'another-chat';
+      await tap();
+      chat = 'approval-chat';
+      target = 'provider-2';
+      await pool.query(
+        `INSERT INTO approvals(id,owner_id,turn_id,thread_id,confirmation_message_id,status,action)
+         VALUES($1,'local-development',$2,$3,$4,'pending','NOD_browser')`,
+        [randomUUID(), turnId, threadId, ordinaryId],
+      );
+      await tap();
+      assert.deepEqual(accepted, []);
+      target = 'provider-1';
+      await tap();
+      approved = false;
+      await tap();
+      assert.deepEqual(accepted, [{ messageId, approvalId, approved: true }]);
+      assert.deepEqual(acknowledgements, [
+        'retry',
+        'retry',
+        'unavailable',
+        'unavailable',
+        'unavailable',
+        'recorded',
+        'unavailable',
+      ]);
+      assert.equal(sent[0]?.text, question);
+      assert.equal(sent[0]?.approval, true);
+      assert.equal(sent[1]?.approval, undefined);
+
+      const nextMessage = randomUUID();
+      const nextApproval = randomUUID();
+      await reply(turnId, question, nextMessage, 2);
+      await pool.query(
+        `INSERT INTO approvals(id,owner_id,turn_id,thread_id,confirmation_message_id,status,action)
+         VALUES($1,'local-development',$2,$3,$4,'pending','NOD_browser')`,
+        [nextApproval, turnId, threadId, nextMessage],
+      );
+      await channels.drain();
+      let enterRecord = () => {};
+      let finishRecord = () => {};
+      const started = new Promise<void>((resolve) => {
+        enterRecord = resolve;
+      });
+      const release = new Promise<void>((resolve) => {
+        finishRecord = resolve;
+      });
+      beforeCommit = () => {
+        enterRecord();
+        return release;
+      };
+      target = 'provider-3';
+      const inFlight = tap();
+      try {
+        await started;
+        await channels.replaceTransport({ ...transport });
+      } finally {
+        finishRecord();
+      }
+      await inFlight;
+      assert.equal(
+        (await pool.query('SELECT status FROM approvals WHERE id=$1', [nextApproval])).rows[0]
+          ?.status,
+        'pending',
+      );
+      assert.equal(acknowledgements.at(-1), 'unavailable');
+      assert.deepEqual(acceptedChannels, ['telegram']);
+    } finally {
+      await app.close();
+    }
+  },
+);
+
+test(
   'retired schedule confirmations do not reach connected channels',
   { skip: !process.env.TEST_DATABASE_URL },
   async (t) => {

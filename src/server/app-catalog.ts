@@ -25,6 +25,7 @@ type AppMetadata = {
   categories: string[];
   endpoint?: string;
   instancePath?: string;
+  hints?: Record<string, string>;
   scope?: string;
   icon?: { bytes: Uint8Array; mimeType: string };
   skills?: string;
@@ -167,6 +168,12 @@ export function loadAppCatalog(directory = fileURLToPath(new URL('../apps/', imp
       );
     const connection = app.connection;
     const fixture = contract.data;
+    const hints = 'hints' in connection ? connection.hints : undefined;
+    const unknownHint =
+      connection.type === 'cli' &&
+      Object.keys(hints ?? {}).find((name) => !(name in connection.environment));
+    if (unknownHint)
+      throw new Error(`App ${entry.name}: hint ${unknownHint} names no environment field.`);
     if (fixture.type !== connection.type)
       throw new Error(`App ${entry.name}: the read fixture must use the app connection type.`);
     const setup = (() => {
@@ -300,6 +307,7 @@ export function loadAppCatalog(directory = fileURLToPath(new URL('../apps/', imp
       name: app.displayName,
       description: manifest.description.trim(),
       categories: app.categories,
+      ...(hints ? { hints } : {}),
       ...(icon ? { icon } : {}),
       ...(skills ? { skills } : {}),
     };
