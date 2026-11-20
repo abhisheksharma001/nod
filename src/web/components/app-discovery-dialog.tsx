@@ -23,10 +23,12 @@ type Discovery = {
   name: string;
   catalogApp?: boolean;
   credentialLabels?: Record<string, string>;
+  hints?: Record<string, string>;
   service?: string;
   needsAddress?: boolean;
   localAddress?: string;
   oauthStatus?: 'pending' | 'connected' | 'cancelled' | 'failed' | null;
+  oauthError?: string;
   authorizationUrl?: string;
   attempt?: string;
   callbackUrl?: string;
@@ -156,7 +158,7 @@ export function AppDiscoveryDialog({
         const current = pending.current;
         if (value.oauthStatus) {
           if (value.oauthStatus === 'connected') report.current?.();
-          setError('');
+          setError(value.oauthError ?? '');
           const replaced =
             current?.url && value.authorizationUrl && current.url !== value.authorizationUrl;
           show({
@@ -547,8 +549,11 @@ export function AppDiscoveryDialog({
               <Field
                 label={`Your ${discovery.name} address`}
                 hint={
-                  discovery.localAddress &&
-                  (desktopRuntimeAvailable() ? 'Found on this computer.' : 'Found on your server.')
+                  discovery.localAddress
+                    ? desktopRuntimeAvailable()
+                      ? 'Found on this computer.'
+                      : 'Found on your server.'
+                    : discovery.hints?.address
                 }
               >
                 <Input
@@ -569,7 +574,7 @@ export function AppDiscoveryDialog({
               </Field>
               <details className="app-discovery-methods">
                 <summary>Use an access token instead</summary>
-                <Field label="MCP access token">
+                <Field label="MCP access token" hint={discovery.hints?.token}>
                   <Input
                     name="token"
                     type="password"
@@ -588,7 +593,7 @@ export function AppDiscoveryDialog({
           ) : oauth ? (
             <form onSubmit={(event) => void authorize(event)} autoComplete="off">
               {paths[0]?.clientIdRequired && (
-                <Field label="Client ID">
+                <Field label="Client ID" hint={discovery.hints?.clientId}>
                   <Input
                     name="clientId"
                     value={clientId}
@@ -617,26 +622,30 @@ export function AppDiscoveryDialog({
                   disabled={saving}
                 />
               </Field>
-              {(settings ?? ['token']).map((name) => (
-                <Field
-                  key={name}
-                  label={
-                    discovery.credentialLabels?.[name === 'token' ? (names?.[0] ?? '') : name] ??
-                    (name === 'token' ? 'API key or access token' : name)
-                  }
-                >
-                  <Input
-                    name={name === 'token' ? 'token' : `setting:${name}`}
-                    type="password"
-                    required
-                    minLength={1}
-                    maxLength={8192}
-                    autoComplete="off"
-                    spellCheck={false}
-                    disabled={saving}
-                  />
-                </Field>
-              ))}
+              {(settings ?? ['token']).map((name) => {
+                const field = name === 'token' ? (names?.[0] ?? name) : name;
+                return (
+                  <Field
+                    key={name}
+                    label={
+                      discovery.credentialLabels?.[field] ??
+                      (name === 'token' ? 'API key or access token' : name)
+                    }
+                    hint={discovery.hints?.[field]}
+                  >
+                    <Input
+                      name={name === 'token' ? 'token' : `setting:${name}`}
+                      type="password"
+                      required
+                      minLength={1}
+                      maxLength={8192}
+                      autoComplete="off"
+                      spellCheck={false}
+                      disabled={saving}
+                    />
+                  </Field>
+                );
+              })}
               <Button
                 type="submit"
                 disabled={

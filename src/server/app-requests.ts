@@ -11,7 +11,7 @@ export function appRequestUrl(endpoint: string, relative: string) {
     throw new Error('Use a path in the saved API address.');
   const base = new URL(endpoint);
   const url = new URL(
-    relative.startsWith('/') ? relative.slice(1) : relative,
+    relative.startsWith('/') ? `.${relative}` : relative,
     base.href.endsWith('/') ? base : `${base.href}/`,
   );
   if (/%(?:2e|2f|5c|25)/i.test(url.pathname) || /%(?:2e|2f|5c|25)/i.test(base.pathname))

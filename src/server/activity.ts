@@ -12,6 +12,9 @@ export type LiveWork = Activity & {
   receivedMessageIds?: string[];
 };
 
+const trimCharacters =
+  '\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff';
+
 const query = (
   runs: boolean,
 ) => `SELECT DISTINCT ON (u.session_id) u.id,u.channel,u.status,COALESCE(u.started_at,u.created_at) AS since,
@@ -24,11 +27,14 @@ const query = (
     CASE WHEN u.status='running' THEN ARRAY(SELECT q.message_id FROM turns q WHERE q.owner_id=u.owner_id
       AND q.session_id=u.session_id AND q.status='queued' AND q.source IN ('user','task') AND q.message_id IS NOT NULL
       ORDER BY q.created_at,q.id) END AS received_message_ids,
-    ${runs ? '(SELECT r.id FROM schedule_runs r WHERE r.owner_id=u.owner_id AND r.turn_id=u.session_id LIMIT 1)' : 'NULL'} AS run_id
+    r.id AS run_id,r.schedule_id
   FROM turns u
   JOIN threads th ON th.id=u.thread_id AND th.owner_id=u.owner_id AND th.archived_at IS NULL
   LEFT JOIN LATERAL (SELECT id,title,now_text,message_id FROM tasks WHERE owner_id=u.owner_id AND session_id=u.session_id
     ORDER BY created_at DESC LIMIT 1) t ON true
+  LEFT JOIN LATERAL (
+    ${runs ? 'SELECT id,schedule_id FROM schedule_runs WHERE owner_id=u.owner_id AND turn_id=u.session_id LIMIT 1' : 'SELECT NULL AS id, NULL AS schedule_id'}
+  ) r ON true
   LEFT JOIN LATERAL (SELECT type,summary,created_at FROM turn_events WHERE turn_id=u.id AND type IN ('step','thought','retry')
     ORDER BY created_at DESC,id DESC LIMIT 1) s ON true
   LEFT JOIN LATERAL (SELECT true AS calling,e.site,e.summary AS tool FROM turn_events e WHERE e.turn_id=u.id AND e.type='tool_start'
@@ -36,14 +42,19 @@ const query = (
       AND c.call_id=e.call_id AND c.type IN ('tool_complete','tool_failed'))
     ORDER BY (e.site IS NOT NULL) DESC,e.created_at DESC,e.id DESC LIMIT 1) o ON true
   LEFT JOIN LATERAL (SELECT jsonb_agg(e ORDER BY e.created_at DESC,e.id DESC) AS recent FROM (
-    SELECT e.id,e.summary,e.site,e.created_at,
-      (SELECT CASE WHEN p.type='step' THEN p.summary END FROM turn_events p
-        WHERE p.turn_id=u.id AND p.type IN ('step','steered')
-          AND (p.type='steered' OR p.run_id IS NOT DISTINCT FROM e.run_id)
-          AND p.created_at<=(SELECT b.created_at FROM turn_events b WHERE b.turn_id=u.id
-            AND b.call_id=e.call_id AND b.type='tool_start' ORDER BY b.created_at DESC,b.id DESC LIMIT 1)
-        ORDER BY p.created_at DESC,p.id DESC LIMIT 1) AS step
-    FROM turn_events e WHERE e.turn_id=u.id AND e.type='tool_complete' AND e.summary<>'set status'
+    SELECT * FROM (
+      SELECT DISTINCT ON (COALESCE(p.id,e.id)) e.id,e.summary,e.site,e.created_at,p.summary AS step
+      FROM turn_events e
+      LEFT JOIN LATERAL (
+        SELECT CASE WHEN p.type='step' AND btrim(p.summary,$2)<>'' THEN p.id END AS id,
+          CASE WHEN p.type='step' THEN p.summary END AS summary
+        FROM turn_events p WHERE p.turn_id=u.id AND p.type IN ('step','steered')
+            AND (p.type='steered' OR p.run_id IS NOT DISTINCT FROM e.run_id)
+            AND p.created_at<=(SELECT b.created_at FROM turn_events b WHERE b.turn_id=u.id
+              AND b.call_id=e.call_id AND b.type='tool_start' ORDER BY b.created_at DESC,b.id DESC LIMIT 1)
+        ORDER BY p.created_at DESC,p.id DESC LIMIT 1) p ON true
+      WHERE e.turn_id=u.id AND e.type='tool_complete' AND e.summary<>'set status'
+      ORDER BY COALESCE(p.id,e.id),e.created_at DESC,e.id DESC) e
     ORDER BY e.created_at DESC,e.id DESC LIMIT 4) e) h ON true
   CROSS JOIN LATERAL (SELECT
     (SELECT max(created_at) FROM turn_events WHERE turn_id=u.id) AS last,
@@ -51,7 +62,8 @@ const query = (
     (SELECT max(created_at) FROM turn_events WHERE turn_id=u.id
        AND type IN ('started','steered','step','thought','tool_start','tool_complete','tool_failed','agent_start')) AS worked,
     (SELECT max(created_at) FROM turn_events WHERE turn_id=u.id AND type='final') AS finished) w
-  WHERE u.owner_id=$1 AND u.status IN ('queued','running') AND (${ownerStarted()} OR t.id IS NOT NULL)
+  WHERE u.owner_id=$1 AND u.status IN ('queued','running')
+    AND (${ownerStarted()} OR t.id IS NOT NULL OR r.id IS NOT NULL)
     AND (w.finished IS NULL OR w.worked>w.finished)
   ORDER BY u.session_id,u.status='running' DESC,u.created_at,u.id`;
 
@@ -67,6 +79,7 @@ const toolLabels = new Map([
   ['fetch content', 'Reading a web page'],
   ['get search content', 'Reading search results'],
   ['browser', 'Using the browser'],
+  ['computer', 'Using an app'],
   ['delegate', 'Working with helpers'],
   ['create audio', 'Making audio'],
   ['share file', 'Preparing a file'],
@@ -127,7 +140,7 @@ export function createActivity({
     const runs = Boolean(
       (await pool.query("SELECT to_regclass('schedule_runs') AS name")).rows[0]?.name,
     );
-    const { rows } = await pool.query(query(runs), [ownerId]);
+    const { rows } = await pool.query(query(runs), [ownerId, trimCharacters]);
     const name = model?.();
     return rows
       .map((row) => ({
@@ -169,7 +182,9 @@ export function createActivity({
           ? { received: true as const, receivedMessageIds: row.received_message_ids }
           : {}),
         ...(row.owner_started ? {} : { background: true as const }),
-        ...(row.run_id ? { runId: row.run_id as string } : {}),
+        ...(row.run_id
+          ? { runId: row.run_id as string, scheduleId: row.schedule_id as string }
+          : {}),
       }))
       .sort((a, b) => a.since.localeCompare(b.since));
   }

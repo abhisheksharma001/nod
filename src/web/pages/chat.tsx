@@ -1,5 +1,13 @@
 import { Tooltip } from '../components/tooltip';
-import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import {
+  Fragment,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type SetStateAction,
+} from 'react';
 import { createPortal, flushSync } from 'react-dom';
 import { ArrowDown, Check, CornerUpLeft, LoaderCircle, Repeat } from '../components/icons';
 import type {
@@ -367,7 +375,11 @@ export function Chat({
       ),
     [connections],
   );
-  const [text, setText] = useState('');
+  const [text, setDraftText] = useState('');
+  function setText(value: SetStateAction<string>) {
+    setDraftText(value);
+    setReplyNotice('');
+  }
   const [sending, setSending] = useState(false);
   const [error, setError] = useState('');
   const [recovering, setRecovering] = useState(false);
@@ -379,7 +391,6 @@ export function Chat({
   const [replyTo, setReplyTo] = useState<ComposerReply | null | undefined>(null);
   const [replyNotice, setReplyNotice] = useState('');
   const [unavailableQuestions, setUnavailableQuestions] = useState<ReadonlySet<string>>(new Set());
-  useEffect(() => setReplyNotice(''), [text, state.threadId]);
   const taskReply = useRef<string | null>(null);
   const [focusTarget, setFocusTarget] = useState<{
     id: string;
@@ -572,6 +583,30 @@ export function Chat({
     epoch: number;
     oldest: Pick<Message, 'id' | 'createdAt'> | null;
   }>({ threadId, count: hiddenCount, epoch: 0, oldest: null });
+  const clearedHistory = useRef({ threadId, at: state.chatClearedAt });
+  if (clearedHistory.current.threadId !== threadId)
+    clearedHistory.current = { threadId, at: state.chatClearedAt };
+  else if (clearedHistory.current.at !== state.chatClearedAt) {
+    clearedHistory.current = { threadId, at: state.chatClearedAt };
+    hiddenHistory.current = {
+      threadId,
+      count: hiddenCount,
+      epoch: hiddenHistory.current.epoch + 1,
+      oldest: null,
+    };
+    known.current = { threadId, messages: [] };
+  }
+  useEffect(() => {
+    if (!state.chatClearedAt) return;
+    cancelFocusedMessage();
+    setReplyTo(null);
+    setOptimistic((current) => current.filter((item) => item.threadId !== threadId));
+    const previous = retry.current;
+    if (previous && !previous.replyId) {
+      if (previous.recording) recordingIds.current.delete(recordingSource(previous.recording));
+      retry.current = null;
+    } else if (previous) retry.current = { ...previous, warned: true };
+  }, [threadId, state.chatClearedAt]);
   if (hiddenHistory.current.threadId !== threadId)
     hiddenHistory.current = { threadId, count: hiddenCount, epoch: 0, oldest: null };
   else if (hiddenHistory.current.count !== hiddenCount) {
@@ -712,10 +747,12 @@ export function Chat({
   const working = live.some((item) => !item.background);
   const lastMessage = allMessages.at(-1);
   const beforeLast = allMessages.at(-2);
+  const failureKind = lastMessage?.streamId?.split(':')[0];
+  const modelAdvice = failureKind !== 'offline-failure' || Boolean(state.configuration.modelIssue);
   const modelFailed =
     lastMessage?.role === 'assistant' &&
     lastMessage.id !== recovered &&
-    lastMessage.streamId?.startsWith('model-failure:') &&
+    (failureKind === 'model-failure' || failureKind === 'offline-failure') &&
     beforeLast?.role === 'user' &&
     beforeLast.turnId === lastMessage.turnId;
   const failedRequest =
@@ -1218,6 +1255,10 @@ export function Chat({
     approvalAnswer?: { approvalId: string; approved: boolean },
   ): Promise<ComposerSendResult & { error?: string; questionUnavailable?: true }> {
     if (welcoming) return { sent: false, restoreText: true };
+    if (value.trim().toLowerCase() === '/clear' && (attachments.length || recording)) {
+      setError('Send /clear as a text message without attachments or a recording.');
+      return { sent: false, restoreText: true, restoreRecording: true };
+    }
     unreadPositioned.current = currentUnreadVisit.current;
     const replyId = reply?.id;
     questionAnswer ??=
@@ -1232,6 +1273,7 @@ export function Chat({
     const directAnswer = source === 'answer_choice' || source === 'approval_card';
     const captureAnalytics = analyticsForCurrentSession();
     const sentThread = threadId;
+    const sentChatClearedAt = state.chatClearedAt ?? null;
     const activeReply = { retired: false };
     const replyRetired = () => activeReply.retired;
     const verificationRequests = (
@@ -1380,6 +1422,14 @@ export function Chat({
           restoreRecording: !privateVerification,
         };
       }
+      if (!replyId && (clearedHistory.current.at ?? null) !== sentChatClearedAt) {
+        failed = true;
+        retry.current = null;
+        if (recordingKey) recordingIds.current.delete(recordingKey);
+        setOptimistic((current) => current.filter((item) => item.message.id !== id));
+        setError('This message was cancelled when the chat was cleared.');
+        return { sent: false, restoreText: true, restoreRecording: true };
+      }
       if (replyId && (hiddenMessageIds.current.has(replyId) || replyRetired())) {
         failed = true;
         retry.current = previousAttempt
@@ -1433,6 +1483,7 @@ export function Chat({
         submittedBody ??
         JSON.stringify({
           threadId: sentThread,
+          chatClearedAt: sentChatClearedAt,
           clientMessageId: id,
           text: value,
           ...(displayText ? { displayText } : {}),
@@ -2272,7 +2323,7 @@ export function Chat({
                           ...(task.kind
                             ? { kind: task.kind === 'ongoing' ? 'ongoing' : 'immediate' }
                             : {}),
-                          origin: task.origin === 'common' ? 'common' : 'learned',
+                          origin: task.origin ?? 'learned',
                           position,
                         });
                         void send(task.title, [], null, 'task_card');
@@ -2526,15 +2577,24 @@ export function Chat({
             </Notice>
           )}
           {state.configuration.llmReady &&
+            state.configuration.modelChecking &&
+            !state.configuration.modelIssue && (
+              <div className="chat-model-check" role="status">
+                <LoaderCircle size={14} className="spin" aria-hidden="true" />
+                Checking your model connection…
+              </div>
+            )}
+          {state.configuration.llmReady &&
             !state.chatRecovery &&
             (state.configuration.modelIssue ||
-              (modelFailed && (failedRequest || state.configuration.modelAlternative))) && (
+              (modelFailed &&
+                (failedRequest || (modelAdvice && state.configuration.modelAlternative)))) && (
               <Notice kind="info">
                 {state.configuration.modelIssue
-                  ? `Your model’s last request failed: ${state.configuration.modelIssue.reason.replace(/(?<![.!?])$/, '.')}`
+                  ? `Your model connection needs attention: ${state.configuration.modelIssue.reason.replace(/(?<![.!?])$/, '.')}`
                   : 'Your model’s last request failed.'}
                 <span className="notice-actions">
-                  {state.configuration.modelAlternative && (
+                  {modelAdvice && state.configuration.modelAlternative && (
                     <Button
                       type="button"
                       size="sm"
@@ -2556,7 +2616,7 @@ export function Chat({
                       Try again
                     </Button>
                   )}
-                  <a href="/settings/models">{appPages['/settings/models']}</a>
+                  {modelAdvice && <a href="/settings/models">{appPages['/settings/models']}</a>}
                 </span>
               </Notice>
             )}
@@ -2567,7 +2627,6 @@ export function Chat({
             </Notice>
           )}
           <div
-            hidden={!state.configuration.llmReady && !working && !sending}
             onInputCapture={() => {
               unreadPositioned.current = currentUnreadVisit.current;
             }}
@@ -2581,7 +2640,11 @@ export function Chat({
               restoreReply={(saved) => {
                 if (!saved || !hiddenMessageIds.current.has(saved.id)) setReplyTo(saved);
               }}
-              ready={state.configuration.llmReady && !welcoming && !recovering}
+              ready={
+                (state.configuration.llmReady || text.trim().toLowerCase() === '/clear') &&
+                !welcoming &&
+                !recovering
+              }
               busy={connected && working}
               text={text}
               setText={setText}
