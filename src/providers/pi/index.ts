@@ -56,7 +56,7 @@ import {
 import { threadIdentity } from '../../ports/thread-identity.ts';
 import { createPiUsageTracker, piUsageMetrics, usageId } from './usage.ts';
 import { agentModels } from '../../shared/model-defaults.ts';
-import type { ModelSelection } from '../../shared/models.ts';
+import { modelPricingSignature, type ModelSelection } from '../../shared/models.ts';
 import { createSandbox, workspaceOutputs } from './sandbox.ts';
 import { untrustedBlock } from '../../shared/untrusted.ts';
 import { draft2020Schema } from '../../shared/json-schema.ts';
@@ -738,7 +738,11 @@ export function createPiAgent(options: {
           executionMode: tool.parallel ? 'parallel' : 'sequential',
           execute: async (id, args, signal) => {
             const active = activation?.getActiveTools() ?? [];
-            const missing = (budget.compact ? [] : (tool.companions ?? [])).filter(
+            const companions =
+              typeof tool.companions === 'function'
+                ? tool.companions(args as Record<string, unknown>)
+                : tool.companions;
+            const missing = (budget.compact ? [] : (companions ?? [])).filter(
               (name) => !active.includes(name) && input.tools.some((item) => item.name === name),
             );
             if (missing.length) activation?.setActiveTools([...active, ...missing]);
@@ -757,6 +761,7 @@ export function createPiAgent(options: {
           },
         })),
       ];
+      const guided = new Set<string>();
       const deferred =
         !input.restricted || budget.compact || input.tools.some((tool) => tool.deferred);
       const settings = SettingsManager.inMemory({
@@ -809,13 +814,23 @@ export function createPiAgent(options: {
                           );
                           const loaded = (result.details as { loaded?: string[] } | undefined)
                             ?.loaded;
-                          return budget.compact && loaded?.length
-                            ? {
-                                ...result,
-                                content: [
-                                  { type: 'text' as const, text: `Loaded: ${loaded.join(', ')}` },
-                                ],
-                              }
+                          if (budget.compact && loaded?.length)
+                            return {
+                              ...result,
+                              content: [
+                                { type: 'text' as const, text: `Loaded: ${loaded.join(', ')}` },
+                              ],
+                            };
+                          const guides = (loaded ?? []).flatMap((name) => {
+                            const deferred = input.tools.find(
+                              (tool) => tool.name === name,
+                            )?.deferred;
+                            if (!deferred?.guide || guided.has(deferred.namespace)) return [];
+                            guided.add(deferred.namespace);
+                            return [{ type: 'text' as const, text: deferred.guide }];
+                          });
+                          return guides.length
+                            ? { ...result, content: [...result.content, ...guides] }
                             : result;
                         },
                       }),
@@ -1160,6 +1175,10 @@ export function createPiAgent(options: {
       let compaction:
         { id: string; started: number; error?: string; requests: AssistantMessage[] } | undefined;
       const auxiliarySeen = new Set(manager.getEntries().map((entry) => entry.id));
+      const usagePricing = (usage: { provider: string; model: string } | undefined) => {
+        const target = usage && runtime.getModel(usage.provider, usage.model);
+        return modelPricingSignature(target?.cost, target?.api);
+      };
       const observeUsage = createPiUsageTracker({
         sessionId: manager.getSessionId(),
         provider: model.provider,
@@ -1199,6 +1218,7 @@ export function createPiAgent(options: {
                   status: error ? 'failed' : event.aborted ? 'cancelled' : 'succeeded',
                   durationMs: message?.durationMs ?? performance.now() - compaction.started,
                   ...piUsageMetrics(message?.usage),
+                  pricingSignature: usagePricing(message),
                 },
               });
           compaction = undefined;
@@ -1222,6 +1242,7 @@ export function createPiAgent(options: {
               status: 'succeeded',
               durationMs: 0,
               ...piUsageMetrics(event.entry.usage),
+              pricingSignature: usagePricing(event.entry),
             },
           });
         }
@@ -1282,7 +1303,7 @@ export function createPiAgent(options: {
             settings.applyOverrides({ compaction: { keepRecentTokens: 0 } });
           }
           const usage = observeUsage(event.message);
-          if (usage) input.onEvent(usage);
+          if (usage) input.onEvent({ ...usage, pricingSignature: usagePricing(event.message) });
           if (event.message.stopReason === 'error')
             input.onEvent({
               type: 'error',

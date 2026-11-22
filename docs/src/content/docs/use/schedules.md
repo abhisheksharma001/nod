@@ -39,9 +39,11 @@ In chat, "stop the morning summary" asks Nod to pause the schedule. If Nod asks 
 
 Open **Scheduled** and select **Run now** on a schedule. Nod opens its details so you can follow the run. The new result opens when it is available. A run that failed in chat offers **Run now** too. If you changed the schedule after that run failed, Nod refuses and asks you to review it first.
 
-The extra run uses the saved instruction and delivery channel. The usual approval checks still apply. It does not change the next scheduled time or resume a paused schedule. You can also run a completed one-time schedule again.
+The extra run uses the saved instruction and delivery channel and does its work now, even when the instruction names another day or time. The usual approval checks still apply, and the time named in the instruction never makes them ask. It does not change the next scheduled time or resume a paused schedule. You can also run a completed one-time schedule again.
 
 The button shows **Queued**, **Working**, or **Needs your input** while a run is active. You cannot start another run until that run ends. A recurring schedule skips timed runs that fall due during an active run. A one-time schedule waits for the active run to end.
+
+Select **Stop this run** to stop only that run, including work waiting for your answer. Future runs stay enabled. A watch runs at its next scheduled time even when its accounts have no changes. The control does not pause the schedule. To stop future runs, use the schedule's pause switch. Actions that already reached an app may have completed. Check their result before you start another run.
 
 Select **Needs your input** to open the run's current question in Chat, where you can approve an action or complete sign-in. This opens the existing request without starting another run.
 
@@ -59,6 +61,7 @@ flowchart TD
 ```
 
 - **It runs next to your chat.** A schedule doesn't wait for the conversation, and the conversation doesn't wait for it.
+- **Follow a run in Scheduled.** The schedule shows what Nod is doing, such as reading files or using an app. Open the live line to see recent completed activity when it is available.
 - **What you asked to get arrives every time.** A summary, brief or reminder comes on every run. A watch or check-in messages you only when something needs you, such as a real price drop, a problem or a question. Routine checks stay quiet.
 - **A failed run tells you.** If a run stops on an error, Nod sends a short message that names the schedule and says what stopped it, so a missing summary never goes unnoticed.
 - **It replies where you asked.** A schedule you set up on Telegram sends its messages to Telegram.
@@ -67,7 +70,7 @@ flowchart TD
 - **A complete instruction approval has a clear scope.** When you approve a new complete schedule instruction, Nod shows its future work, targets, timing and limits. That approval can cover the recurring work it describes. Approving a name or timing change changes only those fields. Approving one email never grants recurring sends.
 - **Saved instructions stay traceable.** Each run keeps its execution request, run time and owner inputs. Required messages that become withdrawn or unavailable cannot return as permission. Nod then refuses work that needs them. You can save a complete replacement in **Schedules**, or approve a complete replacement Nod proposes. A check that cannot process the complete request refuses it; it never drops older limits to fit. Existing schedules keep their known instruction without guessed earlier context. Some schedules changed through an older Nod version have incomplete permission history. To use them again, edit their complete instruction in **Schedules**, or approve a complete replacement that Nod proposes.
 - **One run at a time.** While a run is still queued, working or waiting for your answer, a recurring schedule skips its next runs. A one-time schedule waits for the active run to end. A run does its work itself and can't set up more schedules.
-- **Watches skip unchanged runs.** When a recurring check can only find something new after a change in your connected accounts, such as waiting for a reply, Nod saves which accounts it watches. Before each run, Nod checks those accounts for new mail, changed events or app activity without a model call, and skips the run when nothing changed since the last finished run. The first run, and the run after a failed one, always run. Reminders, digests, websites and checks tied to a time don't skip.
+- **Watches skip unchanged runs.** When a recurring check can only find something new after a change in your connected accounts, such as waiting for a reply, Nod saves which accounts it watches. Before each run, Nod checks those accounts for new mail, changed events or app activity without a model call, and skips the run when nothing changed since the last finished run. The first run, and the run after a failed or stopped one, always run. Reminders, digests, websites and checks tied to a time don't skip.
 
 Open a schedule's **See details** to read its runs, newest first. Select **Load earlier runs** for older results. Completed one-time schedules remain under **Inactive**, with their runs available to review.
 
@@ -75,13 +78,13 @@ Each run shows its status. When a saved web reply is available, select **See det
 
 ## Work Nod starts on its own
 
-Nod reads every app you connect on its own, prepares useful work privately and messages you only when it's worth it. See [Nudges](/use/nudges/). There's nothing to turn on. At any time, you can say what's worth interrupting you for, such as "tell me when a client emails", and Nod uses it to choose what to flag.
+Nod watches Gmail and Google Calendar on its own, prepares useful work privately and messages you only when it's worth it. See [Nudges](/use/nudges/). Turn on **Automatic preparation** in **Settings → Notifications**. New profiles start with it off. At any time, you can say what's worth interrupting you for, such as "tell me when a client emails", and Nod uses it to choose what to flag.
 
 How Nod checks:
 
 - **Gmail.** Nod checks for new inbox mail every 15 minutes. If a check is temporarily unavailable, it keeps the messages already found and schedules another check one to five minutes later. Each new message starts a quiet private run that decides whether there's useful work, such as preparing a reply.
 - **Google Calendar.** Nod checks for changed events every 30 minutes without a model call.
-- **Other connected apps.** Every 30 minutes, one quiet private run reads them through their own read tools.
+- **Other connected apps.** No periodic check. An app event starts preparation. You can still ask Nod to read them in chat or in a schedule.
 
 Work Nod starts on its own reads and drafts. It sends, deletes or changes something only when you've told it to do that on its own, such as "whenever Ana sends an invoice, forward it to accounting@acme.com". Anything else waits for your yes. [Your rules](/trust/approvals/#your-rules) can change both: a rule to go ahead lets an action run without asking, and a rule to ask first makes Nod ask even when your standing instruction covers the action. See [Standing instructions](/trust/approvals/#standing-instructions). To change or stop it, tell Nod, for example "stop flagging Slack messages".
 

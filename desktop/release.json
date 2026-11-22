@@ -1,10 +1,10 @@
 {
-  "version": "0.8.4",
-  "previousTag": "nod-v0.8.3",
-  "source": "cc81434d87b2ad15f7c2d0934c4ac6824c4db0fb",
-  "highlights": "## 🧩 Bring your app to Nod\n\nBuild a connector from an MCP server, an HTTP API or a CLI. The [contributor guide](https://nod.n8n.io/docs/contribute/apps/) and AI builder skill help you create an app folder, follow the standard and add the required tests. Then open a pull request for review. Approved connectors get an Apps entry, a public page and a social image.\n\nAlready have an MCP server on your computer or network? Enter its local or private address in **Apps → Connect MCP**.\n\n## 👀 See Nod's last few steps\n\nSelect the activity line in chat or a task to see up to four recent operations, newest first. Close the list when you want a quieter view. It stays closed while the work continues.\n\n## Also in this release\n\n- **Bug reports:** **Report bug** is easier to find. Nod offers a report when something in Nod itself fails. You review what gets sent.\n- **File previews:** Right-click an image in the preview panel to save or open it.\n- **Memory:** Nod follows references in requests to remember earlier details. Notes you write keep their line breaks.\n- **Sign-in:** MCP setup shows the service's reason when sign-in cannot start. ChatGPT sign-in works when its usual local port is busy.\n- **Long chats:** Earlier tools stay available on later turns. Context errors no longer leave the chat stuck.",
+  "version": "0.9.2",
+  "previousTag": "nod-v0.9.1",
+  "source": "d0e4d57b29bb0eeeb720f443b8d48efadb0168ff",
+  "highlights": "## 💬 One chat for your work\n\nAsk Nod to reply to an email, forward it or delete it. Nod now aims to finish short work in connected apps directly in chat.\n\nLarger jobs have their own tasks. You can send several requests and let separate tasks progress at the same time. Reply to a task's message to give it a correction or an update.\n\n## 👀 See the current step\n\nA live line shows what Nod is doing. Open it to see recent steps. Keep typing while Nod works. It reads your next message after its current step.\n\n## ✅ Checked from start to finish\n\nThis release fixes cases where requests could get mixed together or left without an answer. New checks run through whole conversations, including several requests, task replies, Stop and a restart.\n\n## Also in this release\n\n- **Schedules:** **Run now** starts the run even outside its usual time. Your rules still apply.\n- **Approvals:** Email approvals show the recipients, subject and message once, with the question above the card. Nod can also name the recipient and subject when it asks to send a draft it created.\n- **Flight searches:** Compare Google Flights results in one card. Prices cover all travellers, before bag and seat fees.\n- **Language:** Replies, task updates and approval questions follow your conversation's language.\n- **Conversations:** Nod sends fewer repeated details to your model as the conversation grows.",
   "video": {
-    "url": "https://github.com/user-attachments/assets/6bfc3d71-6de3-4593-8fad-b7e56d2af262",
-    "releaseSha256": "0fd4ab5fb690428c253131fd7b17d06b0d25821e56100b29738d600c4e68e3fa"
+    "url": "https://github.com/user-attachments/assets/cafed6e3-c72c-4d34-b4b9-cc4157593a55",
+    "releaseSha256": "aab3e08dd39eccd0b7973e7e96532601bcd7ce2ea077c38dfdb75334f1bbcf04"
   }
 }
