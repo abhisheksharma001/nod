@@ -33,19 +33,21 @@ Nod opens an app only when your words name it or ask for work that needs it. Ope
 
 ## What Nod can do
 
-| Action           | What it does                                                                                                       |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------ |
-| List apps        | Lists running apps. It shows window titles only for apps Nod opened in this request.                               |
-| Open             | Launches an app in the background, or picks one that is already running.                                           |
-| Read a window    | Reads the window's controls, labels and text, or the app's menu bar. A busy window comes back as an outline first. |
-| Picture a window | Takes a picture of that one window, never the whole screen. It needs Screen Recording.                             |
-| Press, choose    | Presses a button or chooses a menu item.                                                                           |
-| Type             | Sets or types the text of a field, or picks an option.                                                             |
-| Key              | Sends a shortcut, such as Cmd+N, to that app only.                                                                 |
+| Action           | What it does                                                                                                                                                                                                                               |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| List apps        | Lists running apps. It shows window titles only for apps Nod opened in this request, including hidden and minimized windows, and leaves out windows the accessibility service can't read. If one app doesn't answer, Nod lists the others. |
+| Open             | Launches an app in the background, or picks one that is already running.                                                                                                                                                                   |
+| Read a window    | Reads the window's controls, labels and text, or the app's menu bar. A busy window comes back as an outline first.                                                                                                                         |
+| Picture a window | Takes a picture of that one window, never the whole screen. It needs Screen Recording, and refuses while a password field has focus.                                                                                                       |
+| Press, choose    | Presses a button or chooses a menu item.                                                                                                                                                                                                   |
+| Type             | Sets or types the text of a field, or picks an option.                                                                                                                                                                                     |
+| Key              | Sends a shortcut, such as Cmd+N, to that app only.                                                                                                                                                                                         |
 
 Each step that can change content goes through the same [trust check](/trust/approvals/) as a connected app action. The check receives the app, window, control, proposed input, and current accessible window content. This includes existing recipients and message text, not only what Nod typed. Text entry is checked too: it can replace a selection or save at once. Only reading and moving focus run without this check.
 
-Before input, Nod reads the window again. It refuses the step if the window content or control changed after the check. It checks again after waiting to bring an app forward. Keyboard input also stays bound to the focused control. In a list, table, outline, grid, tree or menu of more than 20 items, such as an inbox or a month view, the check sees only the item Nod acts on and the selected item, so new messages arriving elsewhere don't stop the step. When list items are left out, a send or submission runs without asking only when the checked window itself shows its recipients and message and your words cover them. A step can't run when the accessibility service returns an incomplete window, when the control is no longer in the window, or when the checked content exceeds 24,000 characters.
+Before input, Nod reads the window again. It refuses the step if the window content or control changed after the check. It checks again after waiting to bring an app forward. Keyboard input also stays bound to the focused control. In a list, table, outline, grid, tree or menu of more than 20 items, such as an inbox or a month view, the check sees only the item Nod acts on, the focused item and the selected item, so new messages arriving elsewhere don't stop the step. In a large window, such as a long Notion page, the check sees the window title and up to about 12,000 characters around the control Nod acts on (for a shortcut, every selected item of the focused list, else the focused control), and changes farther away don't stop the step. When list items or parts of the window are left out, a send or submission runs without asking only when the checked content itself shows its recipients and message and your words cover them. A step can't run when the accessibility service returns an incomplete window, when the control is no longer in the window, when even the content right around the control exceeds 24,000 characters, or when a window too large to check whole has more than one control that looks like the one Nod acts on, such as several Delete buttons.
+
+A step that waits for your answer, that you declined, or whose outcome is uncertain still blocks the same control in that app for the rest of the request, even after the window changes. Stopping work cancels its queued steps, and no step starts after its deadline, so a step reported as not run can't run later.
 
 ## What Nod never does
 
@@ -56,6 +58,7 @@ Nod refuses these, without a judgment call. It recognizes apps by their ID and p
 - File managers: Finder, File Explorer, Files (Nautilus) and Dolphin. Nod works with your files only through [local files](/connect/local-files/), with its protections. An app Nod may use can still open and save files through its own Open and Save panels, which local files would refuse; [keep Nod out of that app](#keep-nod-out-of-an-app) if that matters.
 - Password managers, such as Passwords and 1Password, and crypto wallets.
 - Nod itself.
+- An app whose name another running app shares, or on Windows and Linux one with neither an app ID nor a program, because Nod can't tell which app it is.
 - On macOS, the Apple menu, with Restart, Shut Down, Log Out and System Settings, and each app's own menu, with Services. Nod never shows them to the model.
 - System shortcuts, such as Spotlight, Force Quit, Log Out and Lock Screen, any shortcut with the Windows or Super key, Alt+Tab, Ctrl+Alt+Delete and Ctrl+Alt+T.
 - Any app you keep Nod out of.
@@ -70,7 +73,7 @@ Nod works in the background where it can, so you can keep working. While it read
 
 ## When Nod brings an app to the front
 
-Some steps only work with the app in front: keyboard shortcuts, typing into a message body such as in Mail, and on macOS anything in apps built on Chromium or Electron, such as Slack, Notion or Teams, which don't update while they're behind other windows. On Windows, typing always needs the app in front.
+Some steps only work with the app in front: keyboard shortcuts, typing into a message body such as in Mail, buttons an app turns on only while it's in front, such as Send in Mail, and on macOS anything in apps built on Chromium or Electron, such as Slack, Notion or Teams, which don't update while they're behind other windows. On Windows, typing always needs the app in front.
 
 For those steps, Nod waits until you stop typing or moving the pointer for a moment, then brings only that window to the front. While it works there:
 

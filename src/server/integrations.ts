@@ -118,6 +118,7 @@ type ConnectionRow = {
   setup_link_hash: string | null;
   callback_expires: Date | null;
   callback_expired?: boolean;
+  callback_timeout_recorded: boolean;
   callback_return_to: ReturnTarget;
   trigger_id: string | null;
   triggers_enabled: boolean;
@@ -178,6 +179,7 @@ type IntegrationOptions = {
   browserConnections?: (client?: PoolClient) => Promise<Connection[]>;
   icon?: (origin: string) => Promise<SiteIcon | null>;
   mailCheck?: MailCheck;
+  emailCodePollMs?: number;
   paused?(): Promise<boolean>;
 };
 
@@ -279,7 +281,8 @@ export async function initializeIntegrationSchema(pool: Pool) {
       ADD COLUMN IF NOT EXISTS activity_token text,
       ADD COLUMN IF NOT EXISTS activity_failed boolean NOT NULL DEFAULT false,
       ADD COLUMN IF NOT EXISTS activity_poll_at timestamptz,
-      ADD COLUMN IF NOT EXISTS activity_claim_id text;
+      ADD COLUMN IF NOT EXISTS activity_claim_id text,
+      ADD COLUMN IF NOT EXISTS callback_timeout_recorded boolean NOT NULL DEFAULT false;
     INSERT INTO app_setup_links(owner_id,link_hash,slug)
       SELECT owner_id,setup_link_hash,slug FROM app_connections WHERE setup_link_hash IS NOT NULL
       ON CONFLICT DO NOTHING;
@@ -288,6 +291,7 @@ export async function initializeIntegrationSchema(pool: Pool) {
 }
 
 const activeCallbackClaims = new Set<string>();
+const callbackLifetimeMs = 600_000;
 
 function protectedCallback(row: Pick<ConnectionRow, 'callback_claim_id' | 'callback_expired'>) {
   return Boolean(
@@ -331,6 +335,22 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
   }
   function connectionFailure(error: unknown) {
     return serviceFailureReason(error);
+  }
+  function watchExpiry(slug: string, hash: string) {
+    setTimeout(
+      () =>
+        pool
+          .query(
+            `UPDATE app_connections SET callback_timeout_recorded=true WHERE owner_id=$1 AND callback_hash=$2
+             AND callback_claim_id IS NULL AND callback_expires<=now() AND NOT callback_timeout_recorded`,
+            [configuredOwner, hash],
+          )
+          .then(({ rowCount }) => {
+            if (rowCount) track(slug, 'failed', 'timeout', { step: 'sign_in' });
+          })
+          .catch(() => {}),
+      callbackLifetimeMs + 1000,
+    ).unref();
   }
   const providerId = z
     .string()
@@ -953,6 +973,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
     if (active.length >= 10)
       throw new IntegrationError('This service supports up to ten connected accounts.', 409);
     const nonce = randomBytes(32).toString('base64url');
+    const hash = createHash('sha256').update(nonce).digest('hex');
     const callbackUrl = new URL('/api/apps/callback', options.baseUrl);
     callbackUrl.searchParams.set('state', nonce);
     const configurationId = provider.configurationId;
@@ -1014,12 +1035,12 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
         }
         await client.query(
           `INSERT INTO app_connections (owner_id,slug,pending_account_id,callback_hash,callback_expires,provider_id,callback_return_to,turn_id,setup_link_hash,callback_verifier,configuration_id,replaces_connection_id,pending_account_email)
-           VALUES ($1,$2,$3,$4,now() + interval '10 minutes',$5,$6,$7,$8,$9,$10,$11,$12)`,
+           VALUES ($1,$2,$3,$4,now() + $13 * interval '1 millisecond',$5,$6,$7,$8,$9,$10,$11,$12)`,
           [
             configuredOwner,
             slug,
             attempt.accountId,
-            createHash('sha256').update(nonce).digest('hex'),
+            hash,
             providerId,
             returnTo,
             turn?.turnId ?? null,
@@ -1028,6 +1049,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
             configurationId ?? null,
             replacement?.id ?? null,
             replacement ? normalizedEmail(replacement.account_email!) : null,
+            callbackLifetimeMs,
           ],
         );
         await client.query(
@@ -1047,6 +1069,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
         client.release();
       }
       for (const previous of discarded) await discardReconnect(previous);
+      watchExpiry(slug, hash);
       return {
         url: attempt.url,
         ...(returnTo === 'window' || returnTo === 'desktop' ? { attempt: nonce } : {}),
@@ -1081,7 +1104,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
     );
     if (discarded.rows[0]) {
       await discardReconnect(discarded.rows[0]);
-      return discarded.rows[0].pending_account_id;
+      return discarded.rows[0];
     }
     const { rows } = await pool.query<ConnectionRow>(
       `WITH pending AS (
@@ -1093,7 +1116,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
       [id, configuredOwner, hash, claimId ?? null, expiredOnly],
     );
     if (rows[0]) await discardReconnect(rows[0]);
-    return rows[0]?.pending_account_id;
+    return rows[0];
   }
 
   async function abandonSetup(linkHash: string, reason: 'cancelled' | 'unavailable' | 'unknown') {
@@ -1103,11 +1126,14 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
       [configuredOwner, linkHash],
     );
     let abandoned = (await options.discovered?.abandonSetup(linkHash, reason)) ?? false;
-    for (const row of rows)
-      if ((await clearReconnect(row.id, row.callback_hash!)) !== undefined) {
-        track(row.slug, 'failed', reason, { step: 'sign_in' });
+    for (const row of rows) {
+      const cleared = await clearReconnect(row.id, row.callback_hash!);
+      if (cleared) {
+        if (!cleared.callback_timeout_recorded)
+          track(row.slug, 'failed', reason, { step: 'sign_in' });
         abandoned = true;
       }
+    }
     return abandoned;
   }
 
@@ -1160,7 +1186,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
          AND (callback_claim_id IS NULL OR callback_expires<=now())
          AND (callback_claim_id IS NULL OR NOT (callback_claim_id=ANY($9::text[]))) FOR UPDATE
        ) UPDATE app_connections c SET pending_account_id=NULL,pending_account_email=$6,pending_auth_config_id=NULL,
-       callback_hash=$5,callback_claim_id=NULL,callback_verifier=NULL,callback_expires=now()+interval '10 minutes',callback_return_to=$7,setup_link_hash=NULL,turn_id=$8
+       callback_hash=$5,callback_claim_id=NULL,callback_verifier=NULL,callback_expires=now()+$10 * interval '1 millisecond',callback_timeout_recorded=false,callback_return_to=$7,setup_link_hash=NULL,turn_id=$8
        FROM previous WHERE c.id=previous.id RETURNING previous.*`,
       [
         row.id,
@@ -1172,6 +1198,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
         returnTo,
         turn?.turnId ?? null,
         [...activeCallbackClaims],
+        callbackLifetimeMs,
       ],
     );
     if (!reserved.rowCount)
@@ -1221,6 +1248,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
         'INSERT INTO app_setup_links(owner_id,link_hash,slug) VALUES($1,$2,$3) ON CONFLICT DO NOTHING',
         [configuredOwner, createHash('sha256').update(redirect.href).digest('hex'), slug],
       );
+      watchExpiry(slug, hash);
       return {
         url: attempt.url,
         ...(returnTo === 'window' || returnTo === 'desktop' ? { attempt: nonce } : {}),
@@ -1228,7 +1256,8 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
       };
     } catch (error) {
       const cleared = await clearReconnect(row.id, hash);
-      if (attemptedId && cleared !== attemptedId) await discardReconnect(row, attemptedId);
+      if (attemptedId && cleared?.pending_account_id !== attemptedId)
+        await discardReconnect(row, attemptedId);
       track(slug, 'failed', connectionFailure(error), { step: 'reconnect', error });
       throw error;
     }
@@ -2047,7 +2076,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
         signal,
       );
       while (messages?.length === 0) {
-        await delay(5000, undefined, { signal });
+        await delay(options.emailCodePollMs ?? 5000, undefined, { signal });
         before = Date.now();
         messages = await provider.verificationEmails(
           row.account_id!,
@@ -2136,8 +2165,8 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
     );
   }
 
-  async function watchable(connectionIds: string[]) {
-    const rows = await connectionRows(configuredOwner);
+  async function watchable(connectionIds: string[], client?: PoolClient) {
+    const rows = await connectionRows(configuredOwner, client);
     return connectionIds.every((id) => rows.some((row) => row.id === id && changeSignal(row)));
   }
 
@@ -2831,11 +2860,9 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
               : 'apps';
             if (!configurationMatches(row)) {
               outcome = 'failed';
-              const pending = await clearReconnect(
-                row.id,
-                hash,
-                row.callback_claim_id ?? undefined,
-              );
+              const pending = (
+                await clearReconnect(row.id, hash, row.callback_claim_id ?? undefined)
+              )?.pending_account_id;
               const previous = rowProvider(row);
               if (pending && previous)
                 try {
@@ -2889,8 +2916,11 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
                 } finally {
                   activeCallbackClaims.delete(claimId);
                 }
-              } else if ((await clearReconnect(row.id, hash, undefined, true)) !== undefined)
-                track(row.slug, 'failed', 'timeout', { step: 'callback' });
+              } else {
+                const cleared = await clearReconnect(row.id, hash, undefined, true);
+                if (cleared && !cleared.callback_timeout_recorded)
+                  track(row.slug, 'failed', 'timeout', { step: 'callback' });
+              }
             }
           } else if (options.discovered) {
             const result = await options.discovered

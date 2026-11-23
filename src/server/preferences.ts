@@ -38,14 +38,23 @@ export const defaultPreferences: Preferences = {
   localFilesEnabled: false,
 };
 type QuietHours = Pick<Preferences, 'quietHoursEnabled' | 'quietStart' | 'quietEnd' | 'timeZone'>;
+let lastClock: { timeZone: string; format: Intl.DateTimeFormat } | undefined;
+function clock(timeZone: string) {
+  if (lastClock?.timeZone !== timeZone)
+    lastClock = {
+      timeZone,
+      format: new Intl.DateTimeFormat('en-GB', {
+        timeZone,
+        hour: '2-digit',
+        minute: '2-digit',
+        hourCycle: 'h23',
+      }),
+    };
+  return lastClock.format;
+}
 export function isQuietTime(preferences: QuietHours, now = new Date()) {
   if (!preferences.quietHoursEnabled) return false;
-  const current = new Intl.DateTimeFormat('en-GB', {
-    timeZone: preferences.timeZone ?? 'UTC',
-    hour: '2-digit',
-    minute: '2-digit',
-    hourCycle: 'h23',
-  }).format(now);
+  const current = clock(preferences.timeZone ?? 'UTC').format(now);
   const { quietStart, quietEnd } = preferences;
   return (
     quietStart !== quietEnd &&
@@ -69,7 +78,7 @@ function canonicalLocale(value: string) {
 }
 const columns =
   'speech_voice AS "speechVoice",speech_reply AS "speechReply",notification_rule AS "notificationRule",rules,time_zone AS "timeZone",locale,hour_cycle AS "hourCycle",quiet_hours_enabled AS "quietHoursEnabled",quiet_start AS "quietStart",quiet_end AS "quietEnd",proactive_paused AS "proactivePaused",local_files_enabled AS "localFilesEnabled"';
-function ianaTimeZone(value: string) {
+export function ianaTimeZone(value: string) {
   try {
     new Intl.DateTimeFormat('en', { timeZone: value });
     return !/^[+-]/.test(value);

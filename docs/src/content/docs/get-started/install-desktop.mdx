@@ -173,6 +173,8 @@ Newer Nod builds show an in-app notice when an update finishes downloading. It n
 
 On a Mac, the new version can take a minute or two to open after the window closes, because macOS copies and checks the new app first. If you open Nod during that time, it closes again right away and the new version opens when the install finishes.
 
+On a Mac, Nod waits while its update installer is still running. If the installer is still active or its state is unknown when Nod starts its automatic update checks, the first automatic check waits 15 minutes. Every check and restart also waits until macOS reports that the installer is idle. The native menu and tray actions stay unavailable while Nod waits for the installer.
+
 Nod 0.8.4 and earlier on a Mac cancel the update when you open them while it installs, so Nod opens on the old version again. Select **Restart to update** once more and wait until Nod opens by itself. If it still opens on the old version, quit Nod and run the [Terminal installer](#install-nod). It keeps your profile, keys and data.
 
 A ready update also installs when you choose **Quit Nod**. Nod stays closed until you open it again. On Windows, the installer runs in the background after Nod stops. On a Mac, the native updater applies the downloaded update after exit. Closing the window keeps Nod running and does not install an update. To use the update now, choose **Restart to update**. On Windows, this runs the installer in the background and opens Nod again when it finishes.

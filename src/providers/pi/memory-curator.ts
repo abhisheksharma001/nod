@@ -1,6 +1,7 @@
 import {
   InMemoryCredentialStore,
   getSupportedThinkingLevels,
+  isRetryableAssistantError,
   type Api,
   type AssistantMessage,
   type Context,
@@ -27,6 +28,7 @@ const untraced = new Set([
   'review',
   'style',
   'skill',
+  'ideas',
   'classify',
   'check',
 ]);
@@ -143,7 +145,8 @@ export function createPiMemoryCurator(options: {
     ) {
       signal?.throwIfAborted();
       const traceTurnId = crypto.randomUUID();
-      const bounded = task === 'classify' || task === 'attention' || task === 'check';
+      const bounded =
+        task === 'classify' || task === 'attention' || task === 'check' || task === 'activity';
       const turnBound =
         signal !== undefined && ['review', 'access', 'skill', 'remember'].includes(task);
       if (options.resolve) loaded = undefined;
@@ -234,7 +237,7 @@ export function createPiMemoryCurator(options: {
                   AbortSignal.timeout(bounded ? 10_000 : 45_000),
                   ...(signal ? [signal] : []),
                 ]),
-            maxTokens: bounded ? 512 : 8192,
+            maxTokens: bounded ? 512 : task === 'ideas' ? 2048 : 8192,
             ...(sessionId ? { sessionId } : {}),
             ...(bounded ? { maxRetries: 0, timeoutMs: 10_000 } : {}),
             ...(turnBound && model.provider === 'compatible'
@@ -291,7 +294,11 @@ export function createPiMemoryCurator(options: {
       };
       const reply = await retryAssistantCall(
         complete,
-        { enabled: task !== 'vision' && !bounded, maxRetries: 2, baseDelayMs: 250 },
+        {
+          enabled: task !== 'vision' && task !== 'ideas' && !bounded,
+          maxRetries: 2,
+          baseDelayMs: 250,
+        },
         signal,
       );
       if (
@@ -302,7 +309,7 @@ export function createPiMemoryCurator(options: {
         const label =
           task === 'vision'
             ? 'The image model is unavailable.'
-            : task === 'classify' || task === 'attention'
+            : task === 'classify' || task === 'attention' || task === 'activity'
               ? 'The classification model is unavailable.'
               : task === 'review' || task === 'access'
                 ? 'The action review model is unavailable.'
@@ -318,7 +325,12 @@ export function createPiMemoryCurator(options: {
         const status = [...(reply.errorMessage ?? '').matchAll(/\(HTTP (\d{3})\)/g)].at(-1)?.[1];
         throw Object.assign(
           new Error(`${label} Task: ${task}. Model: ${model.provider}/${model.id}.${detail}`),
-          status ? { providerStatus: Number(status) } : {},
+          status
+            ? {
+                providerStatus: Number(status),
+                providerRetryable: isRetryableAssistantError(reply),
+              }
+            : {},
         );
       }
       return json(

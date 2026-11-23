@@ -6,6 +6,7 @@ import type { Pool } from 'pg';
 import { feedbackLimits, type FeedbackContext } from '../shared/feedback.ts';
 import { parseFeedbackActivity, type FeedbackActivity } from '../shared/feedback-activity.ts';
 import { integrationServiceIds } from '../shared/integrations.ts';
+import { browserSignInGuard } from '../shared/browser-errors.ts';
 import { feedbackTechnicalContext } from './feedback-context.ts';
 import { createFeedbackRedactor } from './feedback-redaction.ts';
 import type { PersonalProfile } from './personal-data.ts';
@@ -70,6 +71,7 @@ const tools = [
   'apps',
   'codemode',
   'files',
+  'flights',
   'history_search',
   'limits_update',
   'memory_learn',
@@ -89,6 +91,8 @@ const tools = [
   'follow_up',
   'manage_apps',
   'manage_personal_context',
+  'memory',
+  'nod',
   'pay',
   'react_to_message',
   'send_message',
@@ -113,6 +117,7 @@ const usageOperations = [
   'reflect',
   'style',
   'plan',
+  'ideas',
   'classify',
   'vision',
   'recall',
@@ -327,6 +332,7 @@ export async function buildFeedbackReport(options: FeedbackReportOptions) {
           'steered',
           'step',
           'thought',
+          'intent',
           'final',
           'queued',
           'running',
@@ -709,6 +715,8 @@ export async function buildFeedbackReport(options: FeedbackReportOptions) {
       error.code,
       error.status,
       record(data.context).reason,
+      browserSignInGuard(record(data.context).signInGuard),
+      choice(record(data.context).method, ['signInMethods', 'selectSignInMethod']),
     ]);
     const previous = repeated.get(key);
     repeated.delete(key);

@@ -17,6 +17,7 @@ import type { Computer } from '../src/ports/computer.ts';
 import { createBrowserConnections } from '../src/server/browser-connections.ts';
 import { createAnalytics } from '../src/server/analytics.ts';
 import type { ProductAnalytics } from '../src/ports/analytics.ts';
+import { withFailureLog } from '../src/ports/failure-log.ts';
 
 test(
   'browser profiles require an explicit observed sign-in outcome and retain owner and turn fences',
@@ -471,6 +472,84 @@ test(
 );
 
 test(
+  'private frame input refuses a control center outside the root viewport before dispatch',
+  { skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true', timeout: 30_000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), 'nod-method-viewport-'));
+    let submitted = 0;
+    const server = createHttpServer((request, response) => {
+      if (request.method === 'POST') {
+        submitted++;
+        response.end('Selected');
+        return;
+      }
+      response.setHeader('content-type', 'text/html');
+      response.end(
+        request.url === '/inner'
+          ? '<form action="/selected" method="post"><button id="primary" style="width:300px;height:40px">Continue</button></form>'
+          : `<iframe style="position:fixed;left:120px;top:50px;width:500px;height:300px;border:0" src="http://localhost:${(server.address() as { port: number }).port}/inner" onload="document.getElementById('ready').textContent='Frame ready'"></iframe><p id="ready"></p>`,
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    let socketPath = '';
+    const computer = createAgentBrowserComputer({
+      dataRoot: directory,
+      browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
+      privateNetwork: true,
+      headless: true,
+      viewport: { width: 180, height: 600 },
+      daemonCommand: async (path, command, signal, timeoutMs) => {
+        socketPath = path;
+        return existingDaemonCommand(path, command, signal, timeoutMs);
+      },
+    });
+    try {
+      const address = server.address();
+      assert.ok(address && typeof address !== 'string');
+      await computer.act('fixture', { action: 'open', url: `http://127.0.0.1:${address.port}` });
+      await computer.act('fixture', { action: 'wait', text: 'Frame ready' });
+      const connection = await existingDaemonCommand(socketPath, { action: 'cdp_url' });
+      const tabs = await existingDaemonCommand(socketPath, { action: 'tab_list' });
+      const tab = (tabs.tabs as { active: boolean; targetId: string }[]).find(
+        (value) => value.active,
+      )!;
+      const inspector = await openDevtools(String(connection.cdpUrl), tab.targetId);
+      const inputs: string[] = [];
+      try {
+        const bound = await inspector.signInControl({ selector: '#primary' });
+        const original = WebSocket.prototype.send;
+        const sending = t.mock.method(
+          WebSocket.prototype,
+          'send',
+          function (this: WebSocket, data: Parameters<WebSocket['send']>[0]) {
+            const message = typeof data === 'string' ? JSON.parse(data) : undefined;
+            if (message?.method === 'Input.dispatchMouseEvent') inputs.push(message.params.type);
+            original.call(this, data);
+          },
+        );
+        try {
+          await assert.rejects(inspector.selectSignInControl(bound), (error: unknown) => {
+            assert.equal(Object(error).signInGuard, 'control_hidden');
+            return true;
+          });
+        } finally {
+          sending.mock.restore();
+        }
+        assert.deepEqual(inputs, []);
+        assert.equal(submitted, 0);
+      } finally {
+        inspector.close();
+      }
+    } finally {
+      await computer.dispose();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
   'private submission stops before a click when its browser closes',
   { timeout: 20_000 },
   async () => {
@@ -537,14 +616,22 @@ test(
   async () => {
     let submissions = 0;
     const controller = new AbortController();
-    const server = createHttpServer((request, response) => {
+    const validated = deferred();
+    const enabled = deferred();
+    const server = createHttpServer(async (request, response) => {
       response.setHeader('content-type', 'text/html');
       if (request.url === '/submit') {
         submissions++;
         response.end('<h1>Unexpected submission</h1>');
+      } else if (request.url === '/validated') {
+        await validated.promise;
+        response.end();
+      } else if (request.url === '/enabled') {
+        enabled.resolve();
+        response.end();
       } else
         response.end(`<form action="/submit" method="post"><input id="password" type="password"><button id="submit" disabled>Continue</button></form><script>
-        document.querySelector('input').oninput=()=>{clearTimeout(window.validation);window.validation=setTimeout(()=>document.querySelector('button').disabled=false,1500)};
+        document.querySelector('input').oninput=()=>{window.validation??=fetch('/validated').then(()=>{document.querySelector('button').disabled=false;fetch('/enabled')})};
       </script>`);
     });
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -586,7 +673,9 @@ test(
       await waiting;
       controller.abort();
       const submitted = await outcome;
-      await delay(1700);
+      validated.resolve();
+      await enabled.promise;
+      await delay(300);
       assert.equal(submitted, false);
       assert.equal(submissions, 0);
       await computer.act('closing', { action: 'reload' });
@@ -613,7 +702,7 @@ test(
         response.end('<h1>Unexpected submission</h1>');
       } else
         response.end(`<form action="/submit" method="post"><input id="password" type="password"><button id="submit" disabled>Continue</button></form><script>
-        document.querySelector('input').oninput=()=>{clearTimeout(window.validation);window.validation=setTimeout(()=>document.querySelector('button').disabled=false,1500)};
+        document.querySelector('input').oninput=()=>{clearTimeout(window.validation);window.validation=setTimeout(()=>document.querySelector('button').disabled=false,300)};
       </script>`);
     });
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -662,7 +751,7 @@ test(
       controller.abort();
       release();
       const submitted = await outcome;
-      await delay(1700);
+      await delay(500);
       assert.equal(submissions, 0);
       assert.equal(submitted, false);
       await computer.act('closing', { action: 'open', url: origin });
@@ -683,14 +772,22 @@ test(
   async () => {
     let submissions = 0;
     const controller = new AbortController();
-    const server = createHttpServer((request, response) => {
+    const validated = deferred();
+    const enabled = deferred();
+    const server = createHttpServer(async (request, response) => {
       response.setHeader('content-type', 'text/html');
       if (request.url === '/submit') {
         submissions++;
         response.end('<h1>Unexpected submission</h1>');
+      } else if (request.url === '/validated') {
+        await validated.promise;
+        response.end();
+      } else if (request.url === '/enabled') {
+        enabled.resolve();
+        response.end();
       } else
         response.end(`<form action="/submit" method="post"><input id="password" type="password"><button id="submit" disabled>Continue</button></form><script>
-        document.querySelector('input').oninput=()=>{clearTimeout(window.validation);window.validation=setTimeout(()=>document.querySelector('button').disabled=false,1500)};
+        document.querySelector('input').oninput=()=>{window.validation??=fetch('/validated').then(()=>{document.querySelector('button').disabled=false;fetch('/enabled')})};
       </script>`);
     });
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -738,7 +835,9 @@ test(
       await waiting;
       controller.abort();
       const submitted = await outcome;
-      await delay(1700);
+      validated.resolve();
+      await enabled.promise;
+      await delay(300);
       assert.equal(submitted, false);
       assert.equal(submissions, 0);
       await computer.act('closing', { action: 'reload' });
@@ -783,6 +882,9 @@ test(
       browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
       privateNetwork: true,
       headless: true,
+      get submitReadyMs() {
+        return mode === 'disabled' ? 300 : undefined;
+      },
       daemonCommand: async (path, command, signal, timeout, maxBytes) => {
         if (command.action === 'isenabled' && command.selector === '#submit') {
           queries++;
@@ -918,7 +1020,7 @@ test(
         response.end('Accepted');
       } else if (request.url === '/delayed') {
         response.end(`<input id="company"><input id="password" type="password"><button id="submit">Continue</button><script>
-        document.querySelector('button').onclick = () => setTimeout(() => fetch('/record', { method: 'POST', body: JSON.stringify({company: document.querySelector('#company').value, password: document.querySelector('#password').value}) }), 1200);
+        document.querySelector('button').onclick = () => setTimeout(() => fetch('/record', { method: 'POST', body: JSON.stringify({company: document.querySelector('#company').value, password: document.querySelector('#password').value}) }), 300);
       </script>`);
       } else if (request.url === '/card') {
         response.end(
@@ -927,7 +1029,7 @@ test(
       } else {
         response.end(`<button id="login">Log in</button><dialog><input id="username" aria-label="Email"><button id="submit" disabled>Continue</button></dialog><script>
         document.querySelector('#login').onclick = () => document.querySelector('dialog').showModal();
-        document.querySelector('#username').${request.url === '/blur' ? 'onblur' : 'oninput'} = () => { clearTimeout(window.validation); document.querySelector('#submit').disabled = true; window.validation = setTimeout(() => document.querySelector('#submit').disabled = false, 1500); };
+        document.querySelector('#username').${request.url === '/blur' ? 'onblur' : 'oninput'} = () => { clearTimeout(window.validation); document.querySelector('#submit').disabled = true; window.validation = setTimeout(() => document.querySelector('#submit').disabled = false, 800); };
         document.querySelector('#submit').onclick = async () => { await fetch('/identifier-record', {method: 'POST', body: document.querySelector('#username').value}); document.querySelector('dialog').innerHTML = '<h1>Password step</h1><input type="password" id="password">'; };
       </script>`);
       }
@@ -1093,6 +1195,7 @@ test(
       covered:
         "const cover=document.createElement('button');cover.style.cssText='position:fixed;inset:0;z-index:1000';cover.textContent='Cover';cover.onclick=()=>fetch('/covered',{method:'POST'});document.body.append(cover)",
       changedOnPress: "primary.addEventListener('mousedown',()=>primary.form.action='/other')",
+      changedOnRelease: "primary.addEventListener('pointerup',()=>primary.form.action='/other')",
       removedOnRelease: "primary.addEventListener('mouseup',()=>primary.remove())",
     };
     const server = createHttpServer(async (request, response) => {
@@ -1109,8 +1212,31 @@ test(
         return;
       }
       response.setHeader('content-type', 'text/html');
+      if (request.url === '/moving-inner') {
+        response.end(
+          '<body style="margin:0"><form action="/selected" method="post"><button id="primary" style="width:400px;height:60px">Continue</button></form>',
+        );
+        return;
+      }
+      if (request.url === '/moving-frame') {
+        response.end(
+          `<iframe id="frame" style="position:fixed;left:100px;top:60px;width:600px;height:200px;border:0" src="http://localhost:${(server.address() as { port: number }).port}/moving-inner" onload="document.getElementById('ready').textContent='Frame ready'"></iframe><div id="cover" style="display:none;position:fixed;left:360px;top:60px;width:40px;height:60px;z-index:10"></div><p id="ready"></p>`,
+        );
+        return;
+      }
       if (request.url === '/done') {
         response.end('<h1>Selected</h1>');
+        return;
+      }
+      if (request.url?.startsWith('/initial-')) {
+        const attributes: Record<string, string> = {
+          '/initial-disabled': 'disabled',
+          '/initial-hidden': 'hidden',
+          '/initial-inert': 'inert',
+        };
+        response.end(
+          `<button id="primary" ${attributes[request.url] ?? ''}>Continue</button><p id="plain">Plain text</p>`,
+        );
         return;
       }
       if (request.url === '/scrolled' || request.url === '/scrolled-xy') {
@@ -1141,7 +1267,7 @@ test(
       }
       if (request.url === '/twin' || request.url === '/twin-inner') {
         response.end(
-          `<body style="margin:8px"><form action="/selected" method="post" style="margin:0"><button style="width:200px;height:40px">Continue with Example</button></form>${request.url === '/twin' ? '<div style="position:fixed;left:0;top:0;width:300px;height:60px"></div><iframe title="Sign in" src="/twin-inner" style="width:500px;height:300px;margin:150px 200px;border:0"></iframe>' : ''}`,
+          `<body style="margin:8px"><form action="/selected" method="post" style="margin:0"><button style="width:200px;height:40px">Continue with Example</button></form>${request.url === '/twin' ? `<div style="position:fixed;left:0;top:0;width:300px;height:60px"></div><iframe title="Sign in" src="/twin-inner" onload="document.getElementById('ready').textContent='Frame ready'" style="width:500px;height:300px;margin:150px 200px;border:0"></iframe><p id="ready"></p>` : ''}`,
         );
         return;
       }
@@ -1167,12 +1293,16 @@ test(
     assert.ok(address && typeof address !== 'string');
     const origin = `http://127.0.0.1:${address.port}`;
     let socketPath = '';
+    let clickReceiptMs: number | undefined;
     const makeComputer = () => {
       const computer = createAgentBrowserComputer({
         dataRoot: directory,
         browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
         privateNetwork: true,
         headless: true,
+        get clickReceiptMs() {
+          return clickReceiptMs;
+        },
         daemonCommand: async (path, command, signal, timeoutMs) => {
           socketPath = path;
           return existingDaemonCommand(path, command, signal, timeoutMs);
@@ -1188,18 +1318,50 @@ test(
     };
     const worker = await harness({ computer: makeComputer });
     const client = worker.client(directory, { timeoutMs: 30_000 });
+    const failures: Array<{ event: string; error: unknown; context?: Record<string, unknown> }> =
+      [];
+    const record = (event: string, error: unknown, context?: Record<string, unknown>) => {
+      failures.push({ event, error, context });
+    };
+    const inspectMethods = client.signInMethods!;
+    const selectMethod = client.selectSignInMethod!;
+    client.signInMethods = (...args) => withFailureLog(record, () => inspectMethods(...args));
+    client.selectSignInMethod = (...args) => withFailureLog(record, () => selectMethod(...args));
     const act = (input: BrowserAction) => client.act('fixture', input);
     const choices = [
       { label: 'Misleading label', selector: '#primary span' },
       { label: 'Another misleading label', selector: '#alternate' },
     ];
     try {
+      for (const path of [
+        '/initial-disabled',
+        '/initial-hidden',
+        '/initial-inert',
+        '/initial-plain',
+      ]) {
+        await act({ action: 'open', url: origin + path });
+        await assert.rejects(
+          client.signInMethods!('fixture', origin, [
+            { label: 'Ignored', selector: path === '/initial-plain' ? '#plain' : '#primary' },
+          ]),
+          (error: unknown) => {
+            assert.ok(error instanceof BrowserActionError);
+            assert.equal(error.code, 'browser_sign_in_choice');
+            assert.equal(error.signInGuard, 'choice_ineligible');
+            return true;
+          },
+        );
+      }
       await act({ action: 'open', url: origin });
       await assert.rejects(
         client.signInMethods!('fixture', origin, [
-          { label: 'First', selector: '#primary' },
+          { label: 'picker-private@example.test/private-account', selector: '#primary' },
           { label: 'Second', selector: '#primary span' },
         ]),
+        (error: unknown) => {
+          assert.equal(Object(error).signInGuard, 'choice_duplicate');
+          return true;
+        },
       );
       const bound = await client.signInMethods!('fixture', origin, choices);
       assert.deepEqual(
@@ -1215,11 +1377,17 @@ test(
         to: origin + '/alternate',
       });
       const selection = { origin, document: bound.document, methodId: bound.methods[0]!.id };
-      await assert.rejects(client.selectSignInMethod!('other', selection));
+      await assert.rejects(client.selectSignInMethod!('other', selection), (error: unknown) => {
+        assert.equal(Object(error).signInGuard, 'browser_unavailable');
+        return true;
+      });
       await client.selectSignInMethod!('fixture', selection);
       await act({ action: 'wait', url: '**/done' });
       assert.deepEqual(received, ['/selected']);
-      await assert.rejects(client.selectSignInMethod!('fixture', selection));
+      await assert.rejects(client.selectSignInMethod!('fixture', selection), (error: unknown) => {
+        assert.equal(Object(error).signInGuard, 'selection_missing');
+        return true;
+      });
       await assert.rejects(
         client.selectSignInMethod!('fixture', { ...selection, methodId: bound.methods[1]!.id }),
       );
@@ -1229,12 +1397,20 @@ test(
         if (change === 'navigation') await act({ action: 'reload' });
         else if (change === 'closed') await client.close('fixture');
         else if (change !== 'origin') await act({ action: 'click', selector: '#change' });
+        clickReceiptMs = change === 'removedOnRelease' ? 100 : undefined;
         await assert.rejects(
           client.selectSignInMethod!('fixture', {
             origin: change === 'origin' ? 'https://another.example' : origin,
             document: stale.document,
             methodId: stale.methods[0]!.id,
           }),
+          (error: unknown) => {
+            if (change === 'changedOnRelease')
+              assert.equal(Object(error).signInGuard, 'click_guard_changed');
+            if (change === 'removedOnRelease')
+              assert.equal(Object(error).signInGuard, 'click_not_received');
+            return true;
+          },
         );
         assert.deepEqual(received, ['/selected']);
       }
@@ -1261,6 +1437,10 @@ test(
       assert.equal(byRef.methods[0]!.label, 'Continue with Example');
       await assert.rejects(
         client.signInMethods!('fixture', origin, [{ label: 'Ignored', selector: '@e9999' }]),
+        (error: unknown) => {
+          assert.equal(Object(error).signInGuard, 'reference_missing');
+          return true;
+        },
       );
       await act({ action: 'open', url: origin + '/covered' });
       await act({ action: 'click', selector: '#change' });
@@ -1273,13 +1453,17 @@ test(
       );
       await assert.rejects(
         client.signInMethods!('fixture', origin, [{ label: 'Ignored', selector: 'button' }]),
+        (error: unknown) => {
+          assert.equal(Object(error).signInGuard, 'selector_rejected');
+          return true;
+        },
       );
       await act({ action: 'open', url: origin + '/duplicate' });
       await assert.rejects(
         client.signInMethods!('fixture', origin, [{ label: 'Ignored', selector: '#primary' }]),
       );
       await act({ action: 'open', url: origin + '/twin' });
-      await act({ action: 'wait', load: 'networkidle' });
+      await act({ action: 'wait', text: 'Frame ready' });
       const twin = /button "Continue with Example"[^\n]*ref=(e\d+)/.exec(
         (await act({ action: 'snapshot' })).text,
       )?.[1];
@@ -1382,16 +1566,46 @@ test(
           assert.equal(bound.targetFrameId === bound.frameId, path === '/foreign');
           assert.notEqual(bound.loaderId, await inspector.document());
           if (path === '/framed') {
+            const noInput = async (operation: () => Promise<unknown>) => {
+              const inputs: string[] = [];
+              const original = WebSocket.prototype.send;
+              const staleSend = t.mock.method(
+                WebSocket.prototype,
+                'send',
+                function (this: WebSocket, data: Parameters<WebSocket['send']>[0]) {
+                  const message = typeof data === 'string' ? JSON.parse(data) : undefined;
+                  if (message?.method === 'Input.dispatchMouseEvent')
+                    inputs.push(message.params.type);
+                  original.call(this, data);
+                },
+              );
+              try {
+                await assert.rejects(operation());
+              } finally {
+                staleSend.mock.restore();
+              }
+              assert.deepEqual(inputs, []);
+            };
+            await noInput(() =>
+              inspector.selectSignInControl({ ...bound, targetFrameId: 'synthetic-other-target' }),
+            );
             await act({ action: 'click', selector: '#reload-frame' });
             await act({ action: 'wait', text: 'Frame ready' });
-            await assert.rejects(inspector.selectSignInControl(bound));
+            await noInput(() => inspector.selectSignInControl(bound));
           }
           inspector.close();
           inspector = await openDevtools(String(connection.cdpUrl), tab.targetId);
           const current = await inspector.signInControl({ pixel: { x: 150, y: 100 } });
           inspector.close();
-          inspector = await openDevtools(String(connection.cdpUrl), tab.targetId);
+          inspector = await openDevtools(
+            String(connection.cdpUrl),
+            tab.targetId,
+            undefined,
+            path === '/framed' ? 2000 : undefined,
+          );
           let delayed = false;
+          let controlSession: string | undefined;
+          const dispatched: string[] = [];
           let guardTimer: ReturnType<typeof setTimeout> | undefined;
           const originalSend = WebSocket.prototype.send;
           const sending = t.mock.method(
@@ -1399,6 +1613,12 @@ test(
             'send',
             function (this: WebSocket, data: Parameters<WebSocket['send']>[0]) {
               const message = typeof data === 'string' ? JSON.parse(data) : undefined;
+              if (message?.method === 'DOM.getContentQuads') controlSession = message.sessionId;
+              if (message?.method === 'Input.dispatchMouseEvent') {
+                assert.ok(controlSession);
+                assert.equal(message.sessionId, controlSession);
+                dispatched.push(message.params.type);
+              }
               if (
                 path === '/framed' &&
                 !delayed &&
@@ -1406,7 +1626,7 @@ test(
                 message.params?.functionDeclaration?.includes("globalThis[name + 'Guard'] = guard")
               ) {
                 delayed = true;
-                guardTimer = setTimeout(() => originalSend.call(this, data), 5200);
+                guardTimer = setTimeout(() => originalSend.call(this, data), 2400);
                 return;
               }
               originalSend.call(this, data);
@@ -1419,6 +1639,7 @@ test(
             sending.mock.restore();
           }
           assert.equal(delayed, path === '/framed');
+          assert.deepEqual(dispatched, ['mouseMoved', 'mousePressed', 'mouseReleased']);
           const deadline = Date.now() + 5000;
           while (received.length < 4 + index && Date.now() < deadline) await delay(10);
           assert.deepEqual(received, Array(4 + index).fill('/selected'));
@@ -1501,6 +1722,128 @@ test(
         );
         assert.deepEqual(received, [...before, '/selected']);
       }
+      for (const covered of [false, true]) {
+        let moved = false;
+        await act({ action: 'open', url: origin + '/moving-frame' });
+        await act({ action: 'wait', text: 'Frame ready' });
+        const movingConnection = await existingDaemonCommand(socketPath, { action: 'cdp_url' });
+        const movingTabs = await existingDaemonCommand(socketPath, { action: 'tab_list' });
+        const movingTab = (movingTabs.tabs as { active: boolean; targetId: string }[]).find(
+          (value) => value.active,
+        )!;
+        const movingInspector = await openDevtools(
+          String(movingConnection.cdpUrl),
+          movingTab.targetId,
+        );
+        const beforeMove = [...received];
+        const movingInputs: string[] = [];
+        let parentSession: string | undefined;
+        let mutationError: unknown;
+        let mutationTimer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const movingControl = await movingInspector.signInControl({ selector: '#primary' });
+          const original = WebSocket.prototype.send;
+          const sending = t.mock.method(
+            WebSocket.prototype,
+            'send',
+            function (this: WebSocket, data: Parameters<WebSocket['send']>[0]) {
+              const message = typeof data === 'string' ? JSON.parse(data) : undefined;
+              if (message?.method === 'DOM.getFrameOwner') parentSession = message.sessionId;
+              if (message?.method === 'Input.dispatchMouseEvent') {
+                movingInputs.push(message.params.type);
+                if (message.params.type === 'mouseMoved' && !moved) {
+                  assert.ok(parentSession);
+                  const changed = (event: MessageEvent) => {
+                    const response = JSON.parse(String(event.data));
+                    if (response.id !== 900_000_001) return;
+                    clearTimeout(mutationTimer);
+                    this.removeEventListener('message', changed);
+                    if (
+                      response.error ||
+                      response.result?.exceptionDetails ||
+                      response.result?.result?.value !== true
+                    ) {
+                      mutationError = new Error('The parent frame mutation failed.');
+                      movingInspector.close();
+                      return;
+                    }
+                    moved = true;
+                    original.call(this, data);
+                  };
+                  this.addEventListener('message', changed);
+                  mutationTimer = setTimeout(() => {
+                    this.removeEventListener('message', changed);
+                    mutationError = new Error('The parent frame mutation did not answer.');
+                    movingInspector.close();
+                  }, 2000);
+                  original.call(
+                    this,
+                    JSON.stringify({
+                      id: 900_000_001,
+                      method: 'Runtime.evaluate',
+                      sessionId: parentSession,
+                      params: {
+                        expression: `(() => { const frame=document.getElementById('frame');const cover=document.getElementById('cover');frame.style.left='180px';cover.style.display='${covered ? 'block' : 'none'}';return frame.getBoundingClientRect().left===180 && document.elementFromPoint(300,90)===frame && document.elementFromPoint(380,90)===${covered ? 'cover' : 'frame'}; })()`,
+                        returnByValue: true,
+                      },
+                    }),
+                  );
+                  return;
+                }
+              }
+              original.call(this, data);
+            },
+          );
+          try {
+            const refusal = await movingInspector.selectSignInControl(movingControl).then(
+              () => undefined,
+              (error: unknown) => error,
+            );
+            t.diagnostic(
+              `Moved control result: ${refusal instanceof Error ? `${refusal.name}: ${refusal.message}` : String(refusal)}; guard: ${String(Object(refusal).signInGuard)}; input: ${movingInputs.join(',')}.`,
+            );
+            assert.equal(mutationError, undefined);
+            assert.equal(moved, true);
+            if (covered) {
+              assert.equal(Object(refusal).signInGuard, 'control_covered');
+            } else {
+              assert.equal(refusal, undefined);
+              const deadline = Date.now() + 500;
+              while (received.length === beforeMove.length && Date.now() < deadline)
+                await delay(10);
+            }
+          } finally {
+            clearTimeout(mutationTimer);
+            sending.mock.restore();
+            t.diagnostic(
+              `Frame moved: ${moved}; covered: ${covered}; new submissions: ${received.length - beforeMove.length}.`,
+            );
+          }
+          assert.equal(moved, true);
+          assert.deepEqual(
+            movingInputs,
+            covered ? ['mouseMoved'] : ['mouseMoved', 'mousePressed', 'mouseReleased'],
+          );
+          assert.deepEqual(received, covered ? beforeMove : [...beforeMove, '/selected']);
+        } finally {
+          movingInspector.close();
+        }
+      }
+      const guards = failures.map((failure) => failure.context?.signInGuard);
+      for (const guard of [
+        'choice_duplicate',
+        'browser_unavailable',
+        'selection_missing',
+        'selection_origin_changed',
+        'document_changed',
+        'reference_missing',
+        'selector_rejected',
+        'control_changed',
+        'control_covered',
+        'frame_changed',
+      ])
+        assert.ok(guards.includes(guard), `The native report did not keep ${guard}.`);
+      assert.ok(!JSON.stringify(failures).includes('picker-private@example.test'));
     } finally {
       await worker.close();
       server.closeAllConnections();

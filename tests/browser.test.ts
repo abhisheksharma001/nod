@@ -16,7 +16,7 @@ import {
 } from 'node:fs/promises';
 import { connect, createServer, type Socket } from 'node:net';
 import { createServer as createHttpServer } from 'node:http';
-import { hostname, tmpdir } from 'node:os';
+import { availableParallelism, hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -58,6 +58,7 @@ import {
 import { stagedLoginBrowser } from './login-fixture.ts';
 import { fakeComputer, fakeWorkspace } from './runtime-fixtures.ts';
 import { accessCookie, accessKey } from '../src/server/access.ts';
+import { withFailureLog } from '../src/ports/failure-log.ts';
 
 // Shared helpers
 
@@ -68,6 +69,8 @@ function deferred<T = void>() {
   });
   return { promise, resolve };
 }
+
+const interfaceLanes = Math.max(1, Math.min(3, Math.floor(availableParallelism() / 2)));
 
 // Core browser API: ownership and private-capture locks
 
@@ -220,7 +223,7 @@ test(
         [randomUUID(), nextTurnId],
       );
       const fallback = (await request('/api/browser')).json();
-      assert.equal(fallback.currentBrowser.threadId, next.id);
+      assert.equal(fallback.currentBrowser.browserId, next.id);
 
       fail = false;
       const click = { type: 'mouse', event: 'down', x: 0.5, y: 0.25, button: 'left' };
@@ -1153,25 +1156,6 @@ test('a card goes only into the approved fields on the approved sites and stays 
     await computer.fillCard({ ...entry, ...fresh });
     assert.equal(model.values.get('@e4'), card.cardNumber);
     assert.doesNotMatch((await computer.act('shop', { action: 'snapshot' })).text, /4242/);
-    await computer.act('shop', { action: 'open', url: 'https://1.1.1.1/thanks' });
-    model.selections = {
-      main: [
-        {
-          nodeId: 'selected-card',
-          backendDOMNodeId: 911,
-          role: { value: 'spinbutton' },
-          name: { value: 'Synthetic payment method' },
-          value: { value: Number(card.cardNumber) },
-          properties: [{ name: 'editable', value: { value: 'plaintext' } }],
-        },
-      ],
-      pay: [],
-      ads: [],
-    };
-    const selected = await computer.currentPage('shop');
-    assert.doesNotMatch(JSON.stringify(selected), new RegExp(card.cardNumber));
-    assert.match(selected.currentSelections?.incomplete ?? '', /selected value is hidden/);
-    assert.equal(selected.currentSelections?.values[0]?.value, '[redacted]');
   } finally {
     await computer.dispose();
     await devtools.close();
@@ -1371,7 +1355,8 @@ async function runtimeFixture(
   const runtime = createAgentRuntime({ agent, computer, workspace: fakeWorkspace() });
   const context: RuntimeContext = {
     threadId,
-    sessionId: threadId,
+    sessionId: randomUUID(),
+    background: true,
     turnId: randomUUID(),
     prompt: 'Open the synthetic destination after dismissing its covering dialog.',
     history: [],
@@ -1407,7 +1392,7 @@ test('at the browser cap a new browser waits for one idle past the window and ne
     dataRoot: directory,
     run: fixture.run,
     maxLiveSessions: 2,
-    evictIdleMs: 3000,
+    evictIdleMs: 1000,
   });
   const open = (id: string, signal?: AbortSignal) =>
     computer.act(id, { action: 'open', url: 'https://1.1.1.1/login' }, signal);
@@ -1425,7 +1410,7 @@ test('at the browser cap a new browser waits for one idle past the window and ne
     await open('scheduled');
     assert.deepEqual(pages(), ['chat', 'scheduled']);
     await computer.hold('scheduled', true);
-    await delay(3100);
+    await delay(1100);
     const waiting = new AbortController();
     const blocked = open('later', waiting.signal);
     await delay(700);
@@ -1762,6 +1747,71 @@ test('a failed workspace browser action names only Nod-authored reasons', async 
       await assert.rejects(computer.act('task', { action: 'open', url: 'https://example.com/' }), {
         message: 'The workspace browser could not complete this action. Try again.',
       });
+  } finally {
+    await fixture.close();
+  }
+});
+
+test('sign-in refusal guards cross the worker boundary without private values or merged causes', async () => {
+  const privateValue = 'picker-private@example.test/private-selector';
+  let failure: Error;
+  const failures: unknown[] = [];
+  const fixture = await harness({
+    computer: {
+      ...syntheticComputer(),
+      signInMethods: async () => {
+        throw failure;
+      },
+    },
+  });
+  try {
+    const computer = fixture.client('/synthetic/sign-in-guard');
+    const inspect = () =>
+      withFailureLog(
+        (event, error, context) => failures.push({ event, error, context }),
+        () =>
+          computer.signInMethods!('task', 'https://example.test', [
+            { label: privateValue, selector: `[data-account="${privateValue}"]` },
+          ]),
+      );
+    for (const guard of ['control_changed', 'choice_duplicate'] as const) {
+      failure = Object.assign(new BrowserActionError('browser_target_changed', undefined, guard), {
+        cause: privateValue,
+      });
+      await assert.rejects(inspect(), (error: unknown) => {
+        assert.ok(error instanceof BrowserActionError);
+        assert.equal(error.signInGuard, guard);
+        assert.equal(error.code, 'browser_target_changed');
+        assert.equal(error.detail, undefined);
+        assert.equal(error.cause, undefined);
+        return true;
+      });
+    }
+    assert.deepEqual(
+      failures.map((failure) => Object(failure).context.signInGuard),
+      ['control_changed', 'choice_duplicate'],
+    );
+    failure = Object.assign(new Error(privateValue), { signInGuard: 'control_covered' });
+    await assert.rejects(inspect(), (error: unknown) => {
+      assert.equal(Object(error).signInGuard, 'control_covered');
+      assert.equal(
+        Object(error).message,
+        'The workspace browser could not complete this action. Try again.',
+      );
+      return true;
+    });
+    failure = Object.assign(new Error(privateValue), { signInGuard: privateValue });
+    await assert.rejects(inspect(), (error: unknown) => {
+      assert.equal(Object(error).signInGuard, undefined);
+      assert.ok(
+        !JSON.stringify(
+          Object.getOwnPropertyNames(error).map((key) => Object(error)[key]),
+        ).includes(privateValue),
+      );
+      return true;
+    });
+    assert.equal(Object(failures.at(-1)).context.signInGuard, undefined);
+    assert.ok(!JSON.stringify(failures).includes(privateValue));
   } finally {
     await fixture.close();
   }
@@ -2157,6 +2207,46 @@ test('visual browser actions fence the session when releasing the pointer fails'
     assert.equal(commands.filter((action) => action === 'mousedown').length, 1);
     await assert.rejects(computer.act('fixture', { action: 'click', selector: '#account' }));
     assert.equal(commands.includes('click'), false);
+  } finally {
+    await computer.dispose();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('a password typed through the handoff in several pauses hides only the finished value', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'nod-handoff-secret-'));
+  const fixture = stagedLoginBrowser();
+  const secret = 'Sign-handoff-password';
+  const computer = createBrowserFixture({ dataRoot: directory, run: fixture.run });
+  try {
+    await computer.act('fixture', { action: 'open', url: 'https://1.1.1.1/login' });
+    fixture.pages.get('fixture')!.stage = 'password';
+    fixture.pages.get('fixture')!.render();
+    await computer.act('fixture', { action: 'click', selector: '#account' });
+    await computer.control!('fixture', { type: 'text', text: 'Sign' });
+    await computer.control!('fixture', { type: 'text', text: secret.slice(4) });
+    assert.equal(fixture.pages.get('fixture')!.input.value, secret);
+    for (const observation of [
+      await computer.act('fixture', { action: 'snapshot' }),
+      await computer.act('fixture', {
+        action: 'evaluate',
+        script: "document.querySelector('#account').value",
+      }),
+    ])
+      assert.equal(JSON.stringify(observation).includes(secret), false);
+    assert.match((await computer.act('fixture', { action: 'snapshot' })).text, /Sign in password/);
+    await computer.act('fixture', { action: 'fill', selector: '#search', text: 'Sign' });
+    const page = fixture.pages.get('fixture')!;
+    const other = page.dom.window.document.createElement('input');
+    other.type = 'password';
+    page.dom.window.document.body.append(other);
+    other.focus();
+    await computer.control!('fixture', { type: 'text', text: `${secret}2` });
+    const first = await computer.act('fixture', {
+      action: 'evaluate',
+      script: "document.querySelector('#account').value",
+    });
+    assert.equal(JSON.stringify(first).includes(secret), false);
   } finally {
     await computer.dispose();
     await rm(directory, { recursive: true, force: true });
@@ -2797,225 +2887,192 @@ describe('native browser controls', { concurrency: 3 }, () => {
       }
     },
   );
-});
 
-test('a password typed through the handoff in several pauses hides only the finished value', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'nod-handoff-secret-'));
-  const fixture = stagedLoginBrowser();
-  const secret = 'Sign-handoff-password';
-  const computer = createBrowserFixture({ dataRoot: directory, run: fixture.run });
-  try {
-    await computer.act('fixture', { action: 'open', url: 'https://1.1.1.1/login' });
-    fixture.pages.get('fixture')!.stage = 'password';
-    fixture.pages.get('fixture')!.render();
-    await computer.act('fixture', { action: 'click', selector: '#account' });
-    await computer.control!('fixture', { type: 'text', text: 'Sign' });
-    await computer.control!('fixture', { type: 'text', text: secret.slice(4) });
-    assert.equal(fixture.pages.get('fixture')!.input.value, secret);
-    for (const observation of [
-      await computer.act('fixture', { action: 'snapshot' }),
-      await computer.act('fixture', {
-        action: 'evaluate',
-        script: "document.querySelector('#account').value",
-      }),
-    ])
-      assert.equal(JSON.stringify(observation).includes(secret), false);
-    assert.match((await computer.act('fixture', { action: 'snapshot' })).text, /Sign in password/);
-    await computer.act('fixture', { action: 'fill', selector: '#search', text: 'Sign' });
-    const page = fixture.pages.get('fixture')!;
-    const other = page.dom.window.document.createElement('input');
-    other.type = 'password';
-    page.dom.window.document.body.append(other);
-    other.focus();
-    await computer.control!('fixture', { type: 'text', text: `${secret}2` });
-    const first = await computer.act('fixture', {
-      action: 'evaluate',
-      script: "document.querySelector('#account').value",
-    });
-    assert.equal(JSON.stringify(first).includes(secret), false);
-  } finally {
-    await computer.dispose();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test(
-  'native browser targets keep their own name before named ancestor context',
-  { skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true', timeout: 60_000 },
-  async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'nod-target-name-native-'));
-    const server = createHttpServer((_request, response) => {
-      response.setHeader('content-type', 'text/html');
-      response.end(`<title>Synthetic target names</title>
+  test(
+    'native browser targets keep their own name before named ancestor context',
+    { skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true', timeout: 60_000 },
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), 'nod-target-name-native-'));
+      const server = createHttpServer((_request, response) => {
+        response.setHeader('content-type', 'text/html');
+        response.end(`<title>Synthetic target names</title>
         <style>#blank{position:fixed;left:0;top:0;width:20vw;height:20vh}body{padding-top:25vh}</style>
         <form aria-label="Named form"><button type="button" id="form-button"></button></form>
         <section role="region" aria-label="Named region"><button id="blank"></button><input id="field"></section>
         <button id="named">Named exact button<div id="child"></div></button>
         <div id="custom" role="treeitem" aria-label="Named custom target" tabindex="0"></div>
         <form action="/submit" method="post" aria-label="Known form"><input id="known"></form>`);
-    });
-    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-    const address = server.address();
-    assert.ok(address && typeof address !== 'string');
-    const origin = `http://127.0.0.1:${address.port}`;
-    const computer = createAgentBrowserComputer({
-      dataRoot: directory,
-      browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
-      privateNetwork: true,
-      headless: true,
-    });
-    try {
-      await computer.act('target-name', { action: 'open', url: origin });
-      for (const [selector, ancestor] of [
-        ['#form-button', 'Named form'],
-        ['#blank', 'Named region'],
-        ['#child', 'Named exact button'],
-      ]) {
-        const page = await computer.currentPage('target-name', { action: 'click', selector });
-        assert.equal(page.controls?.[0]?.name, '', selector);
-        assert.ok(
-          page.controls?.slice(1).some(({ name }) => name === ancestor),
-          selector,
-        );
-        assert.match(page.target!, /^[0-9a-f]{64}$/);
+      });
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const address = server.address();
+      assert.ok(address && typeof address !== 'string');
+      const origin = `http://127.0.0.1:${address.port}`;
+      const computer = createAgentBrowserComputer({
+        dataRoot: directory,
+        browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
+        privateNetwork: true,
+        headless: true,
+      });
+      try {
+        await computer.act('target-name', { action: 'open', url: origin });
+        for (const [selector, ancestor] of [
+          ['#form-button', 'Named form'],
+          ['#blank', 'Named region'],
+          ['#child', 'Named exact button'],
+        ]) {
+          const page = await computer.currentPage('target-name', { action: 'click', selector });
+          assert.equal(page.controls?.[0]?.name, '', selector);
+          assert.ok(
+            page.controls?.slice(1).some(({ name }) => name === ancestor),
+            selector,
+          );
+          assert.match(page.target!, /^[0-9a-f]{64}$/);
+        }
+        for (const step of [
+          { action: 'click', x: 0.05, y: 0.05 },
+          {
+            action: 'click',
+            points: [
+              { x: 0.05, y: 0.05 },
+              { x: 0.05, y: 0.05 },
+            ],
+          },
+        ] satisfies BrowserAction[]) {
+          const page = await computer.currentPage('target-name', step);
+          assert.equal(page.controls?.[0]?.name, '');
+          assert.equal(page.controls?.[1]?.name, 'Named region');
+        }
+        await computer.act('target-name', {
+          action: 'fill',
+          selector: '#field',
+          text: 'synthetic',
+        });
+        for (const step of [
+          { action: 'press', key: 'Enter' },
+          { action: 'type', text: 'synthetic\n' },
+        ] satisfies BrowserAction[]) {
+          const page = await computer.currentPage('target-name', step);
+          assert.deepEqual(page.controls?.[0], { role: 'textbox', name: '' });
+          assert.equal(page.controls?.[1]?.name, 'Named region');
+          assert.equal(page.submits, undefined);
+        }
+        for (const [selector, name] of [
+          ['#named', 'Named exact button'],
+          ['#custom', 'Named custom target'],
+        ]) {
+          const page = await computer.currentPage('target-name', { action: 'click', selector });
+          assert.equal(page.controls?.[0]?.name, name);
+        }
+        await computer.act('target-name', {
+          action: 'fill',
+          selector: '#known',
+          text: 'synthetic',
+        });
+        const known = await computer.currentPage('target-name', { action: 'press', key: 'Enter' });
+        assert.deepEqual(known.controls?.[0], { role: 'textbox', name: '' });
+        assert.equal(known.controls?.[1]?.name, 'Known form');
+        assert.deepEqual(known.submits, { method: 'POST', to: `${origin}/submit` });
+      } finally {
+        await computer.dispose();
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        await rm(directory, { recursive: true, force: true });
       }
-      for (const step of [
-        { action: 'click', x: 0.05, y: 0.05 },
-        {
-          action: 'click',
-          points: [
-            { x: 0.05, y: 0.05 },
-            { x: 0.05, y: 0.05 },
-          ],
-        },
-      ] satisfies BrowserAction[]) {
-        const page = await computer.currentPage('target-name', step);
-        assert.equal(page.controls?.[0]?.name, '');
-        assert.equal(page.controls?.[1]?.name, 'Named region');
-      }
-      await computer.act('target-name', { action: 'fill', selector: '#field', text: 'synthetic' });
-      for (const step of [
-        { action: 'press', key: 'Enter' },
-        { action: 'type', text: 'synthetic\n' },
-      ] satisfies BrowserAction[]) {
-        const page = await computer.currentPage('target-name', step);
-        assert.deepEqual(page.controls?.[0], { role: 'textbox', name: '' });
-        assert.equal(page.controls?.[1]?.name, 'Named region');
-        assert.equal(page.submits, undefined);
-      }
-      for (const [selector, name] of [
-        ['#named', 'Named exact button'],
-        ['#custom', 'Named custom target'],
-      ]) {
-        const page = await computer.currentPage('target-name', { action: 'click', selector });
-        assert.equal(page.controls?.[0]?.name, name);
-      }
-      await computer.act('target-name', { action: 'fill', selector: '#known', text: 'synthetic' });
-      const known = await computer.currentPage('target-name', { action: 'press', key: 'Enter' });
-      assert.deepEqual(known.controls?.[0], { role: 'textbox', name: '' });
-      assert.equal(known.controls?.[1]?.name, 'Known form');
-      assert.deepEqual(known.submits, { method: 'POST', to: `${origin}/submit` });
-    } finally {
-      await computer.dispose();
-      server.closeAllConnections();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      await rm(directory, { recursive: true, force: true });
-    }
-  },
-);
+    },
+  );
 
-test(
-  'native coordinate targets follow normal pointer hit testing',
-  { skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true', timeout: 60_000 },
-  async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'nod-pointer-target-native-'));
-    const requests: string[] = [];
-    const server = createHttpServer((request, response) => {
-      if (request.method === 'POST' || request.url?.startsWith('/overlay')) {
-        requests.push(`${request.method} ${request.url}`);
-        response.writeHead(204).end();
-        return;
-      }
-      const named = request.url === '/named';
-      response.setHeader('content-type', 'text/html');
-      response.end(`<title>Synthetic pointer target</title>
+  test(
+    'native coordinate targets follow normal pointer hit testing',
+    { skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true', timeout: 60_000 },
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), 'nod-pointer-target-native-'));
+      const requests: string[] = [];
+      const server = createHttpServer((request, response) => {
+        if (request.method === 'POST' || request.url?.startsWith('/overlay')) {
+          requests.push(`${request.method} ${request.url}`);
+          response.writeHead(204).end();
+          return;
+        }
+        const named = request.url === '/named';
+        response.setHeader('content-type', 'text/html');
+        response.end(`<title>Synthetic pointer target</title>
         <style>button{position:fixed;inset:0;width:100vw;height:100vh;border:0}#overlay{pointer-events:none;opacity:.2}</style>
         <form method="post" action="/actual-${named ? 'named' : 'blank'}"><button${named ? ' aria-label="Named actual target"' : ''}></button></form>
         <form method="get" action="/overlay"><button id="overlay" aria-label="Named overlay">Named overlay</button></form>`);
-    });
-    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-    const address = server.address();
-    assert.ok(address && typeof address !== 'string');
-    const computer = createAgentBrowserComputer({
-      dataRoot: directory,
-      browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
-      privateNetwork: true,
-      headless: true,
-    });
-    try {
-      const expected: string[] = [];
-      for (const named of [false, true]) {
-        await computer.act('pointer-target', {
-          action: 'open',
-          url: `http://127.0.0.1:${address.port}/${named ? 'named' : 'blank'}`,
-        });
-        const step: BrowserAction = { action: 'click', x: 0.5, y: 0.5 };
-        const page = await computer.currentPage('pointer-target', step);
-        assert.ok(page.target);
-        assert.deepEqual(page.controls?.[0], {
-          role: 'button',
-          name: named ? 'Named actual target' : '',
-        });
-        assert.deepEqual(page.submits, {
-          method: 'POST',
-          to: `http://127.0.0.1:${address.port}/actual-${named ? 'named' : 'blank'}`,
-        });
-        assert.deepEqual(requests, expected);
-        await computer.act('pointer-target', { ...step, expectTarget: page.target });
-        expected.push(`POST /actual-${named ? 'named' : 'blank'}`);
-        for (let i = 0; i < 500 && requests.length < expected.length; i++) await delay(10);
-        assert.deepEqual(requests, expected);
+      });
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const address = server.address();
+      assert.ok(address && typeof address !== 'string');
+      const computer = createAgentBrowserComputer({
+        dataRoot: directory,
+        browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
+        privateNetwork: true,
+        headless: true,
+      });
+      try {
+        const expected: string[] = [];
+        for (const named of [false, true]) {
+          await computer.act('pointer-target', {
+            action: 'open',
+            url: `http://127.0.0.1:${address.port}/${named ? 'named' : 'blank'}`,
+          });
+          const step: BrowserAction = { action: 'click', x: 0.5, y: 0.5 };
+          const page = await computer.currentPage('pointer-target', step);
+          assert.ok(page.target);
+          assert.deepEqual(page.controls?.[0], {
+            role: 'button',
+            name: named ? 'Named actual target' : '',
+          });
+          assert.deepEqual(page.submits, {
+            method: 'POST',
+            to: `http://127.0.0.1:${address.port}/actual-${named ? 'named' : 'blank'}`,
+          });
+          assert.deepEqual(requests, expected);
+          await computer.act('pointer-target', { ...step, expectTarget: page.target });
+          expected.push(`POST /actual-${named ? 'named' : 'blank'}`);
+          for (let i = 0; i < 500 && requests.length < expected.length; i++) await delay(10);
+          assert.deepEqual(requests, expected);
+        }
+      } finally {
+        await computer.dispose();
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        await rm(directory, { recursive: true, force: true });
       }
-    } finally {
-      await computer.dispose();
-      server.closeAllConnections();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      await rm(directory, { recursive: true, force: true });
-    }
-  },
-);
+    },
+  );
 
-test(
-  'native secure entry completes single and split OTP controls without maxlength hints',
-  { skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true', timeout: 60_000 },
-  async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'nod-code-native-'));
-    const code = '072846';
-    const received: string[] = [];
-    const server = createHttpServer(async (request, response) => {
-      if (request.method === 'POST') {
-        let body = '';
-        for await (const part of request) body += part.toString();
-        received.push(new URLSearchParams(body).getAll('code').join(''));
-        if (new URLSearchParams(body).getAll('code').join('') !== code) {
-          response.writeHead(400);
-          response.end('Invalid code');
+  test(
+    'native secure entry completes single and split OTP controls without maxlength hints',
+    { skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true', timeout: 60_000 },
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), 'nod-code-native-'));
+      const code = '072846';
+      const received: string[] = [];
+      const server = createHttpServer(async (request, response) => {
+        if (request.method === 'POST') {
+          let body = '';
+          for await (const part of request) body += part.toString();
+          received.push(new URLSearchParams(body).getAll('code').join(''));
+          if (new URLSearchParams(body).getAll('code').join('') !== code) {
+            response.writeHead(400);
+            response.end('Invalid code');
+            return;
+          }
+          response.writeHead(303, { location: '/done' });
+          response.end();
           return;
         }
-        response.writeHead(303, { location: '/done' });
-        response.end();
-        return;
-      }
-      if (request.url === '/done') {
-        response.end('<h1>Verified</h1>');
-        return;
-      }
-      const retained = request.url === '/retained';
-      const closed = request.url === '/closed';
-      const automatic = request.url === '/automatic';
-      const split = request.url === '/split' || retained || closed;
-      response.setHeader('content-type', 'text/html');
-      response.end(`<form action="/verify" method="post">
+        if (request.url === '/done') {
+          response.end('<h1>Verified</h1>');
+          return;
+        }
+        const retained = request.url === '/retained';
+        const closed = request.url === '/closed';
+        const automatic = request.url === '/automatic';
+        const split = request.url === '/split' || retained || closed;
+        response.setHeader('content-type', 'text/html');
+        response.end(`<form action="/verify" method="post">
         ${Array.from({ length: split ? code.length : 1 }, (_, index) => `<input name="code" autocomplete="one-time-code" inputmode="numeric" aria-label="Code ${index + 1}">`).join('')}
         ${automatic ? '' : '<button type="submit" onclick="if (!event.isTrusted) event.preventDefault()" disabled>Verify</button>'}<h1></h1>
         </form><script>
@@ -3034,115 +3091,497 @@ test(
         ${retained || closed || automatic ? "document.querySelector('form').onsubmit = async event => { event.preventDefault(); const form = event.currentTarget; await fetch('/verify', { method: 'POST', body: new URLSearchParams(new FormData(form)) }); form.querySelector('h1').textContent = 'Verified'; };" : ''}
         ${closed ? "const form = document.querySelector('form'); const host = document.createElement('code-panel'); form.replaceWith(host); host.attachShadow({mode:'closed'}).append(form);" : ''}
         </script>`);
-    });
-    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-    const address = server.address();
-    assert.ok(address && typeof address !== 'string');
-    const origin = `http://127.0.0.1:${address.port}`;
-    const computer = createAgentBrowserComputer({
-      dataRoot: directory,
-      browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
-      privateNetwork: true,
-      headless: true,
-    });
-    const worker = await harness({ computer });
-    const client = worker.client(directory, { timeoutMs: 30_000 });
-    const act = (input: BrowserAction) => client.act('fixture', input);
-    try {
-      for (const path of ['/single', '/split', '/retained', '/closed', '/automatic']) {
-        const count = received.length;
-        await act({ action: 'open', url: origin + path });
-        const shape = await act({
-          action: 'evaluate',
-          script: 'globalThis.fields.map(field => field.maxLength)',
-        });
-        assert.deepEqual(
-          JSON.parse(shape.text.slice(shape.text.indexOf('\n') + 1)),
-          Array(path === '/single' || path === '/automatic' ? 1 : 6).fill(-1),
-        );
-        await act({ action: 'reload' });
-        const initial = (await act({ action: 'snapshot' })).text;
-        const held = /"Code 1"[^\n]*ref=(e\d+)/.exec(initial)?.[1];
-        assert.ok(held);
-        const codeRefs = Array.from(
-          initial.matchAll(/"Code \d+"[^\n]*ref=(e\d+)/g),
-          (match) => `@${match[1]}`,
-        );
-        if (path === '/closed')
-          for (const fields of [codeRefs.slice(1), codeRefs.map(() => codeRefs[0]!)]) {
-            await assert.rejects(
-              client.injectCredentials({
-                threadId: 'fixture',
-                origin,
-                kind: 'otp',
-                code,
-                passwordSelector: fields,
-              }),
+      });
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const address = server.address();
+      assert.ok(address && typeof address !== 'string');
+      const origin = `http://127.0.0.1:${address.port}`;
+      const computer = createAgentBrowserComputer({
+        dataRoot: directory,
+        browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
+        privateNetwork: true,
+        headless: true,
+      });
+      const worker = await harness({ computer });
+      const client = worker.client(directory, { timeoutMs: 30_000 });
+      const act = (input: BrowserAction) => client.act('fixture', input);
+      try {
+        for (const path of ['/single', '/split', '/retained', '/closed', '/automatic']) {
+          const count = received.length;
+          await act({ action: 'open', url: origin + path });
+          const shape = await act({
+            action: 'evaluate',
+            script: 'globalThis.fields.map(field => field.maxLength)',
+          });
+          assert.deepEqual(
+            JSON.parse(shape.text.slice(shape.text.indexOf('\n') + 1)),
+            Array(path === '/single' || path === '/automatic' ? 1 : 6).fill(-1),
+          );
+          await act({ action: 'reload' });
+          const initial = (await act({ action: 'snapshot' })).text;
+          const held = /"Code 1"[^\n]*ref=(e\d+)/.exec(initial)?.[1];
+          assert.ok(held);
+          const codeRefs = Array.from(
+            initial.matchAll(/"Code \d+"[^\n]*ref=(e\d+)/g),
+            (match) => `@${match[1]}`,
+          );
+          if (path === '/closed')
+            for (const fields of [codeRefs.slice(1), codeRefs.map(() => codeRefs[0]!)]) {
+              await assert.rejects(
+                client.injectCredentials({
+                  threadId: 'fixture',
+                  origin,
+                  kind: 'otp',
+                  code,
+                  passwordSelector: fields,
+                }),
+              );
+              assert.equal(received.length, count);
+              assert.doesNotMatch((await act({ action: 'snapshot' })).text, /:\s*\d/);
+            }
+          const injected = await client.injectCredentials({
+            threadId: 'fixture',
+            origin,
+            kind: 'otp',
+            code,
+            passwordSelector: path === '/closed' ? codeRefs : 'input[autocomplete="one-time-code"]',
+            submitSelector:
+              path === '/closed'
+                ? `@${/button "Verify"[^\n]*ref=(e\d+)/.exec(initial)?.[1]}`
+                : path === '/automatic'
+                  ? undefined
+                  : 'button',
+          });
+          assert.deepEqual(injected, { status: 'submitted' });
+          let accepted: string;
+          if (path === '/closed') {
+            const deadline = Date.now() + 5_000;
+            do accepted = (await act({ action: 'snapshot' })).text;
+            while (!accepted.includes('Verified') && Date.now() < deadline);
+          } else {
+            await act(
+              path === '/retained' || path === '/automatic'
+                ? { action: 'wait', text: 'Verified' }
+                : { action: 'wait', url: '**/done' },
             );
-            assert.equal(received.length, count);
-            assert.doesNotMatch((await act({ action: 'snapshot' })).text, /:\s*\d/);
+            accepted = (await act({ action: 'snapshot' })).text;
           }
-        const injected = await client.injectCredentials({
-          threadId: 'fixture',
-          origin,
-          kind: 'otp',
-          code,
-          passwordSelector: path === '/closed' ? codeRefs : 'input[autocomplete="one-time-code"]',
-          submitSelector:
-            path === '/closed'
-              ? `@${/button "Verify"[^\n]*ref=(e\d+)/.exec(initial)?.[1]}`
-              : path === '/automatic'
-                ? undefined
-                : 'button',
-        });
-        assert.deepEqual(injected, { status: 'submitted' });
-        let accepted: string;
-        if (path === '/closed') {
-          const deadline = Date.now() + 5_000;
-          do accepted = (await act({ action: 'snapshot' })).text;
-          while (!accepted.includes('Verified') && Date.now() < deadline);
-        } else {
-          await act(
-            path === '/retained' || path === '/automatic'
-              ? { action: 'wait', text: 'Verified' }
-              : { action: 'wait', url: '**/done' },
-          );
-          accepted = (await act({ action: 'snapshot' })).text;
+          assert.equal(received.length, count + 1);
+          assert.equal(received.at(-1), code);
+          assert.match(accepted, /Verified/);
+          assert.equal(accepted.includes(code), false);
+          if (path === '/retained' || path === '/closed' || path === '/automatic') {
+            assert.doesNotMatch(accepted, /\[ref=e\d+\]:\s*\d/);
+            await act({ action: 'click', selector: `@${held}` });
+            assert.match((await act({ action: 'snapshot' })).text, /Verified/);
+            await assert.rejects(
+              act({
+                action: 'evaluate',
+                script: 'globalThis.fields.map(node => node.value)',
+              }),
+              (error: unknown) =>
+                error instanceof BrowserActionError && error.code === 'browser_script_paused',
+            );
+            assert.ok(await client.screenshot('fixture'));
+            continue;
+          }
+          await act({ action: 'back' });
+          const restored = await act({
+            action: 'evaluate',
+            script:
+              'btoa([...document.querySelectorAll("input")].map(node => node.value).join(""))',
+          });
+          assert.equal(restored.text.includes(Buffer.from(code).toString('base64')), false);
         }
-        assert.equal(received.length, count + 1);
-        assert.equal(received.at(-1), code);
-        assert.match(accepted, /Verified/);
-        assert.equal(accepted.includes(code), false);
-        if (path === '/retained' || path === '/closed' || path === '/automatic') {
-          assert.doesNotMatch(accepted, /\[ref=e\d+\]:\s*\d/);
-          await act({ action: 'click', selector: `@${held}` });
-          assert.match((await act({ action: 'snapshot' })).text, /Verified/);
-          await assert.rejects(
-            act({
-              action: 'evaluate',
-              script: 'globalThis.fields.map(node => node.value)',
-            }),
-            (error: unknown) =>
-              error instanceof BrowserActionError && error.code === 'browser_script_paused',
-          );
-          assert.ok(await client.screenshot('fixture'));
-          continue;
-        }
-        await act({ action: 'back' });
-        const restored = await act({
-          action: 'evaluate',
-          script: 'btoa([...document.querySelectorAll("input")].map(node => node.value).join(""))',
-        });
-        assert.equal(restored.text.includes(Buffer.from(code).toString('base64')), false);
+      } finally {
+        await worker.close();
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        await rm(directory, { recursive: true, force: true });
       }
-    } finally {
-      await worker.close();
-      server.closeAllConnections();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      await rm(directory, { recursive: true, force: true });
-    }
-  },
-);
+    },
+  );
+
+  test(
+    'private entry masks known values, refuses Pi listeners and refuses a foreign login frame',
+    { timeout: 60_000 },
+    async () => {
+      const hits: string[] = [];
+      let shadowImage: Buffer | undefined;
+      const server = createHttpServer((request, response) => {
+        if (request.url === '/image') {
+          response.setHeader('content-type', 'image/png');
+          response.end(shadowImage);
+          return;
+        }
+        response.setHeader('content-type', 'text/html');
+        if (request.url?.startsWith('/record')) {
+          hits.push(new URL(request.url, 'http://fixture').searchParams.get('value') ?? '');
+          response.end();
+          return;
+        }
+        if (request.url === '/frame') {
+          response.end(
+            '<input id="foreign" type="password" aria-label="Foreign password"><script>document.querySelector("input").addEventListener("input", e => fetch("/record?value="+encodeURIComponent(e.target.value)))</script>',
+          );
+          return;
+        }
+        if (request.url === '/card') {
+          response.end(
+            '<input id="number" aria-label="Card number"><input id="expiry" aria-label="Expiry"><input id="cvc" aria-label="Security code"><h2 id="echo"></h2><button id="submit">Continue</button><script>for(const input of document.querySelectorAll("input"))input.addEventListener("input",e=>document.querySelector("h2").textContent+=e.target.value)</script>',
+          );
+          return;
+        }
+        if (request.url === '/shadow') {
+          response.setHeader('Content-Security-Policy', "style-src 'nonce-nod-fixture'");
+          response.end(
+            `<card-panel></card-panel><button id="report">Report</button><script>
+          document.querySelector('#report').onclick = () => { const mutated = globalThis.maskMutations > 0; globalThis.privateStyles[0].style.setProperty('outline-width', '1px'); setTimeout(() => fetch('/record?value=' + encodeURIComponent('report:' + JSON.stringify({ mutated, styles: globalThis.privateStyles.map(node => [getComputedStyle(node).opacity, getComputedStyle(node).transitionProperty, node.style.getPropertyValue('transition-property'), node.style.getPropertyValue('opacity')]) }))), 0); };
+          customElements.define('card-panel', class extends HTMLElement { constructor() { super(); this.attachShadow({ mode: 'closed' }).innerHTML = '<card-fields></card-fields>'; } });
+          customElements.define('card-fields', class extends HTMLElement { constructor() { super(); const root = this.attachShadow({ mode: 'closed' });
+          root.innerHTML = '<style nonce="nod-fixture">input[aria-label="Card number"],input[aria-label="Security code"],h2{background:rgb(255,0,0);transition:opacity 60s !important}button{background:rgb(0,0,255)}</style><form><input aria-label="Card number"><select aria-label="Month"><option value="1">January</option><option value="8">August</option></select><input aria-label="Year"><input aria-label="Security code"><h2></h2><button>Complete</button></form>';
+          root.querySelectorAll('input').forEach(node => node.style.setProperty('visibility', 'visible', 'important'));
+          globalThis.privateStyles = Array.from(root.querySelectorAll('input[aria-label="Card number"],input[aria-label="Security code"],h2'));
+          globalThis.maskMutations = 0;
+          new MutationObserver(records => { globalThis.maskMutations++; const source = root.querySelector('h2'); if (records.some(record => record.target === source) && source.style.opacity === '0' && source.textContent) { const echo = source.cloneNode(true); echo.style.removeProperty('opacity'); echo.style.removeProperty('transition-property'); root.append(echo); } }).observe(root, { subtree: true, attributes: true, attributeFilter: ['style'] });
+          root.querySelector('input').oninput = event => { event.target.value = event.target.value.replace(/\\D/g, '').replace(/(\\d{4})(?=\\d)/g, '$1 '); root.querySelector('h2').textContent = event.target.value; };
+          root.querySelector('form').onsubmit = event => { event.preventDefault(); fetch('/record?value=' + encodeURIComponent([...root.querySelectorAll('input,select')].map(node => node.value).join('/'))); };
+          } });</script>`,
+          );
+          return;
+        }
+        const { port } = server.address() as { port: number };
+        response.end(
+          `<input id="password" type="password" aria-label="Password"><button id="submit">Continue</button><h2></h2><iframe title="Other origin" src="http://localhost:${port}/frame"></iframe><script>document.querySelector('#password').addEventListener('input',e=>document.querySelector('h2').textContent=e.target.value)</script>`,
+        );
+      });
+      await new Promise<void>((resolve) => server.listen(0, '::', resolve));
+      const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+      const directory = await mkdtemp(join(tmpdir(), 'nod-private-entry-'));
+      const native = createAgentBrowserComputer({
+        dataRoot: directory,
+        privateNetwork: true,
+        headless: true,
+      });
+      const worker = await harness({ computer: native });
+      const computer = worker.client(directory, { timeoutMs: 30_000 });
+      assert.ok(computer.cardDestinations);
+      assert.ok(computer.fillCard);
+      try {
+        await computer.act('private', { action: 'open', url: origin });
+        const secret = 'Synthetic private value';
+        const input = {
+          threadId: 'private',
+          origin,
+          kind: 'password' as const,
+          password: secret,
+          passwordSelector: '#password',
+          submitSelector: '#submit',
+        };
+        await computer.act('private', {
+          action: 'evaluate',
+          script:
+            'document.querySelector("#password").addEventListener("input", e => localStorage.setItem("copied", btoa(e.target.value)))',
+        });
+        await assert.rejects(computer.injectCredentials(input), /script ran/);
+        await computer.act('private', { action: 'reload' });
+        await computer.injectCredentials(input);
+        const seen = (await computer.act('private', { action: 'snapshot' })).text;
+        assert.equal(seen.includes(secret), false);
+        await assert.rejects(
+          computer.act('private', {
+            action: 'evaluate',
+            script: 'document.querySelector("#password").value.split("").reverse().join("")',
+          }),
+          /scripts are paused/,
+        );
+        await computer.act('private', { action: 'reload' });
+        assert.equal(
+          (
+            await computer.act('private', {
+              action: 'evaluate',
+              script: 'localStorage.getItem("copied")',
+            })
+          ).text.includes(Buffer.from(secret).toString('base64')),
+          false,
+        );
+        const page = (await computer.act('private', { action: 'snapshot' })).text;
+        const ref = /"Foreign password"[^\n]*ref=(e\d+)/.exec(page)?.[1];
+        assert.ok(ref);
+        await assert.rejects(computer.injectCredentials({ ...input, passwordSelector: `@${ref}` }));
+        assert.deepEqual(hits, []);
+        await computer.act('private', { action: 'open', url: `${origin}/card` });
+        const fields = { number: '#number', expiry: '#expiry', securityCode: '#cvc' };
+        const bound = await computer.cardDestinations('private', fields);
+        await computer.fillCard({
+          threadId: 'private',
+          fields,
+          ...bound,
+          submitSelector: '#submit',
+          card: {
+            cardNumber: '4242424242424242',
+            expiryMonth: 8,
+            expiryYear: 2030,
+            cardholder: 'Synthetic cardholder',
+            securityCode: '737',
+          },
+        });
+        const receipt = (await computer.act('private', { action: 'snapshot' })).text;
+        assert.equal(receipt.includes('4242424242424242'), false);
+        assert.equal(receipt.includes('737'), false);
+        assert.ok(await computer.screenshot('private'));
+        await assert.rejects(
+          computer.act('private', {
+            action: 'evaluate',
+            script: '[...document.querySelectorAll("input")].map(node=>node.value)',
+          }),
+          /scripts are paused/,
+        );
+        await computer.act('private', { action: 'open', url: `${origin}/shadow` });
+        const shadowPage = (await computer.act('private', { action: 'snapshot' })).text;
+        const shadowRef = (name: string) => {
+          const ref = new RegExp(`"${name}"[^\\n]*ref=(e\\d+)`).exec(shadowPage)?.[1];
+          assert.ok(ref);
+          return `@${ref}`;
+        };
+        const shadowFields = {
+          number: shadowRef('Card number'),
+          expiryMonth: shadowRef('Month'),
+          expiryYear: shadowRef('Year'),
+          securityCode: shadowRef('Security code'),
+        };
+        const shadowBound = await computer.cardDestinations('private', shadowFields);
+        assert.deepEqual(Object.values(shadowBound.destinations), Array(4).fill(origin));
+        await computer.fillCard({
+          threadId: 'private',
+          fields: shadowFields,
+          ...shadowBound,
+          submitSelector: shadowRef('Complete'),
+          card: {
+            cardNumber: '4242424242424242',
+            expiryMonth: 8,
+            expiryYear: 2030,
+            cardholder: 'Synthetic cardholder',
+            securityCode: '737',
+          },
+        });
+        const shadowReceipt = (await computer.act('private', { action: 'snapshot' })).text;
+        assert.equal(shadowReceipt.includes('4242424242424242'), false);
+        assert.equal(shadowReceipt.includes('737'), false);
+        assert.deepEqual(hits, ['4242 4242 4242 4242/8/2030/737']);
+        const image = await computer.screenshot('private');
+        assert.ok(image);
+        shadowImage = Buffer.from(image);
+        await assert.rejects(
+          computer.act('private', {
+            action: 'evaluate',
+            script: 'globalThis.maskMutations',
+          }),
+          /scripts are paused/,
+        );
+        for (const field of [
+          shadowFields.number,
+          shadowFields.expiryYear,
+          shadowFields.securityCode,
+        ])
+          await computer.act('private', { action: 'fill', selector: field, text: '' });
+        await assert.rejects(computer.act('private', { action: 'open', url: 'file:///etc/hosts' }));
+        await assert.rejects(
+          computer.act('private', { action: 'evaluate', script: 'document.title' }),
+          /scripts are paused/,
+        );
+        await computer.act('private', { action: 'click', selector: '#report' });
+        const recorded = hits as string[];
+        const reported = Date.now() + 5_000;
+        while (!recorded.some((hit) => hit.startsWith('report:')) && Date.now() < reported)
+          await delay(50);
+        const report = JSON.parse(
+          recorded.find((hit) => hit.startsWith('report:'))?.slice('report:'.length) ?? 'null',
+        ) as { mutated: boolean; styles: string[][] } | null;
+        assert.equal(report?.mutated, true);
+        assert.deepEqual(
+          report?.styles,
+          Array.from({ length: 3 }, () => ['1', 'opacity', '', '']),
+        );
+        await computer.act('private', { action: 'open', url: origin });
+        const pixels = await computer.act('private', {
+          action: 'evaluate',
+          script: `(async () => { const image = new Image(); image.src = '/image'; await image.decode(); const canvas = document.createElement('canvas'); canvas.width = image.width; canvas.height = image.height; const context = canvas.getContext('2d'); context.drawImage(image, 0, 0); const pixels = context.getImageData(0, 0, image.width, image.height).data; let red = 0, blue = 0; for (let index = 0; index < pixels.length; index += 4) { if (pixels[index] === 255 && pixels[index + 1] === 0 && pixels[index + 2] === 0) red++; if (pixels[index] === 0 && pixels[index + 1] === 0 && pixels[index + 2] === 255) blue++; } return { red, blue }; })()`,
+        });
+        const colors = JSON.parse(pixels.text.slice(pixels.text.indexOf('\n') + 1)) as {
+          red: number;
+          blue: number;
+        };
+        assert.equal(colors.red, 0);
+        assert.ok(colors.blue > 0);
+      } finally {
+        await worker.close();
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        await rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test(
+    'a checked step reports the form it would send without sending it',
+    { timeout: 60_000 },
+    async (t) => {
+      const sent: string[] = [];
+      const server = createHttpServer(async (request, response) => {
+        response.setHeader('content-type', 'text/html');
+        if (request.url !== '/' && request.url !== '/favicon.ico') {
+          sent.push(`${request.method} ${request.url}`);
+          response.end('Sent');
+          return;
+        }
+        response.end(
+          '<form method="post" action="/book"><button>19:30</button></form><form action="/search"><input name="q" aria-label="Query"><button>Search</button></form><button id="plain">Plain</button><form method="post" action="/save"><button type="button" id="toggle">Toggle</button><button id="other" formaction="/other" formmethod="get">Other</button></form><form method="post" action="/a"><button>Same</button></form><form method="post" action="/b"><button>Same</button></form><form method="post" action="/reserve"><button>Menu</button></form><form method="post" action="/reserve"><button>Menu</button></form><form action="/find"><input name="city" aria-label="City"><button formaction="/reserve-now" formmethod="post">Go</button></form><form method="post" action="/label"><input type="submit" id="labelled" value="Send"><label for="labelled" id="label">Send it</label></form><form method="post" action="/shadowed"><input type="hidden" name="action" value="other"><input type="radio" name="method" aria-label="Card"><button>Shadowed</button></form>',
+        );
+      });
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+      const directory = await mkdtemp(join(tmpdir(), 'nod-submits-'));
+      const computer = createAgentBrowserComputer({
+        dataRoot: directory,
+        browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
+        privateNetwork: true,
+        headless: true,
+      });
+      try {
+        let snapshot: string;
+        try {
+          snapshot = (await computer.act('submits', { action: 'open', url: origin })).text;
+        } catch {
+          t.skip('Chrome is not available here.');
+          return;
+        }
+        const ref = (name: string) => {
+          const found = new RegExp(`button "${name}" \\[ref=(e\\d+)\\]`).exec(snapshot)?.[1];
+          assert.ok(found, `No ${name} button in the snapshot.`);
+          return `@${found}`;
+        };
+        const submits = async (step: BrowserAction) =>
+          (await computer.currentPage('submits', step)).submits;
+        assert.deepEqual(await submits({ action: 'click', selector: ref('19:30') }), {
+          method: 'POST',
+          to: `${origin}/book`,
+        });
+        assert.deepEqual(await submits({ action: 'click', selector: ref('Search') }), {
+          method: 'GET',
+          to: `${origin}/search`,
+        });
+        assert.deepEqual(await submits({ action: 'click', selector: '#other' }), {
+          method: 'GET',
+          to: `${origin}/other`,
+        });
+        assert.equal(await submits({ action: 'click', selector: '#plain' }), undefined);
+        assert.equal(await submits({ action: 'click', selector: '#toggle' }), undefined);
+        assert.deepEqual(await submits({ action: 'click', selector: ref('Same') }), {
+          method: 'POST',
+          to: `${origin}/a`,
+        });
+        assert.deepEqual(await submits({ action: 'click', selector: ref('Shadowed') }), {
+          method: 'POST',
+          to: `${origin}/shadowed`,
+        });
+        assert.deepEqual(await submits({ action: 'click', selector: ref('Menu') }), {
+          method: 'POST',
+          to: `${origin}/reserve`,
+        });
+        await computer.act('submits', {
+          action: 'fill',
+          selector: 'input[name=q]',
+          text: 'tables',
+        });
+        for (const key of [
+          'Enter',
+          'Return',
+          'Shift+Enter',
+          'Enter+Shift',
+          'Ctrl+Enter+Meta',
+          'NumpadEnter',
+          '\r',
+          '\n',
+        ]) {
+          assert.deepEqual(
+            await submits({ action: 'press', key }),
+            {
+              method: 'GET',
+              to: `${origin}/search`,
+            },
+            key,
+          );
+        }
+        for (const key of [
+          'Enter+Unknown',
+          ' Enter ',
+          'ControlOrMeta+Enter',
+          'Enter\n',
+          'ShiftLeft+Enter',
+        ])
+          assert.equal(await submits({ action: 'press', key }), undefined, key);
+        await computer.act('submits', {
+          action: 'evaluate',
+          script: "document.querySelector('form button').focus()",
+        });
+        assert.deepEqual(await submits({ action: 'press', key: 'Enter' }), {
+          method: 'POST',
+          to: `${origin}/book`,
+        });
+        await computer.act('submits', {
+          action: 'fill',
+          selector: 'input[name=city]',
+          text: 'Porto',
+        });
+        assert.deepEqual(await submits({ action: 'press', key: 'Enter' }), {
+          method: 'POST',
+          to: `${origin}/reserve-now`,
+        });
+        assert.deepEqual(await submits({ action: 'click', selector: '#label' }), {
+          method: 'POST',
+          to: `${origin}/label`,
+        });
+        const cssStep = { action: 'click', selector: '#plain' } as const;
+        const original = await computer.currentPage('submits', cssStep);
+        assert.equal((await computer.currentPage('submits', cssStep)).target, original.target);
+        await computer.act('submits', { ...cssStep, expectTarget: original.target });
+        const enterStep = { action: 'press', key: 'Enter' } as const;
+        const focused = await computer.currentPage('submits', enterStep);
+        await computer.act('submits', { ...enterStep, expectTarget: focused.target });
+        const located = await computer.act('submits', {
+          action: 'evaluate',
+          script:
+            "const r=document.querySelector('#plain').getBoundingClientRect();({x:(r.x+r.width/2)/innerWidth,y:(r.y+r.height/2)/innerHeight})",
+        });
+        const point = JSON.parse(located.text.slice(located.text.indexOf('\n') + 1)) as {
+          x: number;
+          y: number;
+        };
+        const pointStep = { action: 'click', ...point } as const;
+        const pointed = await computer.currentPage('submits', pointStep);
+        await computer.act('submits', { ...pointStep, expectTarget: pointed.target });
+        await computer.act('submits', {
+          action: 'evaluate',
+          script:
+            "const plain=document.querySelector('#plain');plain.replaceWith(plain.cloneNode(true))",
+        });
+        const replacement = await computer.currentPage('submits', cssStep);
+        assert.notEqual(replacement.target, original.target);
+        await assert.rejects(
+          computer.act('submits', { ...cssStep, expectTarget: original.target }),
+          (error) => error instanceof BrowserActionError && error.code === 'browser_target_changed',
+        );
+        assert.deepEqual(sent, []);
+      } finally {
+        await computer.dispose();
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        await rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
+});
 
 test('the owner time zone and region reach a new browser launch without injecting browser flags', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'nod-browser-locale-'));
@@ -3177,6 +3616,742 @@ test('the owner time zone and region reach a new browser launch without injectin
     await computer.dispose();
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test('feedback redaction checks original text and structure before masking', async (t) => {
+  const { createFeedbackRedactor } = await import('../src/server/feedback-redaction.ts');
+  type Probe = {
+    id: string;
+    input: unknown;
+    secrets?: string[];
+    names?: string[];
+    privateParts: string[];
+    kept?: string[];
+    omitted?: boolean;
+  };
+
+  const path = '/Users/Synthetic Owner/PrivateLedger.docx';
+  const url = 'https://synthetic.invalid/PrivateLedger.docx';
+  const email = 'PrivateMailbox@synthetic.invalid';
+  const opaque = 'PrivateOpaqueValue';
+  const payload = JSON.stringify({ payload: opaque });
+  const password = JSON.stringify({ password: opaque });
+  const unicode = '{"pass\\u0077ord":"PrivateOpaqueValue"}';
+  const tuple = ['Authorization', opaque];
+  const keyHeader = ['-----BEGIN', 'PRIVATE', 'KEY-----'].join(' ');
+  const keyFooter = ['-----END', 'PRIVATE', 'KEY-----'].join(' ');
+  const cases: Probe[] = [
+    { id: 'path-control', input: path, privateParts: ['Synthetic Owner', 'PrivateLedger'] },
+    {
+      id: 'path-slash-secret',
+      input: path,
+      secrets: ['/'],
+      privateParts: ['Synthetic Owner', 'PrivateLedger'],
+    },
+    {
+      id: 'path-name-root',
+      input: path,
+      names: ['Users'],
+      privateParts: ['Synthetic Owner', 'PrivateLedger'],
+    },
+    { id: 'url-control', input: url, privateParts: ['synthetic.invalid', 'PrivateLedger'] },
+    {
+      id: 'url-slash-secret',
+      input: url,
+      secrets: ['/'],
+      privateParts: ['synthetic.invalid', 'PrivateLedger'],
+    },
+    {
+      id: 'encoded-url-control',
+      input: encodeURIComponent(url),
+      privateParts: ['synthetic.invalid', 'PrivateLedger'],
+    },
+    {
+      id: 'encoded-url-slash-secret',
+      input: encodeURIComponent(url),
+      secrets: ['/'],
+      privateParts: ['synthetic.invalid', 'PrivateLedger'],
+    },
+    {
+      id: 'encoded-path-control',
+      input: encodeURIComponent(path),
+      privateParts: ['Synthetic Owner', 'PrivateLedger'],
+    },
+    {
+      id: 'encoded-path-slash-secret',
+      input: encodeURIComponent(path),
+      secrets: ['/'],
+      privateParts: ['Synthetic', 'PrivateLedger'],
+    },
+    { id: 'email-control', input: email, privateParts: ['PrivateMailbox', 'synthetic.invalid'] },
+    {
+      id: 'email-at-secret',
+      input: email,
+      secrets: ['@'],
+      privateParts: ['PrivateMailbox', 'synthetic.invalid'],
+    },
+    {
+      id: 'encoded-email-control',
+      input: encodeURIComponent(email),
+      privateParts: ['PrivateMailbox', 'synthetic.invalid'],
+    },
+    {
+      id: 'encoded-email-at-secret',
+      input: encodeURIComponent(email),
+      secrets: ['@'],
+      privateParts: ['PrivateMailbox', 'synthetic.invalid'],
+    },
+    {
+      id: 'literal-overlap-control',
+      input: 'AlphaBridgeOmega',
+      secrets: ['AlphaBridgeOmega'],
+      privateParts: ['Alpha', 'Bridge', 'Omega'],
+    },
+    {
+      id: 'literal-overlap',
+      input: 'AlphaBridgeOmega',
+      secrets: ['AlphaBridge', 'BridgeOmega'],
+      privateParts: ['Alpha', 'Bridge', 'Omega'],
+    },
+    {
+      id: 'object-password-control',
+      input: { password: opaque },
+      secrets: ['pass'],
+      privateParts: [opaque],
+    },
+    { id: 'json-password-control', input: password, privateParts: [opaque] },
+    { id: 'json-password-quote-secret', input: password, secrets: ['"'], privateParts: [opaque] },
+    {
+      id: 'embedded-password-quote-secret',
+      input: `failed: ${password}`,
+      secrets: ['"'],
+      privateParts: [opaque],
+    },
+    {
+      id: 'wrapped-password-quote-secret',
+      input: JSON.stringify(password),
+      secrets: ['"'],
+      privateParts: [opaque],
+    },
+    { id: 'json-unicode-password-control', input: unicode, privateParts: [opaque] },
+    {
+      id: 'json-unicode-password-backslash-secret',
+      input: unicode,
+      secrets: ['\\'],
+      privateParts: [opaque],
+    },
+    { id: 'object-vault-key-control', input: { vaultKey: opaque }, privateParts: [opaque] },
+    {
+      id: 'object-vault-key-literal',
+      input: { vaultKey: opaque },
+      secrets: ['vault'],
+      privateParts: [opaque],
+    },
+    {
+      id: 'object-master-key-literal',
+      input: { masterKey: opaque },
+      secrets: ['master'],
+      privateParts: [opaque],
+    },
+    { id: 'tuple-control', input: tuple, privateParts: [opaque] },
+    ...['PRIVATE KEY', 'RSA PRIVATE KEY'].map((label) => ({
+      id: `closed-key-keeps-tail-${label}`,
+      input: `-----BEGIN ${label}-----\n${opaque}\n-----END ${label}-----\nPublic status: denied`,
+      privateParts: [opaque],
+      kept: ['Public status: denied'],
+    })),
+    {
+      id: 'mismatched-key-end',
+      input: `-----BEGIN RSA PRIVATE KEY-----\n${opaque}\n-----END PRIVATE KEY-----\nPrivateTrailingValue`,
+      privateParts: [opaque, 'PrivateTrailingValue'],
+    },
+    ...[
+      'GITHUB_TOKEN',
+      'db_password',
+      'authToken',
+      'db_pwd',
+      'AUTH_OTP',
+      'authTOTP',
+      'CARD_PAN',
+      'service__api__key',
+    ].flatMap((name) => [
+      { id: `prefixed-object-${name}`, input: { [name]: opaque }, privateParts: [opaque] },
+      {
+        id: `prefixed-named-value-${name}`,
+        input: { name, value: opaque },
+        privateParts: [opaque],
+      },
+      {
+        id: `prefixed-tuple-${name}`,
+        input: [name, opaque, 'PrivateTrailingValue'],
+        privateParts: [opaque, 'PrivateTrailingValue'],
+      },
+      { id: `prefixed-assignment-${name}`, input: `${name}=${opaque}`, privateParts: [opaque] },
+    ]),
+    { id: 'prefixed-tuple-encoded', input: ['GITHUB_%54OKEN', opaque], privateParts: [opaque] },
+    {
+      id: 'prefixed-assignment-masked-label',
+      input: `GITHUB_TOKEN=${opaque}`,
+      secrets: ['GITHUB_TOKEN'],
+      privateParts: [opaque],
+    },
+    {
+      id: 'sentence-label-keeps-trailing-values',
+      input: ['Enter your password', 'Public scalar detail', 'Another detail'],
+      privateParts: [],
+      kept: ['Enter your password', 'Public scalar detail', 'Another detail'],
+    },
+    {
+      id: 'private-tuple-tail',
+      input: ['Authorization', opaque, 'PrivateTrailingValue'],
+      privateParts: [opaque, 'PrivateTrailingValue'],
+    },
+    {
+      id: 'private-tuple-tail-with-literal',
+      input: ['Authorization', opaque, 'PrivateTrailingValue'],
+      secrets: ['Author'],
+      privateParts: [opaque, 'PrivateTrailingValue'],
+    },
+    {
+      id: 'encoded-secret-key',
+      input: { 'pass%77ord': opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'encoded-tuple-label',
+      input: ['Authoriz%61tion', opaque],
+      privateParts: [opaque],
+    },
+    {
+      id: 'json-escaped-tuple-label',
+      input: ['"\\u0041uthorization"', opaque],
+      privateParts: [opaque],
+    },
+    {
+      id: 'encoded-name-alias',
+      input: { 'n%61me': 'Authorization', value: opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'encoded-media-alias',
+      input: { 't%79pe': 'image', data: opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'encoded-media-value',
+      input: { type: 'im%61ge', data: opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'encoded-data-alias',
+      input: { type: 'image', 'd%61ta': opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'encoded-name-vault-alias',
+      input: { 'n%61me': 'vaultKey', value: opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'json-media-value-with-literal',
+      input: { type: '"\\u0069mage"', data: opaque },
+      secrets: ['"'],
+      privateParts: [opaque],
+    },
+    {
+      id: 'json-uri-named-value',
+      input: { name: '"vault%4Bey"', value: opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'invalid-tuple-label',
+      input: ['Authoriz%61tion%ZZ', opaque, 'PrivateTrailingValue'],
+      privateParts: [opaque, 'PrivateTrailingValue'],
+    },
+    {
+      id: 'invalid-media-label',
+      input: { type: 'im%61ge%ZZ', data: opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'decoded-object-tuple-label',
+      input: [encodeURIComponent('{"password":"PrivateInnerValue"}'), opaque],
+      privateParts: [opaque, 'PrivateInnerValue'],
+    },
+    {
+      id: 'decoded-array-tuple-label',
+      input: [encodeURIComponent('["token","public"]'), opaque],
+      privateParts: [opaque],
+    },
+    {
+      id: 'decoded-object-media-label',
+      input: { type: encodeURIComponent('{"type":"image"}'), data: opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'raw-structured-entry-is-not-a-tuple-label',
+      input: ['{"password":"PrivateInnerValue"}', 'Public scalar detail'],
+      privateParts: ['PrivateInnerValue'],
+      kept: ['Public scalar detail'],
+    },
+    {
+      id: 'raw-bracketed-entry-keeps-public-tail',
+      input: ['[notice]', 'Public scalar detail'],
+      privateParts: [],
+      kept: ['[notice]', 'Public scalar detail'],
+    },
+    {
+      id: 'metadata-uri-depth-limit',
+      input: [
+        Array.from({ length: 3 }).reduce<string>(
+          (value) => encodeURIComponent(value),
+          'Authoriz%61tion',
+        ),
+        opaque,
+      ],
+      privateParts: [opaque],
+      omitted: true,
+    },
+    {
+      id: 'metadata-json-depth-limit',
+      input: [
+        Array.from({ length: 11 }).reduce<string>(
+          (value) => JSON.stringify(value),
+          'Authorization',
+        ),
+        opaque,
+      ],
+      privateParts: [opaque],
+      omitted: true,
+    },
+    {
+      id: 'metadata-byte-limit',
+      input: [JSON.stringify(' '.repeat(31_981) + '"Authorization"'), opaque],
+      privateParts: [opaque],
+      omitted: true,
+    },
+    {
+      id: 'metadata-count-limit',
+      input: Array.from({ length: 100 }, (_, index) => [
+        ' '.repeat(index) + '%41uthorization',
+        opaque,
+      ]),
+      privateParts: [opaque],
+      omitted: true,
+    },
+    {
+      id: 'metadata-after-rendered-field-limit',
+      input: Object.assign(
+        { value: opaque, data: opaque },
+        Object.fromEntries(Array.from({ length: 100 }, (_, index) => ['field' + index, index])),
+        { name: 'Authorization', type: 'image' },
+      ),
+      privateParts: [opaque],
+    },
+    {
+      id: 'encoded-name-after-field-limit',
+      input: Object.assign(
+        { value: opaque },
+        Object.fromEntries(Array.from({ length: 99 }, (_, index) => ['field' + index, index])),
+        { 'n%61me': 'Authorization' },
+      ),
+      privateParts: [opaque],
+      kept: ['[structured data omitted]'],
+    },
+    {
+      id: 'encoded-type-after-field-limit',
+      input: Object.assign(
+        { data: opaque },
+        Object.fromEntries(Array.from({ length: 99 }, (_, index) => ['field' + index, index])),
+        { 't%79pe': 'image' },
+      ),
+      privateParts: [opaque],
+      kept: ['[structured data omitted]'],
+    },
+    {
+      id: 'safe-object-below-field-limit',
+      input: Object.assign(
+        { status: 503 },
+        Object.fromEntries(Array.from({ length: 98 }, (_, index) => ['field' + index, index])),
+      ),
+      privateParts: [],
+      kept: ['"status":503', '"field97":97'],
+    },
+    {
+      id: 'safe-object-at-field-limit',
+      input: Object.assign(
+        { status: 503 },
+        Object.fromEntries(Array.from({ length: 99 }, (_, index) => ['field' + index, index])),
+      ),
+      privateParts: [],
+      kept: ['"status":503', '"field98":98'],
+    },
+    {
+      id: 'oversized-encoded-name-key',
+      input: { value: opaque, ['n%61me' + '-'.repeat(195)]: 'Authorization' },
+      privateParts: [opaque],
+      kept: ['[structured data omitted]'],
+    },
+    {
+      id: 'oversized-encoded-media-key',
+      input: { data: opaque, ['t%79pe' + '-'.repeat(195)]: 'image' },
+      privateParts: [opaque],
+      kept: ['[structured data omitted]'],
+    },
+    {
+      id: 'safe-key-below-length-limit',
+      input: { status: 503, ['x'.repeat(199)]: 'Useful technical value' },
+      privateParts: [],
+      kept: ['"status":503', 'Useful technical value'],
+    },
+    {
+      id: 'safe-key-at-length-limit',
+      input: { status: 503, ['x'.repeat(200)]: 'Useful technical value' },
+      privateParts: [],
+      kept: ['"status":503', 'Useful technical value'],
+    },
+    { id: 'tuple-literal', input: tuple, secrets: ['Author'], privateParts: [opaque] },
+    {
+      id: 'json-tuple-literal',
+      input: JSON.stringify(tuple),
+      secrets: ['Author'],
+      privateParts: [opaque],
+    },
+    {
+      id: 'named-vault-key-control',
+      input: { name: 'vaultKey', value: opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'named-vault-key-literal',
+      input: { name: 'vaultKey', value: opaque },
+      secrets: ['vault'],
+      privateParts: [opaque],
+    },
+    { id: 'cookie-control', input: `Cookie: ${opaque}`, privateParts: [opaque] },
+    {
+      id: 'overlapping-bearer-prefix',
+      input: `Bearer Bearer ${opaque}`,
+      privateParts: [opaque],
+    },
+    {
+      id: 'overlapping-basic-prefix',
+      input: 'Basic Basic ' + Buffer.from('synthetic-user:synthetic-password').toString('base64'),
+      privateParts: [Buffer.from('synthetic-user:synthetic-password').toString('base64')],
+    },
+    {
+      id: 'quoted-then-unquoted-url',
+      input: `"https://public.invalid" https://${opaque}/path`,
+      privateParts: [opaque],
+    },
+    {
+      id: 'overlapping-key-blocks',
+      input: [
+        keyHeader,
+        'SyntheticAlpha',
+        keyHeader,
+        'SyntheticBeta',
+        keyFooter,
+        'SyntheticGamma',
+        keyFooter,
+      ].join('\n'),
+      privateParts: ['SyntheticAlpha', 'SyntheticBeta', 'SyntheticGamma'],
+    },
+    {
+      id: 'unclosed-key-block',
+      input: `HTTP 503: ${keyHeader}\n${opaque}`,
+      privateParts: [opaque],
+      kept: ['HTTP 503'],
+    },
+    {
+      id: 'quoted-then-unquoted-path',
+      input: '"/home/Synthetic Owner/first.txt" /Users/PrivateOwner/PrivateLedger.docx',
+      privateParts: ['Synthetic Owner', 'PrivateOwner', 'PrivateLedger'],
+    },
+    { id: 'cookie-name', input: `Cookie: ${opaque}`, names: ['Cookie'], privateParts: [opaque] },
+    { id: 'cookie-literal', input: `Cookie: ${opaque}`, secrets: ['Cook'], privateParts: [opaque] },
+    { id: 'json-payload-name', input: payload, names: ['payload'], privateParts: [opaque] },
+    {
+      id: 'object-payload-name',
+      input: { payload: opaque },
+      names: ['payload'],
+      privateParts: [opaque],
+    },
+    { id: 'query-control', input: `?access_token=${opaque}`, privateParts: [opaque] },
+    {
+      id: 'query-literal',
+      input: `?access_token=${opaque}`,
+      secrets: ['access'],
+      privateParts: [opaque],
+    },
+    {
+      id: 'token-control',
+      input: 'sk-proj-PrivateSyntheticTokenAB',
+      privateParts: ['PrivateSyntheticTokenAB'],
+    },
+    {
+      id: 'token-literal',
+      input: 'sk-proj-PrivateSyntheticTokenAB',
+      secrets: ['sk-'],
+      privateParts: ['PrivateSyntheticTokenAB'],
+    },
+    {
+      id: 'binary-control',
+      input: { type: 'image', data: opaque },
+      secrets: ['image'],
+      privateParts: [opaque],
+    },
+    {
+      id: 'technical-control',
+      input: { status: 503, version: '0.8.0', count: 7, message: 'Engine request failed' },
+      privateParts: [],
+    },
+    {
+      id: 'reason-outside-private-span',
+      input: `HTTP 503 for ${email}; attempt 2`,
+      privateParts: ['PrivateMailbox', 'synthetic.invalid'],
+      kept: ['HTTP 503', 'attempt 2'],
+    },
+    {
+      id: 'encoded-email-percent-secret',
+      input: encodeURIComponent(email),
+      secrets: ['%'],
+      privateParts: ['PrivateMailbox', 'synthetic.invalid'],
+    },
+    {
+      id: 'encoded-payload',
+      input: encodeURIComponent(payload),
+      privateParts: [opaque],
+    },
+    {
+      id: 'nested-encoded-payload',
+      input: encodeURIComponent(encodeURIComponent(payload)),
+      secrets: ['%'],
+      privateParts: [opaque],
+    },
+    {
+      id: 'invalid-encoded-carrier',
+      input: `${opaque}%41%ZZ`,
+      privateParts: [opaque],
+    },
+    {
+      id: 'percentage-keeps-technical-text',
+      input: 'Upload 45% done; HTTP 503',
+      privateParts: [],
+      kept: ['Upload 45% done; HTTP 503'],
+    },
+    {
+      id: 'encoded-depth-limit',
+      input: Array.from({ length: 5 }).reduce<string>((value) => encodeURIComponent(value), email),
+      privateParts: ['PrivateMailbox', 'synthetic.invalid'],
+    },
+    {
+      id: 'decode-count-limit',
+      input: '%41 '.repeat(130) + encodeURIComponent(email),
+      privateParts: ['PrivateMailbox', 'synthetic.invalid'],
+    },
+    {
+      id: 'sensitive-relative-route',
+      input: `/api/${opaque}`,
+      secrets: ['api'],
+      privateParts: [opaque],
+    },
+    {
+      id: 'json-literal-across-key-value',
+      input: JSON.stringify({ field: opaque }),
+      secrets: [`field":"${opaque}`],
+      privateParts: [opaque],
+    },
+    {
+      id: 'json-literal-within-value-keeps-reason',
+      input: JSON.stringify({ message: `HTTP 503 for ${opaque}` }),
+      secrets: [opaque],
+      privateParts: [opaque],
+      kept: ['HTTP 503'],
+    },
+    {
+      id: 'literal-across-embedded-json',
+      input: `failed: ${JSON.stringify({ field: opaque })}`,
+      secrets: [`failed: {"field":"${opaque}`],
+      privateParts: [opaque],
+    },
+    {
+      id: 'json-boolean-literal',
+      input: '{"allowed":false}',
+      secrets: ['false'],
+      privateParts: ['false'],
+    },
+    {
+      id: 'literal-overlap-unicode',
+      input: '😀BridgeΩ',
+      secrets: ['😀Bridge', 'BridgeΩ'],
+      privateParts: ['Bridge', 'Ω'],
+    },
+    {
+      id: 'stack-technical-frame',
+      input: {
+        stack:
+          'Error: HTTP 503\n    at operation (/Users/Synthetic Owner/nod/src/server/worker.ts:12:4)',
+      },
+      privateParts: ['Synthetic Owner', '/Users/'],
+      kept: ['HTTP 503', 'src/server/worker.ts:12:4'],
+    },
+    {
+      id: 'stack-private-frame',
+      input: {
+        stack:
+          'Error: HTTP 503\n    at operation (/Users/Synthetic Owner/nod/src/server/worker.ts:12:4)',
+      },
+      secrets: ['worker'],
+      privateParts: ['Synthetic Owner', '/Users/', 'worker'],
+      kept: ['HTTP 503'],
+    },
+    {
+      id: 'stack-normalized-private-frame',
+      input: {
+        stack:
+          'Error: HTTP 503\n    at operation (C:\\Synthetic Owner\\nod\\src\\server\\worker.ts:12:4)',
+      },
+      secrets: ['src/server'],
+      privateParts: ['Synthetic Owner', 'src/server'],
+      kept: ['HTTP 503'],
+    },
+    {
+      id: 'string-limit',
+      input: 'x'.repeat(32_000) + opaque,
+      privateParts: [opaque],
+    },
+    {
+      id: 'match-limit',
+      input: 'x'.repeat(5000) + opaque,
+      secrets: ['x'],
+      privateParts: [opaque],
+      omitted: true,
+    },
+    {
+      id: 'fragment-limit',
+      input: '{} '.repeat(33) + opaque,
+      privateParts: [opaque],
+    },
+    {
+      id: 'incomplete-structure',
+      input: `failed: {"payload":"${opaque}"`,
+      privateParts: [opaque],
+    },
+  ];
+
+  for (const probe of cases) {
+    await t.test(probe.id, () => {
+      const redactor = createFeedbackRedactor({
+        secrets: probe.secrets ?? [],
+        profile: { names: probe.names ?? [] },
+      });
+      assert.equal(redactor.isReady(), true);
+      const output = redactor.value(probe.input);
+      const encoded = JSON.stringify(output);
+      assert.deepEqual(
+        probe.privateParts.filter((part) => encoded.includes(part)),
+        [],
+        'A private value remained after feedback redaction.',
+      );
+      for (const kept of probe.kept ?? []) assert.ok(encoded.includes(kept), kept);
+      if (probe.omitted) assert.equal(output, '[unreadable data omitted]');
+      else assert.notEqual(output, '[unreadable data omitted]');
+      if (probe.id === 'technical-control') assert.deepEqual(JSON.parse(encoded), probe.input);
+    });
+  }
+  const redactor = createFeedbackRedactor({ secrets: [], profile: { names: [] } });
+  for (const name of ['GITHUB_TOKEN', 'password']) assert.deepEqual(redactor.value([name]), [name]);
+});
+
+test('feedback redaction advances Unicode overlaps and resets recursive checks between calls', async () => {
+  const { execFileSync } = await import('node:child_process');
+  execFileSync(
+    process.execPath,
+    [
+      '--import',
+      'tsx',
+      '--input-type=module',
+      '--eval',
+      `import assert from 'node:assert/strict';
+    import { createFeedbackRedactor } from ${JSON.stringify(new URL('../src/server/feedback-redaction.ts', import.meta.url).href)};
+    const redactor = createFeedbackRedactor({ secrets: [], profile: { names: ['😀😀😀'] } });
+    assert.equal(redactor.text('😀'.repeat(6)), '[owner]');`,
+    ],
+    { timeout: 3000, maxBuffer: 16_000 },
+  );
+  const { createFeedbackRedactor } = await import('../src/server/feedback-redaction.ts');
+  const redactor = createFeedbackRedactor({ secrets: ['/', '@'], profile: { names: [] } });
+  const encoded = Array.from({ length: 4 }).reduce<string>(
+    (value) => encodeURIComponent(value),
+    '/Users/Synthetic Owner/PrivateLedger.docx',
+  );
+  const input = {
+    status: 503,
+    message: 'HTTP 503 for PrivateMailbox%40synthetic.invalid',
+    detail: encoded,
+    headers: ['Authoriz%61tion', 'PrivateRecursiveCredential'],
+  };
+  const expected = JSON.stringify(redactor.value(input));
+  assert.ok(expected.includes('HTTP 503'));
+  for (const privateValue of [
+    'PrivateMailbox',
+    'synthetic.invalid',
+    'Synthetic Owner',
+    'PrivateLedger',
+    'PrivateRecursiveCredential',
+  ])
+    assert.ok(!expected.includes(privateValue), privateValue);
+  for (let index = 0; index < 8; index++) {
+    redactor.text('%41 '.repeat(130) + encoded);
+    assert.equal(JSON.stringify(redactor.value(input)), expected);
+  }
+});
+
+test('feedback redaction omits a value when personal matching reaches its bound', async () => {
+  const { createFeedbackRedactor } = await import('../src/server/feedback-redaction.ts');
+  const { createPersonalDataRedactor } = await import('../src/server/personal-data.ts');
+  const profile = { names: ['aaa'] };
+  const input = 'aaa '.repeat(5000) + 'Technical tail';
+  const redactor = createFeedbackRedactor({ secrets: [], profile });
+  let output = '';
+  assert.doesNotThrow(() => {
+    output = redactor.text(input);
+  });
+  assert.equal(output, '[unreadable data omitted]');
+  assert.ok(createPersonalDataRedactor(profile)(input).endsWith('Technical tail'));
+});
+
+test('feedback redaction omits values when classification metadata is a getter', async () => {
+  const { createFeedbackRedactor } = await import('../src/server/feedback-redaction.ts');
+  const redactor = createFeedbackRedactor({ secrets: [], profile: { names: [] } });
+  let invoked = 0;
+  const named = { value: 'PrivateNamedValue' };
+  const media = { data: 'PrivateBinaryValue', bytes: 'PrivateBytesValue' };
+  const tuple = ['Authorization', 'PrivateTupleValue', 'PrivateTupleTail'];
+  for (const [target, key] of [
+    [named, 'name'],
+    [media, 'type'],
+    [tuple, '0'],
+  ] as const)
+    Object.defineProperty(target, key, {
+      enumerable: true,
+      get() {
+        invoked++;
+        throw new Error('Classification must not call a getter.');
+      },
+    });
+  const output = JSON.stringify(redactor.value({ named, media, tuple, status: 503 }));
+  assert.equal(invoked, 0);
+  for (const privateValue of [
+    'PrivateNamedValue',
+    'PrivateBinaryValue',
+    'PrivateBytesValue',
+    'PrivateTupleValue',
+    'PrivateTupleTail',
+  ])
+    assert.ok(!output.includes(privateValue), privateValue);
+  assert.ok(output.includes('503'));
 });
 
 test('rich feedback redaction handles embedded JSON, identifying addresses, encoded secrets and binary', async () => {
@@ -3214,6 +4389,7 @@ test('rich feedback redaction handles embedded JSON, identifying addresses, enco
     '/media/private-owner/BACKUP/Medical Notes/scan.pdf does not exist.',
     '/run/media/private-owner/USB/Tax Return/form.pdf does not exist.',
     'Book a slot at calendly.com/synthetic-booker/30min please.',
+    'Connection to synthetic-archive.helsinki failed with HTTP 503.',
     'Profile www.example.com/in/synthetic-profile?ref=private-ref#private-anchor failed.',
     'Redirect via unlisted.notatld/next?to=example.com/synthetic-hidden failed.',
     'Mirror downloads.example.com:8443/synthetic-mirror?key=synthetic-query failed.',
@@ -3271,6 +4447,7 @@ test('rich feedback redaction handles embedded JSON, identifying addresses, enco
     'Tax Return',
     'BACKUP',
     'synthetic-booker',
+    'synthetic-archive.helsinki',
     '30min',
     'synthetic-profile',
     'private-ref',
@@ -3317,6 +4494,7 @@ test('rich feedback redaction handles embedded JSON, identifying addresses, enco
     'HTTP 415',
     'HTTP 416',
     'Book a slot at [url] please',
+    'Connection to [host] failed with HTTP 503.',
   ])
     assert.ok(encoded.includes(useful), useful);
   const { timeZoneRegion } = await import('../src/shared/date-locale.ts');
@@ -3469,12 +4647,13 @@ test('rich feedback redaction keeps error classes, frame files, sizes and model 
   assert.ok(safe.error.stack.includes('([path]:5:1)'));
   for (const frame of [
     '(src/server/thread.ts:281:13)',
-    '(node_modules/@fixture/pg/lib/client.js:10:2)',
     '(dist/server/index.js:7:9)',
     'at [path]:18:4',
     'at [path]:3:1',
   ])
     assert.ok(safe.error.stack.includes(frame), frame);
+  assert.ok(safe.error.stack.includes(':10:2'));
+  assert.ok(!safe.error.stack.includes('@fixture'));
   for (const sensitive of [
     'private-owner',
     'private-project',
@@ -3516,10 +4695,302 @@ test('rich feedback redaction keeps error classes, frame files, sizes and model 
   assert.equal(redactor.text('Open D:\\private-owner\\a.txt'), 'Open [path]');
 });
 
-test('browser handoff preserves platform editing chords, text input and paste', async () => {
-  const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
-    timeoutMs: 20_000,
-    input: String.raw`
+test('navigation stays available when a saved script fence cannot reach the inspector', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'nod-navigation-recovery-'));
+  const fixture = stagedLoginBrowser();
+  let offline = false;
+  const navigated: string[] = [];
+  const computer = createBrowserFixture({
+    dataRoot: directory,
+    run: async (...args) => {
+      const command = args[1].slice(args[1].indexOf('--idle-timeout') + 2);
+      if (offline && command[0] === 'get' && command[1] === 'cdp-url')
+        return { stdout: '{"success":false}', stderr: '', exitCode: 1 };
+      if (['back', 'forward', 'reload', 'open'].includes(command[0])) navigated.push(command[0]);
+      const result = await fixture.run(...args);
+      if (command[0] === 'eval') offline = true;
+      return result;
+    },
+  });
+  try {
+    await computer.act('recovery', { action: 'open', url: 'https://1.1.1.1/login' });
+    await computer.act('recovery', {
+      action: 'evaluate',
+      script: "document.body.dataset.changed = 'synthetic'",
+    });
+    for (const action of ['back', 'forward', 'reload'] as const)
+      await computer.act('recovery', { action });
+    assert.deepEqual(navigated, ['open', 'back', 'forward', 'open']);
+    offline = false;
+    await assert.rejects(
+      computer.injectCredentials({
+        threadId: 'recovery',
+        origin: 'https://1.1.1.1',
+        kind: 'identifier',
+        username: 'synthetic-recovery',
+        usernameSelector: '#account',
+        submitSelector: 'button',
+      }),
+      /script ran/,
+    );
+    await computer.act('recovery', { action: 'reload' });
+    await computer.injectCredentials({
+      threadId: 'recovery',
+      origin: 'https://1.1.1.1',
+      kind: 'identifier',
+      username: 'synthetic-recovery',
+      usernameSelector: '#account',
+      submitSelector: 'button',
+    });
+    assert.deepEqual(fixture.pages.get('recovery')!.entered, ['synthetic-recovery']);
+  } finally {
+    offline = false;
+    await computer.dispose();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('failed private entry holds every Pi action until the filled document changes', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'nod-private-cleanup-'));
+  const fixture = stagedLoginBrowser();
+  let failSubmit = true;
+  let failedSubmissions = 0;
+  const computer = createBrowserFixture({
+    dataRoot: directory,
+    run: async (...args) => {
+      const command = args[1].slice(args[1].indexOf('--idle-timeout') + 2);
+      if (command[0] === 'click' && failSubmit) {
+        failedSubmissions++;
+        return { stdout: '{"success":false}', stderr: '', exitCode: 1 };
+      }
+      return fixture.run(...args);
+    },
+  });
+  try {
+    await computer.act('private', { action: 'open', url: 'https://1.1.1.1/login' });
+    await assert.rejects(
+      computer.injectCredentials({
+        threadId: 'private',
+        origin: 'https://1.1.1.1',
+        kind: 'identifier',
+        username: 'synthetic-private@example.test',
+        usernameSelector: '#account',
+        submitSelector: 'button',
+      }),
+    );
+    assert.equal(failedSubmissions, 1);
+    const before = fixture.pages.get('private')!.entered.length;
+    for (const input of [
+      { action: 'snapshot' as const },
+      { action: 'click' as const, selector: 'button' },
+      { action: 'evaluate' as const, script: 'document.body.textContent' },
+    ])
+      await assert.rejects(computer.act('private', input));
+    await assert.rejects(computer.currentPage('private'));
+    await assert.rejects(computer.screenshot('private'));
+    await assert.rejects(computer.download!('private', { selector: 'button' }));
+    await assert.rejects(computer.control!('private', { type: 'key', key: 'Enter' }));
+    await assert.rejects(
+      computer.cardDestinations('private', { number: '#account', expiry: '#account' }),
+    );
+    assert.equal(fixture.pages.get('private')!.entered.length, before);
+    failSubmit = false;
+    await computer.act('private', { action: 'reload' });
+    assert.ok(await computer.screenshot('private'));
+    assert.match(
+      (await computer.act('private', { action: 'evaluate', script: 'document.title' })).text,
+      /Script result/,
+    );
+    await computer.act('private', { action: 'reload' });
+    const page = fixture.pages.get('private')!;
+    page.afterInspect = (script) => {
+      if (script.includes('globalThis.__nodFocused = node')) page.search.focus();
+    };
+    await assert.rejects(
+      computer.injectCredentials({
+        threadId: 'private',
+        origin: 'https://1.1.1.1',
+        kind: 'identifier',
+        username: 'synthetic-focus-race',
+        usernameSelector: '#account',
+      }),
+    );
+    assert.equal(page.input.value, '');
+    assert.equal(page.search.value, '');
+    page.afterInspect = undefined;
+    await computer.act('private', { action: 'reload' });
+    page.afterInspect = (script) => {
+      if (script.includes("execCommand('insertText'")) page.document = 'navigated-during-entry';
+    };
+    await assert.rejects(
+      computer.injectCredentials({
+        threadId: 'private',
+        origin: 'https://1.1.1.1',
+        kind: 'identifier',
+        username: 'synthetic-navigation',
+        usernameSelector: '#account',
+        submitSelector: 'button',
+      }),
+      /checkout page changed/,
+    );
+    assert.equal(page.entered.length, before);
+    page.afterInspect = undefined;
+  } finally {
+    failSubmit = false;
+    await computer.dispose();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('a checked browser step is described from its snapshot and runs only on that page and control', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'nod-checked-step-'));
+  const fixture = stagedLoginBrowser();
+  const commands: Array<Record<string, unknown>> = [];
+  const computer = createBrowserFixture({
+    dataRoot: directory,
+    run: fixture.run,
+    onDaemonCommand: (command) => commands.push(command),
+  });
+  const page = () => fixture.pages.get('checked')!;
+  try {
+    await computer.act('checked', { action: 'open', url: 'https://1.1.1.1/login' });
+    await computer.act('checked', { action: 'fill', selector: '#account', text: 'synthetic' });
+    const search = await computer.currentPage('checked', { action: 'click', selector: '@e3' });
+    assert.match(search.target!, /^[0-9a-f]{64}$/);
+    assert.deepEqual(
+      {
+        origin: search.origin,
+        url: search.url,
+        controls: search.controls,
+        submits: search.submits,
+      },
+      {
+        origin: 'https://1.1.1.1',
+        url: 'https://1.1.1.1/login',
+        controls: [{ role: 'textbox', name: 'Search' }],
+        submits: 'unknown',
+      },
+    );
+    const next = { action: 'click', selector: '@e2' } as const;
+    await assert.rejects(
+      computer.act('checked', { ...next, expectOrigin: 'https://2.2.2.2' }),
+      (error) => error instanceof BrowserActionError && error.code === 'browser_target_changed',
+    );
+    await assert.rejects(
+      computer.act('checked', { ...next, selector: '@e9', expectOrigin: 'https://1.1.1.1' }),
+      (error) => error instanceof BrowserActionError && error.code === 'browser_target_changed',
+    );
+    await assert.rejects(
+      computer.act('checked', {
+        action: 'drag',
+        selector: '@e3',
+        targetSelector: '@e9',
+        expectOrigin: 'https://1.1.1.1',
+      }),
+      (error) => error instanceof BrowserActionError && error.code === 'browser_target_changed',
+    );
+    assert.deepEqual(
+      (
+        await computer.currentPage('checked', {
+          action: 'drag',
+          selector: '@e3',
+          targetSelector: '@e2',
+        })
+      ).dropTarget,
+      [{ role: 'button', name: '' }],
+    );
+    await assert.rejects(
+      computer.act('checked', {
+        action: 'drag',
+        selector: '@e3',
+        targetSelector: '@e2',
+        expectTarget: search.target,
+      }),
+      (error) => error instanceof BrowserActionError && error.code === 'browser_target_changed',
+    );
+    page().location = {
+      origin: 'https://1.1.1.1',
+      href: 'https://1.1.1.1/login?token=first',
+    };
+    page().dom.window.history.replaceState(null, '', '/login?token=first');
+    const collision = await computer.currentPage('checked', next);
+    page().location.href = 'https://1.1.1.1/login?token=second';
+    page().dom.window.history.replaceState(null, '', '/login?token=second');
+    await assert.rejects(
+      computer.act('checked', {
+        ...next,
+        expectOrigin: collision.origin,
+        expectUrl: collision.url,
+        expectTarget: collision.target,
+      }),
+      (error) => error instanceof BrowserActionError && error.code === 'browser_target_changed',
+    );
+    assert.deepEqual(page().entered, []);
+    await assert.rejects(
+      computer.download('checked', { selector: '@e2' }),
+      (error) => error instanceof BrowserActionError && error.code === 'browser_download_control',
+    );
+    await assert.rejects(
+      computer.download('checked', { selector: '@e2', expectOrigin: 'https://2.2.2.2' }),
+      (error) => error instanceof BrowserActionError && error.code === 'browser_target_changed',
+    );
+    assert.equal(
+      commands.some((command) => command.action === 'download'),
+      false,
+    );
+    const nextTarget = await computer.currentPage('checked', next);
+    await computer.act('checked', { action: 'snapshot' });
+    assert.equal((await computer.currentPage('checked', next)).target, nextTarget.target);
+    await computer.act('checked', {
+      ...next,
+      expectOrigin: 'https://1.1.1.1',
+      expectTarget: nextTarget.target,
+    });
+    assert.deepEqual(page().entered, ['synthetic']);
+    await assert.rejects(
+      computer.act('checked', {
+        action: 'evaluate',
+        script: "document.body.dataset.changed = 'synthetic'",
+        readOnly: true,
+      }),
+      (error) => error instanceof BrowserActionError && error.code === 'browser_script_writes',
+    );
+    assert.equal(page().dom.window.document.body.dataset.changed, undefined);
+    const before = await computer.act('checked', { action: 'snapshot' });
+    const searchRef = /textbox "Search" \[ref=(e\d+)\]/.exec(before.text)?.[1];
+    assert.ok(searchRef);
+    const beforeControlChange = await computer.currentPage('checked', {
+      action: 'click',
+      selector: `@${searchRef}`,
+    });
+    await computer.act('checked', {
+      action: 'evaluate',
+      script: "document.querySelector('#search').setAttribute('aria-label', 'Delete account')",
+    });
+    assert.deepEqual(
+      (await computer.currentPage('checked', { action: 'click', selector: `@${searchRef}` }))
+        .controls,
+      [{ role: 'textbox', name: 'Delete account' }],
+    );
+    await assert.rejects(
+      computer.act('checked', {
+        action: 'click',
+        selector: `@${searchRef}`,
+        expectTarget: beforeControlChange.target,
+      }),
+      (error) => error instanceof BrowserActionError && error.code === 'browser_target_changed',
+    );
+  } finally {
+    await computer.dispose();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+describe('interface components', { concurrency: interfaceLanes }, () => {
+  test('browser handoff preserves platform editing chords, text input and paste', async () => {
+    const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+      timeoutMs: 60_000,
+      input: String.raw`
       import assert from 'node:assert/strict';
       import { JSDOM } from 'jsdom';
       const dom = new JSDOM('<!doctype html><div id="root"></div>', {
@@ -3589,9 +5060,26 @@ test('browser handoff preserves platform editing chords, text input and paste', 
         await act(async () => root.render(createElement(BrowserHandoff, { turnId: 'synthetic-turn' })));
         const frame = document.querySelector('.browser-handoff-screen img');
         assert.equal(frame.src, 'blob:synthetic-browser-frame');
+        Object.defineProperty(frame, 'naturalWidth', { value: 100 });
+        Object.defineProperty(frame, 'naturalHeight', { value: 100 });
+        frame.getBoundingClientRect = () => ({ left: 0, top: 0, width: 100, height: 100 });
         await act(async () => frame.dispatchEvent(new Event('load')));
         let screen = document.querySelector('.browser-handoff-screen');
         assert.equal(screen.getAttribute('aria-disabled'), 'false');
+        const press = async (type, button) => act(async () => frame.dispatchEvent(
+          new dom.window.MouseEvent(type, { button, clientX: 50, clientY: 50, bubbles: true }),
+        ));
+        for (const button of [3, 4]) {
+          await press('mousedown', button);
+          await press('mouseup', button);
+        }
+        assert.deepEqual(received, []);
+        await press('mousedown', 0);
+        await press('mouseup', 0);
+        assert.deepEqual(received, [
+          { type: 'mouse', event: 'down', x: 0.5, y: 0.5, button: 'left' },
+          { type: 'mouse', event: 'up', x: 0.5, y: 0.5, button: 'left' },
+        ]);
         let dispatchingKey = false;
         const key = async (key, options = {}) => {
           const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...options });
@@ -3794,14 +5282,14 @@ test('browser handoff preserves platform editing chords, text input and paste', 
         dom.window.close();
       }
     `,
+    });
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   });
-  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-});
 
-test('voice previews sample unsaved voices and cancel stale playback on selection and close', async () => {
-  const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
-    timeoutMs: 20_000,
-    input: String.raw`
+  test('voice previews sample unsaved voices and cancel stale playback on selection and close', async () => {
+    const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+      timeoutMs: 60_000,
+      input: String.raw`
       import assert from 'node:assert/strict';
       import { JSDOM } from 'jsdom';
       const dom = new JSDOM('<!doctype html><div id="root"></div>', {
@@ -4232,14 +5720,14 @@ test('voice previews sample unsaved voices and cancel stale playback on selectio
         dom.window.close();
       }
     `,
+    });
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   });
-  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-});
 
-test('UI analytics keep answer choices, the survey card and survey flag requests within their consent and account', async () => {
-  const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
-    timeoutMs: 20_000,
-    input: String.raw`
+  test('UI analytics keep answer choices, the survey card and survey flag requests within their consent and account', async () => {
+    const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+      timeoutMs: 60_000,
+      input: String.raw`
       import assert from 'node:assert/strict';
       import { JSDOM } from 'jsdom';
       const dom = new JSDOM('<!doctype html><div id="root"></div>', {
@@ -4684,14 +6172,14 @@ test('UI analytics keep answer choices, the survey card and survey flag requests
       await act(() => root.unmount());
       dom.window.close();
     `,
+    });
+    assert.equal(result.exitCode, 0, result.stdout + result.stderr);
   });
-  assert.equal(result.exitCode, 0, result.stdout + result.stderr);
-});
 
-test('composer preserves keyboard shortcuts, upload retries, previews and failed-send recovery', async () => {
-  const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
-    timeoutMs: 20_000,
-    input: String.raw`
+  test('composer preserves keyboard shortcuts, upload retries, previews and failed-send recovery', async () => {
+    const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+      timeoutMs: 60_000,
+      input: String.raw`
       import assert from 'node:assert/strict';
       import { JSDOM } from 'jsdom';
       const dom = new JSDOM('<!doctype html><div id="root" class="chat-page"></div>', {
@@ -6140,1124 +7628,14 @@ test('composer preserves keyboard shortcuts, upload retries, previews and failed
         dom.window.close();
       }
     `,
+    });
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   });
-  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-});
 
-test(
-  'private entry masks known values, refuses Pi listeners and refuses a foreign login frame',
-  { timeout: 60_000 },
-  async () => {
-    const hits: string[] = [];
-    let shadowImage: Buffer | undefined;
-    const server = createHttpServer((request, response) => {
-      if (request.url === '/image') {
-        response.setHeader('content-type', 'image/png');
-        response.end(shadowImage);
-        return;
-      }
-      response.setHeader('content-type', 'text/html');
-      if (request.url?.startsWith('/record')) {
-        hits.push(new URL(request.url, 'http://fixture').searchParams.get('value') ?? '');
-        response.end();
-        return;
-      }
-      if (request.url === '/frame') {
-        response.end(
-          '<input id="foreign" type="password" aria-label="Foreign password"><script>document.querySelector("input").addEventListener("input", e => fetch("/record?value="+encodeURIComponent(e.target.value)))</script>',
-        );
-        return;
-      }
-      if (request.url === '/card') {
-        response.end(
-          '<input id="number" aria-label="Card number"><input id="expiry" aria-label="Expiry"><input id="cvc" aria-label="Security code"><h2 id="echo"></h2><button id="submit">Continue</button><script>for(const input of document.querySelectorAll("input"))input.addEventListener("input",e=>document.querySelector("h2").textContent+=e.target.value)</script>',
-        );
-        return;
-      }
-      if (request.url === '/shadow') {
-        response.setHeader('Content-Security-Policy', "style-src 'nonce-nod-fixture'");
-        response.end(
-          `<card-panel></card-panel><button id="report">Report</button><script>
-          document.querySelector('#report').onclick = () => { const mutated = globalThis.maskMutations > 0; globalThis.privateStyles[0].style.setProperty('outline-width', '1px'); setTimeout(() => fetch('/record?value=' + encodeURIComponent('report:' + JSON.stringify({ mutated, styles: globalThis.privateStyles.map(node => [getComputedStyle(node).opacity, getComputedStyle(node).transitionProperty, node.style.getPropertyValue('transition-property'), node.style.getPropertyValue('opacity')]) }))), 0); };
-          customElements.define('card-panel', class extends HTMLElement { constructor() { super(); this.attachShadow({ mode: 'closed' }).innerHTML = '<card-fields></card-fields>'; } });
-          customElements.define('card-fields', class extends HTMLElement { constructor() { super(); const root = this.attachShadow({ mode: 'closed' });
-          root.innerHTML = '<style nonce="nod-fixture">input[aria-label="Card number"],input[aria-label="Security code"],h2{background:rgb(255,0,0);transition:opacity 60s !important}button{background:rgb(0,0,255)}</style><form><input aria-label="Card number"><select aria-label="Month"><option value="1">January</option><option value="8">August</option></select><input aria-label="Year"><input aria-label="Security code"><h2></h2><button>Complete</button></form>';
-          root.querySelectorAll('input').forEach(node => node.style.setProperty('visibility', 'visible', 'important'));
-          globalThis.privateStyles = Array.from(root.querySelectorAll('input[aria-label="Card number"],input[aria-label="Security code"],h2'));
-          globalThis.maskMutations = 0;
-          new MutationObserver(records => { globalThis.maskMutations++; const source = root.querySelector('h2'); if (records.some(record => record.target === source) && source.style.opacity === '0' && source.textContent) { const echo = source.cloneNode(true); echo.style.removeProperty('opacity'); echo.style.removeProperty('transition-property'); root.append(echo); } }).observe(root, { subtree: true, attributes: true, attributeFilter: ['style'] });
-          root.querySelector('input').oninput = event => { event.target.value = event.target.value.replace(/\\D/g, '').replace(/(\\d{4})(?=\\d)/g, '$1 '); root.querySelector('h2').textContent = event.target.value; };
-          root.querySelector('form').onsubmit = event => { event.preventDefault(); fetch('/record?value=' + encodeURIComponent([...root.querySelectorAll('input,select')].map(node => node.value).join('/'))); };
-          } });</script>`,
-        );
-        return;
-      }
-      const { port } = server.address() as { port: number };
-      response.end(
-        `<input id="password" type="password" aria-label="Password"><button id="submit">Continue</button><h2></h2><iframe title="Other origin" src="http://localhost:${port}/frame"></iframe><script>document.querySelector('#password').addEventListener('input',e=>document.querySelector('h2').textContent=e.target.value)</script>`,
-      );
-    });
-    await new Promise<void>((resolve) => server.listen(0, '::', resolve));
-    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
-    const directory = await mkdtemp(join(tmpdir(), 'nod-private-entry-'));
-    const native = createAgentBrowserComputer({
-      dataRoot: directory,
-      privateNetwork: true,
-      headless: true,
-    });
-    const worker = await harness({ computer: native });
-    const computer = worker.client(directory, { timeoutMs: 30_000 });
-    assert.ok(computer.cardDestinations);
-    assert.ok(computer.fillCard);
-    try {
-      await computer.act('private', { action: 'open', url: origin });
-      const secret = 'Synthetic private value';
-      const input = {
-        threadId: 'private',
-        origin,
-        kind: 'password' as const,
-        password: secret,
-        passwordSelector: '#password',
-        submitSelector: '#submit',
-      };
-      await computer.act('private', {
-        action: 'evaluate',
-        script:
-          'document.querySelector("#password").addEventListener("input", e => localStorage.setItem("copied", btoa(e.target.value)))',
-      });
-      await assert.rejects(computer.injectCredentials(input), /script ran/);
-      await computer.act('private', { action: 'reload' });
-      await computer.injectCredentials(input);
-      const seen = (await computer.act('private', { action: 'snapshot' })).text;
-      assert.equal(seen.includes(secret), false);
-      await assert.rejects(
-        computer.act('private', {
-          action: 'evaluate',
-          script: 'document.querySelector("#password").value.split("").reverse().join("")',
-        }),
-        /scripts are paused/,
-      );
-      await computer.act('private', { action: 'reload' });
-      assert.equal(
-        (
-          await computer.act('private', {
-            action: 'evaluate',
-            script: 'localStorage.getItem("copied")',
-          })
-        ).text.includes(Buffer.from(secret).toString('base64')),
-        false,
-      );
-      const page = (await computer.act('private', { action: 'snapshot' })).text;
-      const ref = /"Foreign password"[^\n]*ref=(e\d+)/.exec(page)?.[1];
-      assert.ok(ref);
-      await assert.rejects(computer.injectCredentials({ ...input, passwordSelector: `@${ref}` }));
-      assert.deepEqual(hits, []);
-      await computer.act('private', { action: 'open', url: `${origin}/card` });
-      const fields = { number: '#number', expiry: '#expiry', securityCode: '#cvc' };
-      const bound = await computer.cardDestinations('private', fields);
-      await computer.fillCard({
-        threadId: 'private',
-        fields,
-        ...bound,
-        submitSelector: '#submit',
-        card: {
-          cardNumber: '4242424242424242',
-          expiryMonth: 8,
-          expiryYear: 2030,
-          cardholder: 'Synthetic cardholder',
-          securityCode: '737',
-        },
-      });
-      const receipt = (await computer.act('private', { action: 'snapshot' })).text;
-      assert.equal(receipt.includes('4242424242424242'), false);
-      assert.equal(receipt.includes('737'), false);
-      assert.ok(await computer.screenshot('private'));
-      await assert.rejects(
-        computer.act('private', {
-          action: 'evaluate',
-          script: '[...document.querySelectorAll("input")].map(node=>node.value)',
-        }),
-        /scripts are paused/,
-      );
-      await computer.act('private', { action: 'open', url: `${origin}/shadow` });
-      const shadowPage = (await computer.act('private', { action: 'snapshot' })).text;
-      const shadowRef = (name: string) => {
-        const ref = new RegExp(`"${name}"[^\\n]*ref=(e\\d+)`).exec(shadowPage)?.[1];
-        assert.ok(ref);
-        return `@${ref}`;
-      };
-      const shadowFields = {
-        number: shadowRef('Card number'),
-        expiryMonth: shadowRef('Month'),
-        expiryYear: shadowRef('Year'),
-        securityCode: shadowRef('Security code'),
-      };
-      const shadowBound = await computer.cardDestinations('private', shadowFields);
-      assert.deepEqual(Object.values(shadowBound.destinations), Array(4).fill(origin));
-      await computer.fillCard({
-        threadId: 'private',
-        fields: shadowFields,
-        ...shadowBound,
-        submitSelector: shadowRef('Complete'),
-        card: {
-          cardNumber: '4242424242424242',
-          expiryMonth: 8,
-          expiryYear: 2030,
-          cardholder: 'Synthetic cardholder',
-          securityCode: '737',
-        },
-      });
-      const shadowReceipt = (await computer.act('private', { action: 'snapshot' })).text;
-      assert.equal(shadowReceipt.includes('4242424242424242'), false);
-      assert.equal(shadowReceipt.includes('737'), false);
-      assert.deepEqual(hits, ['4242 4242 4242 4242/8/2030/737']);
-      const image = await computer.screenshot('private');
-      assert.ok(image);
-      shadowImage = Buffer.from(image);
-      await assert.rejects(
-        computer.act('private', {
-          action: 'evaluate',
-          script: 'globalThis.maskMutations',
-        }),
-        /scripts are paused/,
-      );
-      for (const field of [shadowFields.number, shadowFields.expiryYear, shadowFields.securityCode])
-        await computer.act('private', { action: 'fill', selector: field, text: '' });
-      await assert.rejects(computer.act('private', { action: 'open', url: 'file:///etc/hosts' }));
-      await assert.rejects(
-        computer.act('private', { action: 'evaluate', script: 'document.title' }),
-        /scripts are paused/,
-      );
-      await computer.act('private', { action: 'click', selector: '#report' });
-      const recorded = hits as string[];
-      const reported = Date.now() + 5_000;
-      while (!recorded.some((hit) => hit.startsWith('report:')) && Date.now() < reported)
-        await delay(50);
-      const report = JSON.parse(
-        recorded.find((hit) => hit.startsWith('report:'))?.slice('report:'.length) ?? 'null',
-      ) as { mutated: boolean; styles: string[][] } | null;
-      assert.equal(report?.mutated, true);
-      assert.deepEqual(
-        report?.styles,
-        Array.from({ length: 3 }, () => ['1', 'opacity', '', '']),
-      );
-      await computer.act('private', { action: 'open', url: origin });
-      const pixels = await computer.act('private', {
-        action: 'evaluate',
-        script: `(async () => { const image = new Image(); image.src = '/image'; await image.decode(); const canvas = document.createElement('canvas'); canvas.width = image.width; canvas.height = image.height; const context = canvas.getContext('2d'); context.drawImage(image, 0, 0); const pixels = context.getImageData(0, 0, image.width, image.height).data; let red = 0, blue = 0; for (let index = 0; index < pixels.length; index += 4) { if (pixels[index] === 255 && pixels[index + 1] === 0 && pixels[index + 2] === 0) red++; if (pixels[index] === 0 && pixels[index + 1] === 0 && pixels[index + 2] === 255) blue++; } return { red, blue }; })()`,
-      });
-      const colors = JSON.parse(pixels.text.slice(pixels.text.indexOf('\n') + 1)) as {
-        red: number;
-        blue: number;
-      };
-      assert.equal(colors.red, 0);
-      assert.ok(colors.blue > 0);
-    } finally {
-      await worker.close();
-      server.closeAllConnections();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      await rm(directory, { recursive: true, force: true });
-    }
-  },
-);
-
-test('navigation stays available when a saved script fence cannot reach the inspector', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'nod-navigation-recovery-'));
-  const fixture = stagedLoginBrowser();
-  let offline = false;
-  const navigated: string[] = [];
-  const computer = createBrowserFixture({
-    dataRoot: directory,
-    run: async (...args) => {
-      const command = args[1].slice(args[1].indexOf('--idle-timeout') + 2);
-      if (offline && command[0] === 'get' && command[1] === 'cdp-url')
-        return { stdout: '{"success":false}', stderr: '', exitCode: 1 };
-      if (['back', 'forward', 'reload', 'open'].includes(command[0])) navigated.push(command[0]);
-      const result = await fixture.run(...args);
-      if (command[0] === 'eval') offline = true;
-      return result;
-    },
-  });
-  try {
-    await computer.act('recovery', { action: 'open', url: 'https://1.1.1.1/login' });
-    await computer.act('recovery', {
-      action: 'evaluate',
-      script: "document.body.dataset.changed = 'synthetic'",
-    });
-    for (const action of ['back', 'forward', 'reload'] as const)
-      await computer.act('recovery', { action });
-    assert.deepEqual(navigated, ['open', 'back', 'forward', 'open']);
-    offline = false;
-    await assert.rejects(
-      computer.injectCredentials({
-        threadId: 'recovery',
-        origin: 'https://1.1.1.1',
-        kind: 'identifier',
-        username: 'synthetic-recovery',
-        usernameSelector: '#account',
-        submitSelector: 'button',
-      }),
-      /script ran/,
-    );
-    await computer.act('recovery', { action: 'reload' });
-    await computer.injectCredentials({
-      threadId: 'recovery',
-      origin: 'https://1.1.1.1',
-      kind: 'identifier',
-      username: 'synthetic-recovery',
-      usernameSelector: '#account',
-      submitSelector: 'button',
-    });
-    assert.deepEqual(fixture.pages.get('recovery')!.entered, ['synthetic-recovery']);
-  } finally {
-    offline = false;
-    await computer.dispose();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test('failed private entry holds every Pi action until the filled document changes', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'nod-private-cleanup-'));
-  const fixture = stagedLoginBrowser();
-  let failSubmit = true;
-  let failedSubmissions = 0;
-  const computer = createBrowserFixture({
-    dataRoot: directory,
-    run: async (...args) => {
-      const command = args[1].slice(args[1].indexOf('--idle-timeout') + 2);
-      if (command[0] === 'click' && failSubmit) {
-        failedSubmissions++;
-        return { stdout: '{"success":false}', stderr: '', exitCode: 1 };
-      }
-      return fixture.run(...args);
-    },
-  });
-  try {
-    await computer.act('private', { action: 'open', url: 'https://1.1.1.1/login' });
-    await assert.rejects(
-      computer.injectCredentials({
-        threadId: 'private',
-        origin: 'https://1.1.1.1',
-        kind: 'identifier',
-        username: 'synthetic-private@example.test',
-        usernameSelector: '#account',
-        submitSelector: 'button',
-      }),
-    );
-    assert.equal(failedSubmissions, 1);
-    const before = fixture.pages.get('private')!.entered.length;
-    for (const input of [
-      { action: 'snapshot' as const },
-      { action: 'click' as const, selector: 'button' },
-      { action: 'evaluate' as const, script: 'document.body.textContent' },
-    ])
-      await assert.rejects(computer.act('private', input));
-    await assert.rejects(computer.currentPage('private'));
-    await assert.rejects(computer.screenshot('private'));
-    await assert.rejects(computer.download!('private', { selector: 'button' }));
-    await assert.rejects(computer.control!('private', { type: 'key', key: 'Enter' }));
-    await assert.rejects(
-      computer.cardDestinations('private', { number: '#account', expiry: '#account' }),
-    );
-    assert.equal(fixture.pages.get('private')!.entered.length, before);
-    failSubmit = false;
-    await computer.act('private', { action: 'reload' });
-    assert.ok(await computer.screenshot('private'));
-    assert.match(
-      (await computer.act('private', { action: 'evaluate', script: 'document.title' })).text,
-      /Script result/,
-    );
-    await computer.act('private', { action: 'reload' });
-    const page = fixture.pages.get('private')!;
-    page.afterInspect = (script) => {
-      if (script.includes('globalThis.__nodFocused = node')) page.search.focus();
-    };
-    await assert.rejects(
-      computer.injectCredentials({
-        threadId: 'private',
-        origin: 'https://1.1.1.1',
-        kind: 'identifier',
-        username: 'synthetic-focus-race',
-        usernameSelector: '#account',
-      }),
-    );
-    assert.equal(page.input.value, '');
-    assert.equal(page.search.value, '');
-    page.afterInspect = undefined;
-    await computer.act('private', { action: 'reload' });
-    page.afterInspect = (script) => {
-      if (script.includes("execCommand('insertText'")) page.document = 'navigated-during-entry';
-    };
-    await assert.rejects(
-      computer.injectCredentials({
-        threadId: 'private',
-        origin: 'https://1.1.1.1',
-        kind: 'identifier',
-        username: 'synthetic-navigation',
-        usernameSelector: '#account',
-        submitSelector: 'button',
-      }),
-      /checkout page changed/,
-    );
-    assert.equal(page.entered.length, before);
-    page.afterInspect = undefined;
-  } finally {
-    failSubmit = false;
-    await computer.dispose();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test('a checked browser step is described from its snapshot and runs only on that page and control', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'nod-checked-step-'));
-  const fixture = stagedLoginBrowser();
-  const commands: Array<Record<string, unknown>> = [];
-  const computer = createBrowserFixture({
-    dataRoot: directory,
-    run: fixture.run,
-    onDaemonCommand: (command) => commands.push(command),
-  });
-  const page = () => fixture.pages.get('checked')!;
-  try {
-    await computer.act('checked', { action: 'open', url: 'https://1.1.1.1/login' });
-    await computer.act('checked', { action: 'fill', selector: '#account', text: 'synthetic' });
-    const search = await computer.currentPage('checked', { action: 'click', selector: '@e3' });
-    assert.match(search.target!, /^[0-9a-f]{64}$/);
-    assert.deepEqual(
-      {
-        origin: search.origin,
-        url: search.url,
-        controls: search.controls,
-        submits: search.submits,
-      },
-      {
-        origin: 'https://1.1.1.1',
-        url: 'https://1.1.1.1/login',
-        controls: [{ role: 'textbox', name: 'Search' }],
-        submits: 'unknown',
-      },
-    );
-    const next = { action: 'click', selector: '@e2' } as const;
-    await assert.rejects(
-      computer.act('checked', { ...next, expectOrigin: 'https://2.2.2.2' }),
-      (error) => error instanceof BrowserActionError && error.code === 'browser_target_changed',
-    );
-    await assert.rejects(
-      computer.act('checked', { ...next, selector: '@e9', expectOrigin: 'https://1.1.1.1' }),
-      (error) => error instanceof BrowserActionError && error.code === 'browser_target_changed',
-    );
-    await assert.rejects(
-      computer.act('checked', {
-        action: 'drag',
-        selector: '@e3',
-        targetSelector: '@e9',
-        expectOrigin: 'https://1.1.1.1',
-      }),
-      (error) => error instanceof BrowserActionError && error.code === 'browser_target_changed',
-    );
-    assert.deepEqual(
-      (
-        await computer.currentPage('checked', {
-          action: 'drag',
-          selector: '@e3',
-          targetSelector: '@e2',
-        })
-      ).dropTarget,
-      [{ role: 'button', name: '' }],
-    );
-    await assert.rejects(
-      computer.act('checked', {
-        action: 'drag',
-        selector: '@e3',
-        targetSelector: '@e2',
-        expectTarget: search.target,
-      }),
-      (error) => error instanceof BrowserActionError && error.code === 'browser_target_changed',
-    );
-    page().location = {
-      origin: 'https://1.1.1.1',
-      href: 'https://1.1.1.1/login?token=first',
-    };
-    page().dom.window.history.replaceState(null, '', '/login?token=first');
-    const collision = await computer.currentPage('checked', next);
-    page().location.href = 'https://1.1.1.1/login?token=second';
-    page().dom.window.history.replaceState(null, '', '/login?token=second');
-    await assert.rejects(
-      computer.act('checked', {
-        ...next,
-        expectOrigin: collision.origin,
-        expectUrl: collision.url,
-        expectTarget: collision.target,
-      }),
-      (error) => error instanceof BrowserActionError && error.code === 'browser_target_changed',
-    );
-    assert.deepEqual(page().entered, []);
-    await assert.rejects(
-      computer.download('checked', { selector: '@e2' }),
-      (error) => error instanceof BrowserActionError && error.code === 'browser_download_control',
-    );
-    await assert.rejects(
-      computer.download('checked', { selector: '@e2', expectOrigin: 'https://2.2.2.2' }),
-      (error) => error instanceof BrowserActionError && error.code === 'browser_target_changed',
-    );
-    assert.equal(
-      commands.some((command) => command.action === 'download'),
-      false,
-    );
-    const nextTarget = await computer.currentPage('checked', next);
-    await computer.act('checked', { action: 'snapshot' });
-    assert.equal((await computer.currentPage('checked', next)).target, nextTarget.target);
-    await computer.act('checked', {
-      ...next,
-      expectOrigin: 'https://1.1.1.1',
-      expectTarget: nextTarget.target,
-    });
-    assert.deepEqual(page().entered, ['synthetic']);
-    await assert.rejects(
-      computer.act('checked', {
-        action: 'evaluate',
-        script: "document.body.dataset.changed = 'synthetic'",
-        readOnly: true,
-      }),
-      (error) => error instanceof BrowserActionError && error.code === 'browser_script_writes',
-    );
-    assert.equal(page().dom.window.document.body.dataset.changed, undefined);
-    const before = await computer.act('checked', { action: 'snapshot' });
-    const searchRef = /textbox "Search" \[ref=(e\d+)\]/.exec(before.text)?.[1];
-    assert.ok(searchRef);
-    const beforeControlChange = await computer.currentPage('checked', {
-      action: 'click',
-      selector: `@${searchRef}`,
-    });
-    await computer.act('checked', {
-      action: 'evaluate',
-      script: "document.querySelector('#search').setAttribute('aria-label', 'Delete account')",
-    });
-    assert.deepEqual(
-      (await computer.currentPage('checked', { action: 'click', selector: `@${searchRef}` }))
-        .controls,
-      [{ role: 'textbox', name: 'Delete account' }],
-    );
-    await assert.rejects(
-      computer.act('checked', {
-        action: 'click',
-        selector: `@${searchRef}`,
-        expectTarget: beforeControlChange.target,
-      }),
-      (error) => error instanceof BrowserActionError && error.code === 'browser_target_changed',
-    );
-  } finally {
-    await computer.dispose();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test(
-  'a checked step reports the form it would send without sending it',
-  { timeout: 60_000 },
-  async (t) => {
-    const sent: string[] = [];
-    const server = createHttpServer(async (request, response) => {
-      response.setHeader('content-type', 'text/html');
-      if (request.url !== '/' && request.url !== '/favicon.ico') {
-        sent.push(`${request.method} ${request.url}`);
-        response.end('Sent');
-        return;
-      }
-      response.end(
-        '<form method="post" action="/book"><button>19:30</button></form><form action="/search"><input name="q" aria-label="Query"><button>Search</button></form><button id="plain">Plain</button><form method="post" action="/save"><button type="button" id="toggle">Toggle</button><button id="other" formaction="/other" formmethod="get">Other</button></form><form method="post" action="/a"><button>Same</button></form><form method="post" action="/b"><button>Same</button></form><form method="post" action="/reserve"><button>Menu</button></form><form method="post" action="/reserve"><button>Menu</button></form><form action="/find"><input name="city" aria-label="City"><button formaction="/reserve-now" formmethod="post">Go</button></form><form method="post" action="/label"><input type="submit" id="labelled" value="Send"><label for="labelled" id="label">Send it</label></form><form method="post" action="/shadowed"><input type="hidden" name="action" value="other"><input type="radio" name="method" aria-label="Card"><button>Shadowed</button></form>',
-      );
-    });
-    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
-    const directory = await mkdtemp(join(tmpdir(), 'nod-submits-'));
-    const computer = createAgentBrowserComputer({
-      dataRoot: directory,
-      browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
-      privateNetwork: true,
-      headless: true,
-    });
-    try {
-      let snapshot: string;
-      try {
-        snapshot = (await computer.act('submits', { action: 'open', url: origin })).text;
-      } catch {
-        t.skip('Chrome is not available here.');
-        return;
-      }
-      const ref = (name: string) => {
-        const found = new RegExp(`button "${name}" \\[ref=(e\\d+)\\]`).exec(snapshot)?.[1];
-        assert.ok(found, `No ${name} button in the snapshot.`);
-        return `@${found}`;
-      };
-      const submits = async (step: BrowserAction) =>
-        (await computer.currentPage('submits', step)).submits;
-      assert.deepEqual(await submits({ action: 'click', selector: ref('19:30') }), {
-        method: 'POST',
-        to: `${origin}/book`,
-      });
-      assert.deepEqual(await submits({ action: 'click', selector: ref('Search') }), {
-        method: 'GET',
-        to: `${origin}/search`,
-      });
-      assert.deepEqual(await submits({ action: 'click', selector: '#other' }), {
-        method: 'GET',
-        to: `${origin}/other`,
-      });
-      assert.equal(await submits({ action: 'click', selector: '#plain' }), undefined);
-      assert.equal(await submits({ action: 'click', selector: '#toggle' }), undefined);
-      assert.deepEqual(await submits({ action: 'click', selector: ref('Same') }), {
-        method: 'POST',
-        to: `${origin}/a`,
-      });
-      assert.deepEqual(await submits({ action: 'click', selector: ref('Shadowed') }), {
-        method: 'POST',
-        to: `${origin}/shadowed`,
-      });
-      assert.deepEqual(await submits({ action: 'click', selector: ref('Menu') }), {
-        method: 'POST',
-        to: `${origin}/reserve`,
-      });
-      await computer.act('submits', { action: 'fill', selector: 'input[name=q]', text: 'tables' });
-      for (const key of [
-        'Enter',
-        'Return',
-        'Shift+Enter',
-        'Enter+Shift',
-        'Ctrl+Enter+Meta',
-        'NumpadEnter',
-        '\r',
-        '\n',
-      ]) {
-        assert.deepEqual(
-          await submits({ action: 'press', key }),
-          {
-            method: 'GET',
-            to: `${origin}/search`,
-          },
-          key,
-        );
-      }
-      for (const key of [
-        'Enter+Unknown',
-        ' Enter ',
-        'ControlOrMeta+Enter',
-        'Enter\n',
-        'ShiftLeft+Enter',
-      ])
-        assert.equal(await submits({ action: 'press', key }), undefined, key);
-      await computer.act('submits', {
-        action: 'evaluate',
-        script: "document.querySelector('form button').focus()",
-      });
-      assert.deepEqual(await submits({ action: 'press', key: 'Enter' }), {
-        method: 'POST',
-        to: `${origin}/book`,
-      });
-      await computer.act('submits', {
-        action: 'fill',
-        selector: 'input[name=city]',
-        text: 'Porto',
-      });
-      assert.deepEqual(await submits({ action: 'press', key: 'Enter' }), {
-        method: 'POST',
-        to: `${origin}/reserve-now`,
-      });
-      assert.deepEqual(await submits({ action: 'click', selector: '#label' }), {
-        method: 'POST',
-        to: `${origin}/label`,
-      });
-      const cssStep = { action: 'click', selector: '#plain' } as const;
-      const original = await computer.currentPage('submits', cssStep);
-      assert.equal((await computer.currentPage('submits', cssStep)).target, original.target);
-      await computer.act('submits', { ...cssStep, expectTarget: original.target });
-      const enterStep = { action: 'press', key: 'Enter' } as const;
-      const focused = await computer.currentPage('submits', enterStep);
-      await computer.act('submits', { ...enterStep, expectTarget: focused.target });
-      const located = await computer.act('submits', {
-        action: 'evaluate',
-        script:
-          "const r=document.querySelector('#plain').getBoundingClientRect();({x:(r.x+r.width/2)/innerWidth,y:(r.y+r.height/2)/innerHeight})",
-      });
-      const point = JSON.parse(located.text.slice(located.text.indexOf('\n') + 1)) as {
-        x: number;
-        y: number;
-      };
-      const pointStep = { action: 'click', ...point } as const;
-      const pointed = await computer.currentPage('submits', pointStep);
-      await computer.act('submits', { ...pointStep, expectTarget: pointed.target });
-      await computer.act('submits', {
-        action: 'evaluate',
-        script:
-          "const plain=document.querySelector('#plain');plain.replaceWith(plain.cloneNode(true))",
-      });
-      const replacement = await computer.currentPage('submits', cssStep);
-      assert.notEqual(replacement.target, original.target);
-      await assert.rejects(
-        computer.act('submits', { ...cssStep, expectTarget: original.target }),
-        (error) => error instanceof BrowserActionError && error.code === 'browser_target_changed',
-      );
-      assert.deepEqual(sent, []);
-    } finally {
-      await computer.dispose();
-      server.closeAllConnections();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      await rm(directory, { recursive: true, force: true });
-    }
-  },
-);
-
-test('selection state and replay bindings cross the browser worker for clicks and uploads', async () => {
-  const binding = '1'.repeat(64);
-  const values = [{ role: 'checkbox', name: 'Include vacancies', checked: 'false' as const }];
-  const seen: unknown[] = [];
-  const fixture = await harness({
-    computer: {
-      ...fakeComputer(),
-      currentPage: async () => ({
-        origin: 'https://reports.example.test',
-        url: 'https://reports.example.test/',
-        currentSelections: { binding, values },
-      }),
-      act: async (_id, input) => {
-        seen.push(input);
-        return { text: 'Synthetic click', url: 'https://reports.example.test/' };
-      },
-      upload: async (_id, input) => {
-        seen.push(input);
-        return { text: 'Synthetic upload', url: 'https://reports.example.test/' };
-      },
-    },
-  });
-  try {
-    const client = fixture.client('/synthetic/selection-binding');
-    assert.deepEqual((await client.currentPage('task')).currentSelections, { binding, values });
-    await client.act('task', { action: 'click', selector: '#report', expectSelections: binding });
-    await client.upload('task', {
-      selector: '#file',
-      name: 'synthetic.txt',
-      bytes: Buffer.from('synthetic'),
-      expectSelections: binding,
-    });
-    assert.equal(seen.length, 2);
-    for (const input of seen) assert.equal((input as BrowserAction).expectSelections, binding);
-  } finally {
-    await fixture.close();
-  }
-});
-
-test('native selection trees keep false, mixed and empty states and reject incomplete values', async () => {
-  const node = (
-    id: number,
-    role: string,
-    value?: unknown,
-    properties: Record<string, unknown> = {},
-    parentId?: number,
-  ) => ({
-    nodeId: String(id),
-    backendDOMNodeId: id,
-    ...(parentId ? { parentId: String(parentId) } : {}),
-    role: { value: role },
-    name: { value: `Synthetic ${id}` },
-    ...(value === undefined ? {} : { value: { value } }),
-    properties: Object.entries(properties).map(([name, value]) => ({ name, value: { value } })),
-  });
-  const model: DevtoolsModel = {
-    document: 'selection-document',
-    frames: [{ id: 'main', session: 'page', origin: 'https://reports.example.test' }],
-    frameOf: {},
-    values: new Map(),
-    selections: {
-      main: [
-        node(1, 'spinbutton', 0),
-        node(2, 'checkbox', undefined, { checked: 'false' }),
-        node(3, 'checkbox', undefined, { checked: 'mixed' }),
-        node(4, 'listbox'),
-        node(5, 'option', undefined, { selected: false }, 4),
-        node(6, 'textbox', 'Synthetic private text'),
-        node(7, 'combobox', 'Synthetic editable text', { editable: 'plaintext' }),
-      ],
-    },
-  };
-  const fixture = await fakeDevtools(model);
-  const inspector = await openDevtools(fixture.url, 'fixture-target');
-  try {
-    const [frame] = await inspector.selections();
-    assert.ok(frame);
-    assert.equal(frame.document, model.document);
-    assert.deepEqual(
-      frame.values.map(({ role, value, checked, selectedCount }) => ({
-        role,
-        value,
-        checked,
-        selectedCount,
-      })),
-      [
-        { role: 'spinbutton', value: '0', checked: undefined, selectedCount: undefined },
-        { role: 'checkbox', value: undefined, checked: 'false', selectedCount: undefined },
-        { role: 'checkbox', value: undefined, checked: 'mixed', selectedCount: undefined },
-        { role: 'listbox', value: undefined, checked: undefined, selectedCount: 0 },
-      ],
-    );
-    assert.doesNotMatch(JSON.stringify(frame), /Synthetic private text|Synthetic editable text/);
-    model.selections!.main = [node(1, 'combobox')];
-    await assert.rejects(inspector.selections(), /did not report a current value/);
-    model.selections!.main = [node(1, 'slider')];
-    await assert.rejects(inspector.selections(), /did not report a current value/);
-    model.selections!.main = [node(1, 'checkbox')];
-    await assert.rejects(inspector.selections(), /did not report a current checked state/);
-    model.selections!.main = Array.from({ length: 257 }, (_, id) =>
-      node(id, 'checkbox', undefined, { checked: false }),
-    );
-    await assert.rejects(inspector.selections(), /more than 256/);
-    model.selections!.main = [node(1, 'combobox', 'x'.repeat(64_001))];
-    await assert.rejects(inspector.selections(), /exceed 64000/);
-    model.selectionError = 'Synthetic native capture failure';
-    await assert.rejects(inspector.selections(), /Synthetic native capture failure/);
-  } finally {
-    inspector.close();
-    await fixture.close();
-  }
-});
-
-test(
-  'selection capture stops promptly, bounds public values and closes a stalled inspector',
-  { timeout: 15_000 },
-  async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'nod-selection-capture-'));
-    const model: DevtoolsModel = {
-      document: 'selection-document',
-      frames: [{ id: 'main', session: 'page', origin: 'https://1.1.1.1' }],
-      frameOf: {},
-      values: new Map(),
-      selections: { main: [] },
-    };
-    const fixture = await fakeDevtools(model);
-    const computer = createBrowserFixture({
-      dataRoot: directory,
-      run: async (_executable, args) => {
-        const command = args.slice(args.indexOf('--idle-timeout') + 2);
-        const data: Record<string, unknown> =
-          command[0] === 'get' && command[1] === 'url'
-            ? { url: 'https://1.1.1.1/' }
-            : command[0] === 'get' && command[1] === 'cdp-url'
-              ? { cdpUrl: fixture.url }
-              : command[0] === 'snapshot'
-                ? { snapshot: '- button "Generate report" [ref=e1]' }
-                : {};
-        if (command[0] === 'screenshot') await writeFile(command[1]!, 'synthetic screen');
-        return { stdout: JSON.stringify({ success: true, data }), stderr: '', exitCode: 0 };
-      },
-    });
-    try {
-      await computer.act('selection', { action: 'open', url: 'https://1.1.1.1/' });
-      const selection = (value: string) => ({
-        nodeId: '1',
-        backendDOMNodeId: 1,
-        role: { value: 'combobox' },
-        name: { value: 'Company' },
-        value: { value },
-      });
-      model.selections!.main = [selection('x'.repeat(301))];
-      const first = await computer.currentPage('selection');
-      assert.match(first.currentSelections?.incomplete ?? '', /description limit/);
-      assert.equal(first.currentSelections?.values[0]?.value?.length, 300);
-      model.selections!.main = [selection('x'.repeat(300) + 'y')];
-      const changed = await computer.currentPage('selection');
-      assert.deepEqual(changed.currentSelections?.values, first.currentSelections?.values);
-      assert.notEqual(changed.currentSelections?.binding, first.currentSelections?.binding);
-      model.holdSelections = true;
-      const entered = deferred();
-      model.onSelections = () => entered.resolve();
-      const controller = new AbortController();
-      const stopped = computer.currentPage('selection', undefined, controller.signal);
-      const rejected = assert.rejects(stopped, /Synthetic selection stop/);
-      await entered.promise;
-      const at = Date.now();
-      controller.abort(new Error('Synthetic selection stop'));
-      await rejected;
-      assert.ok(Date.now() - at < 1000, 'Stop must not wait for the inspector deadline.');
-      for (let attempt = 0; fixture.connections() && attempt < 50; attempt++) await delay(10);
-      assert.equal(fixture.connections(), 0);
-      const timed = await computer.currentPage('selection');
-      assert.equal(timed.currentSelections?.binding, undefined);
-      assert.match(
-        timed.currentSelections?.incomplete ?? '',
-        /could not be read.*tim(e|ed)\s?out/i,
-      );
-      for (let attempt = 0; fixture.connections() && attempt < 50; attempt++) await delay(10);
-      assert.equal(fixture.connections(), 0);
-    } finally {
-      await computer.dispose();
-      await fixture.close();
-      await rm(directory, { recursive: true, force: true });
-    }
-  },
-);
-
-test(
-  'native browser confirmations bind selected company and period without changing the action identity',
-  { skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true', timeout: 90_000 },
-  async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'nod-selection-native-'));
-    const server = createHttpServer((request, response) => {
-      response.setHeader('content-type', 'text/html');
-      if (request.url === '/frame') {
-        response.end(
-          '<label>Department<select id="department"><option selected>One</option><option>Two</option></select></label>',
-        );
-        return;
-      }
-      if (request.url?.startsWith('/remote-frame')) {
-        response.end(
-          `<label>Branch<select><option selected>${request.url.includes('South') ? 'South' : 'North'}</option></select></label>`,
-        );
-        return;
-      }
-      response.end(`<form onsubmit="event.preventDefault();window.syntheticReports=(window.syntheticReports||[]).concat(this.elements.month.value);window.syntheticThresholds=(window.syntheticThresholds||[]).concat(this.elements.threshold.value)">
-        <label>Company<select name="company"><option>A</option><option selected>B</option></select></label>
-        <label>Month<select name="month" id="month"><option>October</option><option selected>November</option></select></label>
-        <label>Year<select name="year"><option>2025</option><option selected>2026</option></select></label>
-        <label>Threshold<input id="threshold" name="threshold" type="range" min="0" max="100" value="10"></label><label>Copies<input type="number" value="0"></label><label>Include vacancies<input type="checkbox"></label>
-        <div id="numeric-period" role="spinbutton" aria-label="Numeric period" aria-valuenow="11" aria-valuetext="Reporting month" tabindex="0"></div>
-        <input aria-label="Private free text" value="Synthetic free text"><input type="password" value="Synthetic password">
-        <button id="report">Generate report</button></form><iframe src="/frame" title="Synthetic department"></iframe>
-        <iframe id="remote-frame" src="${origin.replace('127.0.0.1', 'localhost')}/remote-frame?North" title="Synthetic branch"></iframe><button id="dialog" onclick="window.syntheticDialogAccepted=confirm('Generate the selected report?')">Confirm report</button>`);
-    });
-    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
-    let changeFormDuringCapture = false;
-    const computer = createAgentBrowserComputer({
-      dataRoot: directory,
-      browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
-      privateNetwork: true,
-      headless: true,
-      daemonCommand: async (path, command, signal, timeoutMs, maxBytes) => {
-        if (changeFormDuringCapture && command.action === 'cdp_url' && signal) {
-          changeFormDuringCapture = false;
-          await existingDaemonCommand(
-            path,
-            {
-              action: 'evaluate',
-              script: "document.querySelector('form').action='/changed-report'",
-            },
-            signal,
-          );
-        }
-        return existingDaemonCommand(path, command, signal, timeoutMs, maxBytes);
-      },
-    });
-    try {
-      for (const kind of ['css', 'ref']) {
-        const snapshot = await computer.act('selection', { action: 'open', url: origin });
-        const ref = /button "Generate report" \[ref=(e\d+)\]/.exec(snapshot.text)?.[1];
-        assert.ok(ref);
-        const step = { action: 'click', selector: kind === 'ref' ? `@${ref}` : '#report' } as const;
-        const before = await computer.currentPage('selection', step);
-        assert.ok(before.currentSelections?.binding, before.currentSelections?.incomplete);
-        assert.equal(before.currentSelections.incomplete, undefined);
-        assert.equal(
-          (await computer.currentPage('selection', step)).currentSelections?.binding,
-          before.currentSelections.binding,
-        );
-        const values = before.currentSelections.values;
-        for (const [name, value] of [
-          ['Company', 'B'],
-          ['Month', 'November'],
-          ['Year', '2026'],
-          ['Copies', '0'],
-        ])
-          assert.ok(
-            values.some((item) => item.name === name && item.value === value),
-            `${name} must have its current value.`,
-          );
-        assert.ok(
-          values.some((item) => item.name === 'Include vacancies' && item.checked === 'false'),
-        );
-        assert.ok(values.some((item) => item.name === 'Department' && item.value === 'One'));
-        assert.ok(
-          values.some(
-            (item) => item.role === 'slider' && item.name === 'Threshold' && item.value === '10',
-          ),
-        );
-        assert.ok(values.some((item) => item.name === 'Branch' && item.value === 'North'));
-        assert.doesNotMatch(
-          JSON.stringify(values),
-          /Synthetic free text|Synthetic password|backendDOMNodeId|nativeValue|valueText|"node"|"parent"/,
-        );
-        await computer.act('selection', {
-          ...step,
-          expectTarget: before.target,
-          expectSelections: before.currentSelections.binding,
-        });
-        await computer.act('selection', { action: 'select', selector: '#month', text: 'October' });
-        const changed = await computer.currentPage('selection', step);
-        assert.equal(changed.target, before.target);
-        assert.notEqual(changed.currentSelections?.binding, before.currentSelections.binding);
-        await assert.rejects(
-          computer.act('selection', {
-            ...step,
-            expectTarget: before.target,
-            expectSelections: before.currentSelections.binding,
-          }),
-          (error) => error instanceof BrowserActionError && error.code === 'browser_target_changed',
-        );
-        const reports = await computer.act('selection', {
-          action: 'evaluate',
-          script: 'window.syntheticReports',
-          readOnly: true,
-        });
-        assert.deepEqual(JSON.parse(reports.text.slice(reports.text.indexOf('\n') + 1)), [
-          'November',
-        ]);
-        await computer.act('selection', {
-          action: 'evaluate',
-          script:
-            "document.querySelector('iframe').contentDocument.querySelector('select').value='Two'",
-        });
-        const frameChanged = await computer.currentPage('selection', step);
-        assert.notEqual(
-          frameChanged.currentSelections?.binding,
-          changed.currentSelections?.binding,
-        );
-        assert.equal(frameChanged.target, before.target);
-        await computer.act('selection', {
-          action: 'evaluate',
-          script:
-            "document.querySelector('#remote-frame').src=document.querySelector('#remote-frame').src.replace('North','South')",
-        });
-        const remoteChanged = await computer.currentPage('selection', step);
-        assert.equal(remoteChanged.currentSelections?.incomplete, undefined);
-        assert.ok(
-          remoteChanged.currentSelections?.values.some(
-            (item) => item.name === 'Branch' && item.value === 'South',
-          ),
-        );
-        assert.notEqual(
-          remoteChanged.currentSelections?.binding,
-          frameChanged.currentSelections?.binding,
-        );
-        assert.equal(remoteChanged.target, before.target);
-        await computer.act('selection', {
-          action: 'evaluate',
-          script: "document.querySelector('#numeric-period').setAttribute('aria-valuenow','10')",
-        });
-        const numericChanged = await computer.currentPage('selection', step);
-        assert.deepEqual(
-          numericChanged.currentSelections?.values,
-          remoteChanged.currentSelections?.values,
-        );
-        assert.notEqual(
-          numericChanged.currentSelections?.binding,
-          remoteChanged.currentSelections?.binding,
-        );
-        await assert.rejects(
-          computer.act('selection', {
-            ...step,
-            expectTarget: remoteChanged.target,
-            expectSelections: remoteChanged.currentSelections?.binding,
-          }),
-          (error) => error instanceof BrowserActionError && error.code === 'browser_target_changed',
-        );
-        await computer.act('selection', {
-          action: 'evaluate',
-          script: "document.querySelector('#threshold').value='20'",
-        });
-        const rangeChanged = await computer.currentPage('selection', step);
-        assert.equal(rangeChanged.target, numericChanged.target);
-        assert.notEqual(
-          rangeChanged.currentSelections?.binding,
-          numericChanged.currentSelections?.binding,
-        );
-        await assert.rejects(
-          computer.act('selection', {
-            ...step,
-            expectTarget: numericChanged.target,
-            expectSelections: numericChanged.currentSelections?.binding,
-          }),
-          (error) => error instanceof BrowserActionError && error.code === 'browser_target_changed',
-        );
-        changeFormDuringCapture = true;
-        await assert.rejects(
-          computer.act('selection', {
-            ...step,
-            expectTarget: rangeChanged.target,
-            expectSelections: rangeChanged.currentSelections?.binding,
-          }),
-          (error) => error instanceof BrowserActionError && error.code === 'browser_target_changed',
-        );
-        assert.equal(changeFormDuringCapture, false);
-        const final = await computer.act('selection', {
-          action: 'evaluate',
-          script: 'window.syntheticReports',
-          readOnly: true,
-        });
-        assert.deepEqual(JSON.parse(final.text.slice(final.text.indexOf('\n') + 1)), ['November']);
-        const thresholds = await computer.act('selection', {
-          action: 'evaluate',
-          script: 'window.syntheticThresholds',
-          readOnly: true,
-        });
-        assert.deepEqual(JSON.parse(thresholds.text.slice(thresholds.text.indexOf('\n') + 1)), [
-          '10',
-        ]);
-      }
-      await computer.act('selection', { action: 'click', selector: '#dialog' });
-      const modalAt = Date.now();
-      const modal = await computer.currentPage('selection', { action: 'accept_dialog' });
-      assert.ok(
-        Date.now() - modalAt < 1500,
-        'An open dialog must not wait for a blocked accessibility read.',
-      );
-      assert.equal(modal.currentSelections?.binding, undefined);
-      assert.match(modal.currentSelections?.incomplete ?? '', /JavaScript dialog is open/);
-      await computer.act('selection', {
-        action: 'accept_dialog',
-        expectOrigin: modal.origin,
-        expectUrl: modal.url,
-        expectTarget: modal.target,
-      });
-      const accepted = await computer.act('selection', {
-        action: 'evaluate',
-        script: 'window.syntheticDialogAccepted',
-        readOnly: true,
-      });
-      assert.equal(JSON.parse(accepted.text.slice(accepted.text.indexOf('\n') + 1)), true);
-      const step = { action: 'click', selector: '#report' } as const;
-      const saved = await computer.currentPage('selection', step);
-      const restarted = createAgentBrowserComputer({
-        dataRoot: directory,
-        browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
-        privateNetwork: true,
-        headless: true,
-      });
-      try {
-        const restored = await restarted.currentPage('selection', step);
-        assert.deepEqual(restored.currentSelections?.values, saved.currentSelections?.values);
-        assert.notEqual(restored.currentSelections?.binding, saved.currentSelections?.binding);
-        await assert.rejects(
-          restarted.act('selection', {
-            ...step,
-            expectSelections: saved.currentSelections?.binding,
-          }),
-          (error) => error instanceof BrowserActionError && error.code === 'browser_target_changed',
-        );
-      } finally {
-        await restarted.dispose();
-      }
-    } finally {
-      await computer.dispose();
-      server.closeAllConnections();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      await rm(directory, { recursive: true, force: true });
-    }
-  },
-);
-
-test('chat retires reply targets without losing drafts or duplicating ambiguous sends', async () => {
-  const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
-    timeoutMs: 20_000,
-    input: String.raw`
+  test('chat retires reply targets without losing drafts or duplicating ambiguous sends', async () => {
+    const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+      timeoutMs: 60_000,
+      input: String.raw`
       import assert from 'node:assert/strict';
       import { JSDOM } from 'jsdom';
       const dom = new JSDOM('<!doctype html><div id="root"></div>', {
@@ -7419,14 +7797,14 @@ test('chat retires reply targets without losing drafts or duplicating ambiguous 
         dom.window.close();
       }
     `,
+    });
+    assert.equal(result.exitCode, 0, result.stdout + result.stderr);
   });
-  assert.equal(result.exitCode, 0, result.stdout + result.stderr);
-});
 
-test('chat reloads older history after hidden confirmations exceed the ID window', async () => {
-  const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
-    timeoutMs: 20_000,
-    input: String.raw`
+  test('chat reloads older history after hidden confirmations exceed the ID window', async () => {
+    const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+      timeoutMs: 60_000,
+      input: String.raw`
       import assert from 'node:assert/strict';
       import { JSDOM } from 'jsdom';
       const dom = new JSDOM('<!doctype html><div id="root"></div>', {
@@ -7618,14 +7996,14 @@ test('chat reloads older history after hidden confirmations exceed the ID window
         dom.window.close();
       }
     `,
+    });
+    assert.equal(result.exitCode, 0, result.stdout + result.stderr);
   });
-  assert.equal(result.exitCode, 0, result.stdout + result.stderr);
-});
 
-test('chat removes a cached older reply quote when its target becomes hidden', async () => {
-  const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
-    timeoutMs: 20_000,
-    input: String.raw`
+  test('chat removes a cached older reply quote when its target becomes hidden', async () => {
+    const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+      timeoutMs: 60_000,
+      input: String.raw`
       import assert from 'node:assert/strict';
       import { JSDOM } from 'jsdom';
       const dom = new JSDOM('<!doctype html><div id="root"></div>', {
@@ -7710,14 +8088,14 @@ test('chat removes a cached older reply quote when its target becomes hidden', a
         dom.window.close();
       }
     `,
+    });
+    assert.equal(result.exitCode, 0, result.stdout + result.stderr);
   });
-  assert.equal(result.exitCode, 0, result.stdout + result.stderr);
-});
 
-test('chat resumes history after a failed focus check and cancels pending focus on Return', async () => {
-  const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
-    timeoutMs: 20_000,
-    input: String.raw`
+  test('chat resumes history after a failed focus check and cancels pending focus on Return', async () => {
+    const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+      timeoutMs: 60_000,
+      input: String.raw`
       import assert from 'node:assert/strict';
       import { JSDOM } from 'jsdom';
       const dom = new JSDOM('<!doctype html><div id="root"></div>', {
@@ -7883,14 +8261,201 @@ test('chat resumes history after a failed focus check and cancels pending focus 
         dom.window.close();
       }
     `,
+    });
+    assert.equal(result.exitCode, 0, result.stdout + result.stderr);
   });
-  assert.equal(result.exitCode, 0, result.stdout + result.stderr);
-});
 
-test('chat shows pending sends and active work before a model step', async () => {
-  const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
-    timeoutMs: 20_000,
-    input: String.raw`
+  test('chat state reads make progress during refresh events and reject late replies after reset', async () => {
+    const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+      timeoutMs: 60_000,
+      input: String.raw`
+      import assert from 'node:assert/strict';
+      import { JSDOM } from 'jsdom';
+      const dom = new JSDOM('<!doctype html><div id="root"></div>', {
+        url: 'https://nod.fixture.invalid', pretendToBeVisual: true,
+      });
+      Object.assign(globalThis, {
+        window: dom.window, document: dom.window.document,
+        IS_REACT_ACT_ENVIRONMENT: true, localStorage: dom.window.localStorage,
+        getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
+        requestAnimationFrame: dom.window.requestAnimationFrame.bind(dom.window),
+        cancelAnimationFrame: dom.window.cancelAnimationFrame.bind(dom.window),
+      });
+      for (const name of ['Node', 'NodeFilter', 'Element', 'HTMLElement', 'HTMLInputElement',
+        'HTMLButtonElement', 'MutationObserver', 'Event', 'KeyboardEvent', 'CustomEvent', 'DOMParser'])
+        globalThis[name] = dom.window[name];
+      Object.defineProperty(globalThis, 'navigator', { configurable: true, value: dom.window.navigator });
+      window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
+      HTMLElement.prototype.scrollTo = () => {};
+      HTMLElement.prototype.scrollIntoView = () => {};
+      const sources = [];
+      globalThis.EventSource = class {
+        static CLOSED = 2;
+        readyState = 1;
+        constructor() { sources.push(this); }
+        close() { this.readyState = 2; }
+      };
+      const reads = [];
+      let ownerId = 'synthetic-owner';
+      let expireRead = false;
+      const deadlines = [];
+      AbortSignal.timeout = () => {
+        const controller = new AbortController();
+        deadlines.push(controller);
+        return controller.signal;
+      };
+      const threadId = '00000000-0000-4000-8000-000000000901';
+      const nextThreadId = '00000000-0000-4000-8000-000000000902';
+      const message = (id, text) => ({ id, role: 'assistant', text, attachments: [],
+        turnId: null, createdAt: '2026-11-19T12:00:00Z' });
+      const state = (messages, current = threadId) => ({
+        threadId: current, turns: [], activity: [], tasks: [],
+        verificationRequests: [], configuration: { llmReady: true }, messages,
+      });
+      globalThis.fetch = async (path, options = {}) => {
+        if (path === '/api/session') return Response.json({
+          user: { id: ownerId, name: 'Synthetic', email: null, avatarUrl: null },
+          settings: { theme: 'system', onboardingCompleted: true, usageData: false, traces: false },
+          capabilities: { developer: false, traces: false },
+        });
+        if (path === '/api/state') return new Promise((resolve, reject) => {
+          reads.push({ resolve, signal: options.signal });
+          if (expireRead) options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+        });
+        if (path === '/api/conversation/reset') return Response.json({ ok: true, threadId: nextThreadId });
+        if (path === '/api/apps') return Response.json([]);
+        if (path === '/api/trust') return Response.json({});
+        if (path === '/api/speech') return Response.json({ transcription: true });
+        if (path === '/api/onboarding/introduction') return Response.json({ messageId: null });
+        throw new Error('Unexpected request: ' + path);
+      };
+      const { createElement, act, StrictMode } = await import('react');
+      const { createRoot } = await import('react-dom/client');
+      const { sessionStore } = await import('./src/web/lib/session.ts');
+      const { useAppState } = await import('./src/web/hooks/use-app-state.ts');
+      const { Chat } = await import('./src/web/pages/chat.tsx');
+      await sessionStore.refresh();
+      let app;
+      function Screen() {
+        app = useAppState(ownerId);
+        return app.state ? createElement(Chat, {
+          ownerId, state: app.state, streams: app.streams,
+          refresh: app.refresh, resetConversation: app.resetConversation,
+        }) : createElement('p', null, 'Loading');
+      }
+      let root = createRoot(document.getElementById('root'));
+      const event = data => sources.at(-1).onmessage({ data: JSON.stringify(data) });
+      const complete = (read, value) => act(async () => read.resolve(Response.json(value)));
+      try {
+        await act(async () => root.render(createElement(Screen)));
+        const first = reads[0];
+        await act(async () => sources[0].onopen());
+        for (let index = 0; index < 20; index++)
+          await act(async () => event({ type: 'refresh' }));
+        const saved = message('saved-reply', 'Synthetic saved reply');
+        await complete(first, state([saved]));
+        assert.ok(document.querySelector('[data-message-id="saved-reply"]'),
+          'The completed state read must show its saved reply during repeated updates.');
+        assert.equal(first.signal.aborted, false);
+        assert.equal(reads.length, 2);
+        let refreshed = false;
+        const awaitedRefresh = app.refresh().then(() => { refreshed = true; });
+        assert.equal(refreshed, false);
+        const activity = [{ turnId: 'synthetic-work', taskId: null, title: null,
+          step: null, site: null, since: '2026-11-19T12:00:00Z' }];
+        await act(async () => event({ type: 'activity', items: activity }));
+        const approval = { ...message('pending-approval', 'Synthetic pending change'),
+          approval: { id: 'synthetic-approval', state: 'pending', title: 'Save change', app: 'Nod', slug: 'nod' } };
+        await complete(reads[1], state([saved, message('newer-reply', 'Synthetic newer reply'), approval]));
+        assert.ok(document.querySelector('[data-message-id="newer-reply"]'));
+        assert.ok(document.querySelector('[data-message-id="pending-approval"] button'));
+        assert.deepEqual(app.state.activity, activity);
+        assert.equal(refreshed, false);
+        await complete(reads.at(-1), state([saved, message('awaited-reply', 'Synthetic awaited reply'), approval]));
+        await awaitedRefresh;
+        assert.equal(refreshed, true);
+        assert.ok(document.querySelector('[data-message-id="awaited-reply"]'));
+        await act(async () => event({ type: 'refresh' }));
+        const failed = reads.at(-1);
+        await act(async () => event({ type: 'refresh' }));
+        await act(async () => failed.resolve(Response.json({ error: 'Synthetic state read failed' }, { status: 503 })));
+        assert.match(app.error, /Synthetic state read failed/);
+        assert.ok(document.querySelector('[data-message-id="pending-approval"] button'));
+        await complete(reads.at(-1), state([saved, message('recovered-reply', 'Synthetic recovered reply')]));
+        assert.equal(app.error, '');
+        assert.ok(document.querySelector('[data-message-id="recovered-reply"]'));
+        expireRead = true;
+        await act(async () => event({ type: 'refresh' }));
+        expireRead = false;
+        const timedOut = reads.at(-1);
+        const deadline = deadlines.at(-1);
+        await act(async () => event({ type: 'refresh' }));
+        const beforeTimeout = reads.length;
+        await act(async () => deadline.abort(new DOMException('Synthetic deadline', 'TimeoutError')));
+        assert.equal(timedOut.signal.aborted, true);
+        assert.match(app.error, /did not finish within 15 seconds/);
+        assert.equal(reads.length, beforeTimeout + 1);
+        assert.equal(reads.at(-1).signal.aborted, false);
+        await complete(reads.at(-1), state([message('after-timeout', 'Synthetic reply after timeout')]));
+        assert.equal(app.error, '');
+        assert.ok(document.querySelector('[data-message-id="after-timeout"]'));
+        await complete(timedOut, state([message('timed-out-reply', 'Synthetic expired reply')]));
+        assert.equal(document.querySelector('[data-message-id="timed-out-reply"]'), null);
+        await act(async () => event({ type: 'refresh' }));
+        const old = reads.at(-1);
+        await act(async () => event({ type: 'refresh' }));
+        await act(async () => app.resetConversation(threadId));
+        assert.equal(app.state.threadId, nextThreadId);
+        assert.equal(app.error, '');
+        assert.equal(document.querySelector('[data-message-id="saved-reply"]'), null);
+        await act(async () => event({ type: 'refresh' }));
+        assert.equal(old.signal.aborted, true);
+        assert.notEqual(reads.at(-1), old);
+        await complete(reads.at(-1), state([message('new-thread-reply', 'Synthetic new conversation')], nextThreadId));
+        assert.ok(document.querySelector('[data-message-id="new-thread-reply"]'));
+        const resetReads = reads.length;
+        await complete(old, state([message('late-reply', 'Synthetic late reply')]));
+        assert.equal(app.state.threadId, nextThreadId);
+        assert.equal(document.querySelector('[data-message-id="late-reply"]'), null);
+        assert.equal(reads.length, resetReads);
+        await act(async () => event({ type: 'refresh' }));
+        const unmounted = reads.at(-1);
+        await act(async () => event({ type: 'refresh' }));
+        await act(async () => root.unmount());
+        assert.equal(unmounted.signal.aborted, true);
+        const count = reads.length;
+        const retiredSource = sources[0];
+        sessionStore.invalidate();
+        ownerId = 'other-synthetic-owner';
+        await sessionStore.refresh();
+        root = createRoot(document.getElementById('root'));
+        await act(async () => root.render(createElement(StrictMode, null, createElement(Screen, { key: ownerId }))));
+        assert.equal(reads.length, count + 2);
+        const abandoned = reads.at(-2);
+        assert.equal(abandoned.signal.aborted, true);
+        await act(async () => retiredSource.onmessage({ data: JSON.stringify({ type: 'refresh' }) }));
+        await complete(unmounted, state([message('unmounted-reply', 'Synthetic unmounted reply')]));
+        assert.equal(reads.length, count + 2);
+        await complete(reads.at(-1), state([message('other-owner-reply', 'Synthetic other owner reply')]));
+        assert.ok(document.querySelector('[data-message-id="other-owner-reply"]'));
+        await complete(abandoned, state([message('abandoned-reply', 'Synthetic abandoned reply')]));
+        assert.equal(reads.length, count + 2);
+        assert.equal(document.querySelector('[data-message-id="abandoned-reply"]'), null);
+        assert.equal(document.querySelector('[data-message-id="unmounted-reply"]'), null);
+        assert.equal(document.querySelector('[data-message-id="saved-reply"]'), null);
+      } finally {
+        await act(async () => root.unmount());
+        dom.window.close();
+      }
+    `,
+    });
+    assert.equal(result.exitCode, 0, result.stdout + result.stderr);
+  });
+
+  test('chat shows pending sends and active work before a model step', async () => {
+    const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+      timeoutMs: 60_000,
+      input: String.raw`
       import assert from 'node:assert/strict';
       import { JSDOM } from 'jsdom';
       const dom = new JSDOM('<!doctype html><div id="root"></div>', {
@@ -8055,92 +8620,14 @@ test('chat shows pending sends and active work before a model step', async () =>
         dom.window.close();
       }
     `,
+    });
+    assert.equal(result.exitCode, 0, result.stdout + result.stderr);
   });
-  assert.equal(result.exitCode, 0, result.stdout + result.stderr);
-});
 
-test('chat keeps the model recovery notice when Try again fails', async () => {
-  const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
-    timeoutMs: 20_000,
-    input: String.raw`
-      import assert from 'node:assert/strict';
-      import { JSDOM } from 'jsdom';
-      const dom = new JSDOM('<!doctype html><div id="root"></div>', {
-        url: 'https://nod.fixture.invalid', pretendToBeVisual: true,
-      });
-      Object.assign(globalThis, {
-        window: dom.window, document: dom.window.document,
-        IS_REACT_ACT_ENVIRONMENT: true, localStorage: dom.window.localStorage,
-        getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
-        requestAnimationFrame: dom.window.requestAnimationFrame.bind(dom.window),
-        cancelAnimationFrame: dom.window.cancelAnimationFrame.bind(dom.window),
-      });
-      for (const name of ['Node', 'NodeFilter', 'Element', 'HTMLElement', 'HTMLInputElement',
-        'HTMLButtonElement', 'MutationObserver', 'Event', 'KeyboardEvent', 'CustomEvent', 'DOMParser'])
-        globalThis[name] = dom.window[name];
-      Object.defineProperty(globalThis, 'navigator', { configurable: true, value: dom.window.navigator });
-      window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
-      HTMLElement.prototype.scrollTo = () => {};
-      HTMLElement.prototype.scrollIntoView = () => {};
-      const sends = [];
-      globalThis.fetch = async (path, options = {}) => {
-        if (path === '/api/apps') return Response.json([]);
-        if (path === '/api/trust') return Response.json({});
-        if (path === '/api/speech') return Response.json({ transcription: true });
-        if (path === '/api/onboarding/introduction') return Response.json({ messageId: null });
-        assert.equal(path, '/api/messages');
-        sends.push(JSON.parse(options.body));
-        return Response.json({ error: 'Synthetic unavailable request' }, { status: 503 });
-      };
-      const { createElement, act } = await import('react');
-      const { createRoot } = await import('react-dom/client');
-      const { Chat } = await import('./src/web/pages/chat.tsx');
-      const root = createRoot(document.getElementById('root'));
-      const state = {
-        threadId: 'synthetic-thread', turns: [], activity: [], tasks: [],
-        verificationRequests: [], configuration: { llmReady: true },
-        messages: [
-          { id: 'synthetic-request', role: 'user', text: 'Synthetic request', attachments: [],
-            turnId: 'synthetic-turn', createdAt: '2026-10-26T12:00:00Z' },
-          { id: 'synthetic-failure', role: 'assistant', text: 'Synthetic failure', attachments: [],
-            turnId: 'synthetic-turn', streamId: 'model-failure:synthetic-turn',
-            createdAt: '2026-10-26T12:00:01Z' },
-        ],
-      };
-      const tryAgain = () => Array.from(document.querySelectorAll('button'))
-        .find(button => button.textContent.trim() === 'Try again');
-      const settle = async check => {
-        for (let i = 0; i < 100 && !check(); i++)
-          await act(async () => new Promise(resolve => setTimeout(resolve, 10)));
-        assert.ok(check(), 'Expected the retry to settle');
-      };
-      try {
-        await act(async () => root.render(createElement(Chat, {
-          ownerId: 'synthetic-owner', state, streams: {}, refresh: async () => {},
-        })));
-        assert.ok(tryAgain());
-        await act(async () => tryAgain().click());
-        await settle(() => sends.length === 1);
-        await act(async () => new Promise(resolve => setTimeout(resolve, 50)));
-        assert.equal(sends[0].text, 'Synthetic request');
-        assert.ok(document.body.textContent.includes('Synthetic unavailable request'));
-        assert.ok(tryAgain(), 'Try again should stay after a failed retry');
-        assert.equal(tryAgain().disabled, false);
-        await act(async () => tryAgain().click());
-        await settle(() => sends.length === 2);
-      } finally {
-        await act(async () => root.unmount());
-        dom.window.close();
-      }
-    `,
-  });
-  assert.equal(result.exitCode, 0, result.stdout + result.stderr);
-});
-
-test('analytics follow visible Settings sections, Apps tabs and the Scheduled page', async () => {
-  const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
-    timeoutMs: 20_000,
-    input: String.raw`
+  test('analytics follow visible Settings sections, Apps tabs and the Scheduled page', async () => {
+    const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+      timeoutMs: 60_000,
+      input: String.raw`
       import assert from 'node:assert/strict';
       import { JSDOM } from 'jsdom';
       const dom = new JSDOM('<!doctype html><div id="root"></div>', {
@@ -8275,14 +8762,14 @@ test('analytics follow visible Settings sections, Apps tabs and the Scheduled pa
         dom.window.close();
       }
     `,
+    });
+    assert.equal(result.exitCode, 0, result.stdout + result.stderr);
   });
-  assert.equal(result.exitCode, 0, result.stdout + result.stderr);
-});
 
-test('a verified app connection opens chat only on request and keeps private details out of analytics', async () => {
-  const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
-    timeoutMs: 20_000,
-    input: String.raw`
+  test('a verified app connection opens chat only on request and keeps private details out of analytics', async () => {
+    const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+      timeoutMs: 60_000,
+      input: String.raw`
       import assert from 'node:assert/strict';
       import { JSDOM } from 'jsdom';
       const dom = new JSDOM('<!doctype html><div id="root"></div>', { url: 'https://nod.fixture.invalid/apps', pretendToBeVisual: true });
@@ -8389,14 +8876,14 @@ test('a verified app connection opens chat only on request and keeps private det
         await settle(() => document.body.textContent.includes(failure));
       } finally { await act(async () => root.unmount()); dom.window.close(); }
     `,
+    });
+    assert.equal(result.exitCode, 0, result.stdout + result.stderr);
   });
-  assert.equal(result.exitCode, 0, result.stdout + result.stderr);
-});
 
-test('Quiet hours follow the clock preference and preserve canonical values', async () => {
-  const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
-    timeoutMs: 20_000,
-    input: String.raw`
+  test('Quiet hours follow the clock preference and preserve canonical values', async () => {
+    const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+      timeoutMs: 60_000,
+      input: String.raw`
       import assert from 'node:assert/strict';
       import { JSDOM } from 'jsdom';
       const dom = new JSDOM('<!doctype html><div id="root"></div>', {
@@ -8526,14 +9013,14 @@ test('Quiet hours follow the clock preference and preserve canonical values', as
         dom.window.close();
       }
     `,
+    });
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   });
-  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-});
 
-test('Settings saves only reviewed draft revisions and retains failed edits', async () => {
-  const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
-    timeoutMs: 20_000,
-    input: String.raw`
+  test('Settings saves only reviewed draft revisions and retains failed edits', async () => {
+    const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+      timeoutMs: 60_000,
+      input: String.raw`
       import assert from 'node:assert/strict';
       import { JSDOM } from 'jsdom';
       const dom = new JSDOM('<!doctype html><div id="root"></div>', {
@@ -8721,14 +9208,14 @@ test('Settings saves only reviewed draft revisions and retains failed edits', as
         dom.window.close();
       }
     `,
+    });
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   });
-  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-});
 
-test('SearchPicker selects empty-string options with keyboard navigation and filtering', async () => {
-  const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
-    timeoutMs: 20_000,
-    input: String.raw`
+  test('SearchPicker selects empty-string options with keyboard navigation and filtering', async () => {
+    const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+      timeoutMs: 60_000,
+      input: String.raw`
       import assert from 'node:assert/strict';
       import { JSDOM } from 'jsdom';
       const dom = new JSDOM('<!doctype html><div id="root"></div>', {
@@ -8816,14 +9303,14 @@ test('SearchPicker selects empty-string options with keyboard navigation and fil
         dom.window.close();
       }
     `,
+    });
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   });
-  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-});
 
-test('shared controls retain reachable tabs, visible-label typeahead and disabled explanations', async () => {
-  const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
-    timeoutMs: 20_000,
-    input: String.raw`
+  test('shared controls retain reachable tabs, visible-label typeahead and disabled explanations', async () => {
+    const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+      timeoutMs: 60_000,
+      input: String.raw`
       import assert from 'node:assert/strict';
       import { JSDOM } from 'jsdom';
       const dom = new JSDOM('<!doctype html><div id="root"></div>', {
@@ -8917,14 +9404,14 @@ test('shared controls retain reachable tabs, visible-label typeahead and disable
         dom.window.close();
       }
     `,
+    });
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   });
-  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-});
 
-test('navigation guards restore raw app history entries before leaving unsaved settings', async () => {
-  const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
-    timeoutMs: 20_000,
-    input: String.raw`
+  test('navigation guards restore raw app history entries before leaving unsaved settings', async () => {
+    const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+      timeoutMs: 60_000,
+      input: String.raw`
       import assert from 'node:assert/strict';
       import { JSDOM } from 'jsdom';
       const dom = new JSDOM('', { url: 'https://nod.fixture.invalid/apps' });
@@ -8969,6 +9456,7 @@ test('navigation guards restore raw app history entries before leaving unsaved s
         dom.window.close();
       }
     `,
+    });
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   });
-  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
 });

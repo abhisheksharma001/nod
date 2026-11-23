@@ -187,10 +187,15 @@ export function createComposioProxy(options: {
     disableVersionCheck: true,
     fileUploadDirs: false,
   });
+  const verbs = ['get', 'post', 'patch', 'put', 'delete'] as const;
   function signedClient<TClient extends ComposioClient>(raw: TClient): TClient {
     const derive = raw.withOptions.bind(raw);
     raw.withOptions = (value) => signedClient(derive({ ...value, maxRetries: 0 }));
-    raw.request = <T>(value: Parameters<ComposioClient['request']>[0]) => {
+    const send = <T>(
+      verb: (typeof verbs)[number],
+      path: string,
+      value: Parameters<ComposioClient['post']>[1] = {},
+    ) => {
       const signal = value.signal;
       const controller = new AbortController();
       const abort = () => controller.abort(new APIUserAbortError());
@@ -238,7 +243,7 @@ export function createComposioProxy(options: {
                     signal: AbortSignal.any([input.signal, controller.signal]),
                   }),
               },
-            }).request<T>({ ...value, signal: controller.signal, maxRetries: 0 });
+            })[verb]<T>(path, { ...value, signal: controller.signal, maxRetries: 0 });
             resolve(operation.asResponse());
           } catch (error) {
             reject(error);
@@ -266,6 +271,7 @@ export function createComposioProxy(options: {
         }
       });
     };
+    for (const verb of verbs) raw[verb] = (path, value) => send(verb, path, value);
     return raw;
   }
   signedClient(client.getClient());
@@ -290,6 +296,7 @@ export function createComposioProxy(options: {
           signal.throwIfAborted();
           return undefined;
         });
+      refused({ status: response.status, error: refusal });
       throw new IntegrationConnectionError(
         connectionReason(response.status, false, false) ?? 'unavailable',
         'link',
@@ -547,5 +554,8 @@ export function createComposioProxy(options: {
       };
     },
     isPendingAccount: (id: string) => id.startsWith(pendingPrefix),
+    finishPendingAccount(id: string) {
+      if (id.startsWith(pendingPrefix)) options.browser?.finish(id.slice(pendingPrefix.length));
+    },
   };
 }

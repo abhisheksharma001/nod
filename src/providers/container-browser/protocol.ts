@@ -1,4 +1,4 @@
-import { browserErrorCodes } from '../../shared/browser-errors.ts';
+import { browserErrorCodes, browserSignInGuards } from '../../shared/browser-errors.ts';
 import { z } from 'zod';
 import { browserHandoffInput } from '../../shared/browser-handoff.ts';
 import { fileBytes } from '../../shared/files.ts';
@@ -31,10 +31,6 @@ const browserDownloadInput = z
       .optional(),
     expectOrigin: z.string().min(1).max(2048).optional(),
     expectUrl: z.string().min(1).max(8192).optional(),
-    expectSelections: z
-      .string()
-      .regex(/^[0-9a-f]{64}$/)
-      .optional(),
     expectTarget: z
       .string()
       .regex(/^[0-9a-f]{64}$/)
@@ -87,10 +83,6 @@ const browserAction = z
     locale: z.string().max(35).optional(),
     expectOrigin: z.string().min(1).max(2048).optional(),
     expectUrl: z.string().min(1).max(8192).optional(),
-    expectSelections: z
-      .string()
-      .regex(/^[0-9a-f]{64}$/)
-      .optional(),
     expectTarget: z
       .string()
       .regex(/^[0-9a-f]{64}$/)
@@ -192,10 +184,6 @@ export const browserRequest = z.discriminatedUnion('method', [
           size: z.number().int().min(1).max(fileBytes),
           expectOrigin: z.string().min(1).max(2048).optional(),
           expectUrl: z.string().min(1).max(8192).optional(),
-          expectSelections: z
-            .string()
-            .regex(/^[0-9a-f]{64}$/)
-            .optional(),
           expectTarget: z
             .string()
             .regex(/^[0-9a-f]{64}$/)
@@ -346,6 +334,7 @@ export const browserResponse = z.discriminatedUnion('ok', [
       ok: z.literal(false),
       error: z.union([z.enum(['cancelled', 'locked', 'unavailable']), z.enum(browserErrorCodes)]),
       detail: z.string().optional(),
+      signInGuard: z.enum(browserSignInGuards).optional(),
       metadata: browserMetadata,
     })
     .strict(),

@@ -42,7 +42,7 @@ type Step = {
 
 test(
   'memory keeps only the owner’s own words, silently, and moves a pasted import into notes',
-  { skip: !process.env.TEST_DATABASE_URL, timeout: 30_000 },
+  { skip: !process.env.TEST_DATABASE_URL, timeout: 120_000 },
   async (t) => {
     const suffix = randomUUID().replaceAll('-', '').slice(0, 16);
     const schema = `test_memory_app_${suffix}`;
@@ -229,7 +229,7 @@ test(
       return id;
     };
     const personal = (action: string, args: Record<string, unknown>, rejected = false): Step => ({
-      tool: 'manage_personal_context',
+      tool: /^(memory_|history_search|notification_preferences_)/.test(action) ? 'memory' : 'nod',
       args: { action, args },
       rejected,
     });
@@ -267,6 +267,58 @@ test(
         await application.app.inject({ method: 'GET', url: '/api/memory', headers })
       ).json() as MemoryView;
     try {
+      await t.test('API text is refused before route handling', async () => {
+        const handled = t.mock.fn();
+        application.app.addHook('preHandler', async () => {
+          handled();
+        });
+        const nul = 'Synthetic\u0000text';
+        for (const [method, url, payload] of [
+          ['POST', '/api/messages', { clientMessageId: randomUUID(), text: nul }],
+          ['PATCH', '/api/preferences', { rules: nul }],
+          ['PATCH', '/api/preferences', { notificationRule: nul }],
+          [
+            'POST',
+            '/api/schedules',
+            {
+              title: nul,
+              prompt: 'Synthetic',
+              kind: 'recurring',
+              cron: '0 9 * * *',
+              timeZone: 'UTC',
+            },
+          ],
+          [
+            'POST',
+            '/api/schedules',
+            {
+              title: 'Synthetic',
+              prompt: nul,
+              kind: 'recurring',
+              cron: '0 9 * * *',
+              timeZone: 'UTC',
+            },
+          ],
+          ['GET', '/api/messages/search?q=%00', undefined],
+          ['GET', '/api/messages/around/%00', undefined],
+          ['PATCH', '/api/preferences', { 'Synthetic\u0000key': 'Synthetic' }],
+          [
+            'POST',
+            '/api/messages',
+            { clientMessageId: randomUUID(), text: 'Synthetic', extra: [{ text: nul }] },
+          ],
+        ] as const) {
+          const refused = await application.app.inject({
+            method,
+            url,
+            headers: { ...headers, ...(payload ? { 'content-type': 'application/json' } : {}) },
+            payload,
+          });
+          assert.equal(refused.statusCode, 400, `${method} ${url}`);
+          assert.match(refused.json().error, /null character/);
+        }
+        assert.equal(handled.mock.callCount(), 0);
+      });
       await t.test(
         'one backend serves setup while queued turns wait for the computer',
         async () => {
@@ -383,6 +435,33 @@ test(
       const explicitTurn = await ask(explicit, [learn()]);
       assert.deepEqual((await savedEntry(explicit))?.sources, [await sourceOf(explicitTurn)]);
       await assertSilent(explicitTurn);
+
+      const punctuation = 'Remember that I prefer “compact reports”.';
+      const support = punctuation.replace(/[“”]/g, '"');
+      rememberAnswer = (input) => ({
+        ops: keep(input, [punctuation], 'preferences').map((op) => ({
+          ...op,
+          quote: support,
+        })),
+      });
+      const punctuationTurn = await ask(punctuation, [learn()]);
+      const punctuationNote = (await application.memory.load()).entries.find(
+        (entry) => entry.text === punctuation,
+      );
+      assert.ok(punctuationNote);
+      const supported = await application.memory.read({
+        path: `preferences/${punctuationNote.slug}`,
+      });
+      assert.ok('sources' in supported);
+      assert.deepEqual(
+        supported.sources.map(({ id, text }) => ({ id, text })),
+        [{ id: await sourceOf(punctuationTurn), text: support }],
+      );
+      assert.equal(
+        (await view()).notes.find((entry) => entry.path === supported.path)?.sources[0].quote,
+        support,
+      );
+      await assertSilent(punctuationTurn);
 
       const skill = (args: Record<string, unknown>, rejected = false): Step => ({
         tool: 'skills',
@@ -896,6 +975,74 @@ test('memory notes keep their line breaks from every writer while other control 
     ),
     { applied: [], rejected: ['quote'] },
   );
+  for (const [said, quoted] of [
+    ['I\u2019m allergic to peanuts', "I'm allergic to peanuts"],
+    ["I'm allergic to peanuts", 'I\u2019m allergic to peanuts'],
+    ['Call it \u201cthe shed\u201d', 'Call it "the shed"'],
+    ...[...'“”«»„‟'].flatMap((mark) => [
+      [`Call it ${mark}the shed${mark}`, 'Call it "the shed"'],
+      ['Call it "the shed"', `Call it ${mark}the shed${mark}`],
+    ]),
+    ...[...'‘’‚‛‹›'].flatMap((mark) => [
+      [`I${mark}m ready`, "I'm ready"],
+      ["I'm ready", `I${mark}m ready`],
+    ]),
+  ]) {
+    let source = said;
+    const supported = createMemoryService({
+      ownerId: 'quote-owner',
+      store: memoryObjectStore(),
+      pool: {
+        query: async (_sql: string, values: unknown[]) => {
+          assert.deepEqual(values, ['quote-owner', [ids[1]]]);
+          return {
+            rows: [{ id: ids[1], text: source, created_at: new Date(when), channel: 'web' }],
+          };
+        },
+      } as unknown as pg.Pool,
+    });
+    const result = await supported.edit((tree) =>
+      applyOps(
+        tree,
+        [add('Synthetic quote preference', quoted)],
+        [{ id: ids[1], text: said }],
+        when,
+        'stated',
+      ),
+    );
+    assert.deepEqual(result.rejected, [], said);
+    const note = await supported.read({ path: 'preferences/email-signoff' });
+    assert.ok('sources' in note);
+    assert.deepEqual(
+      note.sources.map(({ id, text }) => ({ id, text })),
+      [{ id: ids[1], text: quoted }],
+    );
+    assert.equal((await supported.view()).notes[0].sources[0].quote, quoted);
+    source = 'A different synthetic message.';
+    const changed = await supported.read({ path: 'preferences/email-signoff' });
+    assert.ok('sources' in changed);
+    assert.equal(changed.sources[0].text, null);
+    assert.equal((await supported.view()).notes[0].sources[0].quote, undefined);
+  }
+  for (const [said, quoted, m] of [
+    ['I\u2019m allergic to peanuts', "I'm allergic to cashews", [1]],
+    ['I\u2019m allergic to peanuts', "I'm allergic to peanuts", [2]],
+    ['Use short reports.', 'Use', [1, 2]],
+    ['Use short—clear reports.', 'Use short-clear reports.', [1]],
+    ['Use short… reports.', 'Use short... reports.', [1]],
+    ['Iʼm ready', "I'm ready", [1]],
+  ] as const)
+    assert.deepEqual(
+      applyOps(
+        emptyTree(),
+        [{ ...add('Synthetic quote preference', quoted), m }],
+        [{ id: ids[1], text: said }],
+        when,
+        'stated',
+      ).rejected,
+      ['quote'],
+      said,
+    );
   assert.deepEqual(
     applyOps(
       emptyTree(),
