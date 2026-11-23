@@ -1259,7 +1259,6 @@ export function Chat({
   }, [focusTarget, loadingHistory, historyPage, hasEarlier, historyError, visible]);
   async function recover(selection?: ModelSelection) {
     setRecovering(true);
-    setRecovered(lastMessage?.id);
     try {
       if (selection)
         await api('/api/models/selection', {
@@ -1270,12 +1269,9 @@ export function Chat({
             effort: selection.effort,
           }),
         });
-      if (failedRequest) {
-        const result = await send(failedRequest, [], null);
-        if (!result.sent) setRecovered(undefined);
-      }
+      if (failedRequest) await send(failedRequest, [], null);
+      else setRecovered(lastMessage?.id);
     } catch (error) {
-      setRecovered(undefined);
       setError(errorMessage(error));
     } finally {
       setRecovering(false);
