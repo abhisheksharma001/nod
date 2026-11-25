@@ -12,6 +12,7 @@ import { becauseOf, type TrustBasis } from './trust-basis.ts';
 import type { TurnRef } from './thread.ts';
 import { turnOrigin } from './approvals.ts';
 import { turnChainSql } from './turn-chain.ts';
+import { logFailure } from './failure-log.ts';
 import { credentialOrigin, VaultError } from './vault.ts';
 
 type Kind = 'sign_in' | 'session' | 'form';
@@ -356,6 +357,7 @@ export async function createVaultAccess(
       scope.setErrorHandler((error, _request, reply) => {
         const status =
           error instanceof VaultError ? error.statusCode : error instanceof z.ZodError ? 400 : 500;
+        if (status >= 500) logFailure('vault_activity_failed', error);
         reply.code(status).send({
           error:
             error instanceof VaultError
