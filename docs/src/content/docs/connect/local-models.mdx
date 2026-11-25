@@ -161,7 +161,7 @@ If the server offers Ollama model details, Nod uses its capability list to filte
 | **This server has no models Nod can use**                     | Nod skips models whose Ollama capability list has no tool support. Pull or load a model with tool support, then try again.                               |
 | Nod ignores your request, forgets its tools or repeats itself | The context is too small. Raise it to 65,536 or more and reload the model.                                                                               |
 | A new model doesn't appear on a server added in Settings      | Open **Manage** next to the connection, choose **Add connection**, then enter the same server address and API key, if used. This updates its model list. |
-| **Needs attention** next to a server set in `.env`            | Start the server, open **Manage** next to the connection, then choose **Load models** or **Try again**.                                                  |
+| **Needs attention** next to a server set in `.env`            | Start the server, open **Manage** next to the connection, then choose **Try again**.                                                                     |
 | **Needs attention** next to a server added in Settings        | Nod can't read the connection's saved settings. Open **Manage**, remove the connection, then add the server again.                                       |
 | Nod asks before almost everything, or acts without asking     | Check the separate Trust connection and its mode. A failed check requires confirmation in chat and tasks.                                                |
 
