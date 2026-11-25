@@ -137,7 +137,7 @@ export function masked(value: unknown) {
   return JSON.stringify(value ?? null, (_key, entry: unknown) => {
     if (typeof entry !== 'string' || !/^\s*[[{]/.test(entry)) return entry;
     try {
-      return JSON.parse(entry) as unknown;
+      return withoutSecretKeys(JSON.parse(entry));
     } catch {
       return entry;
     }
