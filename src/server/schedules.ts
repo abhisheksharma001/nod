@@ -245,8 +245,9 @@ export function createSchedules(dependencies: ScheduleDependencies) {
   function validateTiming(
     input: z.infer<typeof timingSchema> & { watch?: string[] | null },
     enabled: boolean,
+    zoneChanged = true,
   ) {
-    if (!ianaTimeZone(input.timeZone)) throw invalid('Choose a valid time zone.');
+    if (zoneChanged && !ianaTimeZone(input.timeZone)) throw invalid('Choose a valid time zone.');
     if (input.kind === 'once') {
       if (input.watch) throw invalid('Only a recurring schedule can watch accounts.');
       if (!input.runAt || input.cron)
@@ -969,7 +970,11 @@ export function createSchedules(dependencies: ScheduleDependencies) {
             : previous.runAt?.toISOString()
           : input.runAt,
     };
-    validateTiming(next, next.enabled && (input.enabled === true || input.runAt !== undefined));
+    validateTiming(
+      next,
+      next.enabled && (input.enabled === true || input.runAt !== undefined),
+      input.timeZone !== undefined,
+    );
     return next;
   }
 

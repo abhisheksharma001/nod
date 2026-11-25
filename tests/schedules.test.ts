@@ -816,6 +816,39 @@ test(
       });
 
       await t.test(
+        'a schedule saved with an unformattable zone can still be renamed and paused',
+        async () => {
+          for (const kind of ['recurring', 'once'] as const) {
+            const schedule = await create(
+              kind === 'once' ? { kind, runAt: '2035-11-06T10:00:00Z' } : { cron: '0 9 * * *' },
+            );
+            await db.pool.query('UPDATE schedules SET time_zone=$2 WHERE id=$1', [
+              schedule.id,
+              'UTC+5',
+            ]);
+            const renamed = await request('PATCH', `/api/schedules/${schedule.id}`, {
+              title: 'Renamed legacy schedule',
+            });
+            assert.equal(renamed.statusCode, 200, renamed.body);
+            const paused = await request('PATCH', `/api/schedules/${schedule.id}`, {
+              enabled: false,
+            });
+            assert.equal(paused.statusCode, 200, paused.body);
+            assert.equal((await personal.getSchedule(schedule.id)).enabled, false);
+            assert.equal(
+              (
+                await request('PATCH', `/api/schedules/${schedule.id}`, {
+                  timeZone: 'UTC+5',
+                })
+              ).statusCode,
+              400,
+            );
+            await request('DELETE', `/api/schedules/${schedule.id}`);
+          }
+        },
+      );
+
+      await t.test(
         'schedule editor changes retain the intended recurrence and exact run time',
         async () => {
           const edited = await create({ cron: '0 9 * * *' });
