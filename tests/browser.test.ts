@@ -5066,11 +5066,11 @@ describe('interface components', { concurrency: interfaceLanes }, () => {
         await act(async () => frame.dispatchEvent(new Event('load')));
         let screen = document.querySelector('.browser-handoff-screen');
         assert.equal(screen.getAttribute('aria-disabled'), 'false');
-        const press = async (type, button) => {
+        const press = async (type, button, clientX = 50) => {
           let allowed;
           await act(async () => {
             allowed = frame.dispatchEvent(new dom.window.MouseEvent(type, {
-              button, clientX: 50, clientY: 50, bubbles: true, cancelable: true,
+              button, clientX, clientY: 50, bubbles: true, cancelable: true,
             }));
           });
           return allowed;
@@ -5079,6 +5079,12 @@ describe('interface components', { concurrency: interfaceLanes }, () => {
           assert.equal(await press('mousedown', button), false);
           assert.equal(await press('mouseup', button), false);
         }
+        frame.getBoundingClientRect = () => ({ left: 0, top: 0, width: 200, height: 100 });
+        for (const button of [3, 4]) {
+          assert.equal(await press('mousedown', button, 10), false);
+          assert.equal(await press('mouseup', button, 10), false);
+        }
+        frame.getBoundingClientRect = () => ({ left: 0, top: 0, width: 100, height: 100 });
         assert.deepEqual(received, []);
         await press('mousedown', 0);
         await press('mouseup', 0);
