@@ -181,7 +181,7 @@ const omittedOutput = '[Earlier output omitted]\n';
 function commandOutput(redact: (text: string) => string, text: string) {
   const safe = redact(text);
   return safe.length > commandOutputChars
-    ? `${omittedOutput}${safe.slice(-(commandOutputChars - omittedOutput.length))}`
+    ? `${omittedOutput}${safe.slice(-(commandOutputChars - omittedOutput.length)).replace(/^[\uDC00-\uDFFF]/, '')}`
     : safe;
 }
 
@@ -546,7 +546,9 @@ export function createAgentRuntime(dependencies: {
         const commandLine = (params as { command?: unknown } | null)?.command;
         const command =
           redactCommand && typeof commandLine === 'string'
-            ? redactCommand(commandLine).slice(0, 4000)
+            ? redactCommand(commandLine)
+                .slice(0, 4000)
+                .replace(/[\uD800-\uDBFF]$/, '')
             : undefined;
         const event = (record?: WorkspaceCommandRecord) => {
           const web = webTarget(name, params, dependencies.redactError ?? String);
