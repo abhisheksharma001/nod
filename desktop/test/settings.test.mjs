@@ -5223,7 +5223,7 @@ test('the remote desktop starts without a local runtime and fences tokens to its
     assert.equal(window.url, url);
     assert.match(window.options.webPreferences.partition, /^persist:nod-server-/);
     assert.equal(requests[0].options.headers.Authorization, `Bearer ${token}`);
-    assert.equal(requests[0].options.redirect, 'error');
+    assert.equal(requests[0].options.redirect, 'manual');
     const frame = window.webContents.mainFrame;
     const appSession = f.appSessions.get(window.options.webPreferences.partition);
     assert.equal(typeof appSession.permissionCheck, 'function');
@@ -5923,6 +5923,7 @@ test('remote connection verification rejects redirects before a second server re
   const f = await runningDesktop(t, fetch, { initialState: 'fresh' });
   await assert.rejects(
     f.checkRemoteConnection({ url: `http://127.0.0.1:${source.address().port}`, token }),
+    (error) => error.message.includes('302') && !error.message.includes(token),
   );
   assert.equal(redirected, 0);
   assert.equal(await f.storage.store.connection(), null);
