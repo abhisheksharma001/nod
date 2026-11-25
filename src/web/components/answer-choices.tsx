@@ -199,7 +199,8 @@ export function AnswerChoices({
               setError('');
             }}
             onKeyDown={(event) => {
-              if (event.key !== 'Enter' || event.nativeEvent.isComposing) return;
+              if (event.key !== 'Enter' || event.nativeEvent.isComposing || event.keyCode === 229)
+                return;
               event.preventDefault();
               finish();
             }}
