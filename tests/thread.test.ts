@@ -14527,6 +14527,12 @@ test('the onboarding brief masks each link and keeps the fields after it', async
   assert.deepEqual(JSON.parse(masked(JSON.stringify(textResult))), {
     data: { text: { items: [event, event].map((item) => ({ ...item, htmlLink: '[link]' })) } },
   });
+  const secretText = {
+    data: { text: JSON.stringify({ accessToken: 'synthetic-inner-value', summary: 'Planning' }) },
+  };
+  assert.deepEqual(JSON.parse(masked(secretText)), {
+    data: { text: { accessToken: '[redacted]', summary: 'Planning' } },
+  });
   const quoted = { note: 'Open https://files.example.test/a"b?token=zzz then reply', next: 'kept' };
   const brief = masked(JSON.stringify(quoted));
   assert.deepEqual(JSON.parse(brief), { note: 'Open [link] then reply', next: 'kept' });
