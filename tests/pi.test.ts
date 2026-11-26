@@ -10835,7 +10835,14 @@ test('a busy work model moves compaction to the backup after one retry', async (
   await session.prompt('First synthetic question.', []);
   await session.prompt('Second synthetic question.', []);
   await session.dispose();
-  assert.ok(requests.includes('fixture-backup'), JSON.stringify(requests));
+  assert.deepEqual(requests.slice(0, 5), [
+    'fixture-primary',
+    'fixture-primary',
+    'fixture-primary',
+    'fixture-primary',
+    'fixture-backup',
+  ]);
+  assert.ok(requests.slice(5).every((model) => model === 'fixture-backup'));
   assert.ok(events.some((event) => event.type === 'final' && /fixture-backup/.test(event.text)));
 });
 
