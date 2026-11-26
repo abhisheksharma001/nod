@@ -336,6 +336,8 @@ test('command output removes whole secrets before taking a bounded tail', async 
   assert.equal(records[5]?.output, '{"name":"password","value":"[redacted]"}');
   assert.equal(records.length, 10);
   assert.equal(/\\ud[89a-f][0-9a-f]{2}/i.test(JSON.stringify(records)), false);
+  assert.equal(records[6]?.command, 'x'.repeat(3999));
+  assert.equal(records[7]?.output, `[Earlier output omitted]\n${'b'.repeat(15_974)}`);
 });
 
 test('partial delivery continues across browser and app reads in chat and saved tasks', async () => {
