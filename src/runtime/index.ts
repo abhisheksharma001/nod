@@ -353,7 +353,7 @@ export function createAgentRuntime(dependencies: {
     const stripToolMarkup = (text: string) =>
       text
         .replace(
-          /^[ \t]*((`|~)\2{2,})[^\n]*\n[\s\S]*?(?:^[ \t]*\1\2*[ \t]*$|(?![\s\S]))|(?<!`)(`+)(?!`)[^\n]*?[^`\n]\3(?!`)|<(?:antml:)?(function_calls(?=>)|invoke(?=\s+name=))[\s\S]*?(?:<\/(?:antml:)?\4>|(?![\s\S]))|<\/(?:antml:)?(?:invoke|function_calls|parameter)>/gim,
+          /^[ \t]*((`|~)\2{2,})(?!\2)[^\n]*\n[\s\S]*?(?:^[ \t]*\1\2*[ \t]*$|(?![\s\S]))|(?<!`)(`+)(?!`)[^\n]*?[^`\n]\3(?!`)|<(?:antml:)?(function_calls(?=>)|invoke(?=\s+name=))[\s\S]*?(?:<\/(?:antml:)?\4>|(?![\s\S]))|<\/(?:antml:)?(?:invoke|function_calls|parameter)>/gim,
           (match, fence, _char, code) => (fence || code ? match : ''),
         )
         .replace(/[\u200b\ufeff]+$/g, '')
