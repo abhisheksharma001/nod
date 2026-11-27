@@ -574,7 +574,8 @@ export function MessageBubble({
                 (result === true || result === 'unavailable') &&
                 focused &&
                 articleElement.current?.isConnected &&
-                (document.activeElement === focused || document.activeElement === document.body)
+                (document.activeElement === focused ||
+                  (document.activeElement === document.body && !focused.isConnected))
               )
                 articleElement.current.focus({ preventScroll: true });
               if (result === true) {
