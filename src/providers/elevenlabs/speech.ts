@@ -116,7 +116,7 @@ export function createElevenLabsSpeechProvider(options: {
     if (![401, 403].includes(response.status)) return;
     if (response.status === 401) {
       const failure = await modelServiceError(response, 'ElevenLabs', [secret]);
-      if (failure.reason && /\b(?:status|code): quota_exceeded\b/.test(failure.details ?? ''))
+      if (failure.reason && failure.codes.includes('quota_exceeded'))
         throw new SpeechProviderError(
           `ElevenLabs refused this request: ${Array.from(failure.reason).slice(0, 300).join('')}`,
         );

@@ -26,6 +26,7 @@ export class ModelServiceError extends Error {
     readonly reason?: string,
     readonly status?: number,
     readonly details?: string,
+    readonly codes: string[] = [],
   ) {
     super(message);
   }
@@ -39,6 +40,7 @@ export async function modelServiceError(
 ) {
   let reason = response.statusText;
   let serviceReason: string | undefined;
+  let codes: string[] = [];
   const reader = response.body?.getReader();
   try {
     if (
@@ -78,6 +80,7 @@ export async function modelServiceError(
             : [];
         });
         if (fields.length) reason = fields.join('; ');
+        codes = [error.code, error.status].filter((value) => typeof value === 'string');
       }
     }
   } catch {
@@ -93,5 +96,6 @@ export async function modelServiceError(
       ? response.status
       : undefined,
     details,
+    codes,
   );
 }
