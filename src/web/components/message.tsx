@@ -502,6 +502,7 @@ export function MessageBubble({
   const pickedChoice = picked.length === 1 ? pickedChoices[0] : undefined;
   const cardPick: CardPick | null = pickChoices.length
     ? {
+        answer: pickQuestion?.choiceAnswer?.text,
         chosen: answered.length ? answered : picked,
         written,
         multiple,

@@ -10,6 +10,7 @@ import {
 import { AlertCircle, Check, ChevronDown, ExternalLink, LockKeyhole, Send } from './icons';
 
 export interface CardPick {
+  answer?: string;
   chosen: number[];
   written: string;
   multiple?: boolean;
@@ -70,7 +71,8 @@ export function CardPickSend({
       </div>
     );
   const open = pick && !pick.sent;
-  if (!open && !extra) return null;
+  const answer = pick?.sent ? pick.answer : undefined;
+  if (!open && !extra && !answer) return null;
   const written = pick?.written.trim() ?? '';
   const idle = !open || pick.disabled || (!written && !action && !pick.chosen.length);
   const send = () => {
@@ -115,6 +117,7 @@ export function CardPickSend({
           </button>
         </>
       )}
+      {answer && <p className="card-pick-answer">{answer}</p>}
       {extra}
     </div>
   );
