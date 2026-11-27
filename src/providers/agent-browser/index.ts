@@ -462,6 +462,7 @@ export function createAgentBrowserComputer(options: {
       state.seenTabs.delete(next);
       if (
         signal?.aborted ||
+        error instanceof DaemonTransportError ||
         !state.targetId ||
         !owner.watch.tabs(state.root).includes(state.targetId)
       )
