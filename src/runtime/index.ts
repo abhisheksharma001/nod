@@ -352,8 +352,10 @@ export function createAgentRuntime(dependencies: {
     const speaks = !context.proactivity && (!context.background || Boolean(context.taskContext));
     const stripToolMarkup = (text: string) =>
       text
-        .replace(/<invoke\b[\s\S]*?(?:<\/invoke>|$)/gi, '')
-        .replace(/<\/?(?:invoke|parameter|function_calls|antml:[a-z_]+)\b[^>]*>/gi, '')
+        .replace(
+          /^[ \t]*(`{3,}|~{3,})[^\n]*\n[\s\S]*?(?:^[ \t]*\1[ \t]*$|(?![\s\S]))|(`[^`\n]+`)|<(?:antml:)?(function_calls(?=>)|invoke(?=\s+name=))[\s\S]*?(?:<\/(?:antml:)?\3>|(?![\s\S]))|<\/(?:antml:)?(?:invoke|function_calls|parameter)>/gim,
+          (match, fence, code) => (fence || code ? match : ''),
+        )
         .replace(/[\u200b\ufeff]+$/g, '')
         .trim();
     const words = (text: string) => new Set(text.match(/[\p{L}\p{N}]+/gu) ?? []);
