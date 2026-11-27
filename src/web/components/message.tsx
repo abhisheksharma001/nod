@@ -562,11 +562,21 @@ export function MessageBubble({
                     : { choiceIds },
               );
           if (!outcome) return;
+          const focused = articleElement.current?.contains(document.activeElement)
+            ? document.activeElement
+            : null;
           setSending(true);
           setError('');
           void outcome.then(
             (result) => {
               setSending(false);
+              if (
+                (result === true || result === 'unavailable') &&
+                focused &&
+                articleElement.current?.isConnected &&
+                (document.activeElement === focused || document.activeElement === document.body)
+              )
+                articleElement.current.focus({ preventScroll: true });
               if (result === true) {
                 setWritten('');
                 if (!chosen.length) setPicked([]);
