@@ -38,8 +38,16 @@ export interface Message {
   answerChoices?: AnswerChoices;
   answerChoicesPending?: boolean;
   choiceAnswer?: { choiceIds: string[]; text?: string };
+  interaction?: {
+    id: string;
+    status: 'open' | 'selected' | 'fulfilled' | 'superseded' | 'expired' | 'cancelled';
+    selectedOptionIds?: string[];
+    validUntil?: string;
+  };
   approval?: MessageApproval;
   cardAnswer?: true;
+  cardChoice?: true;
+  retryable?: boolean;
   work?: { kind: 'task' | 'schedule'; id: string; title: string; turnId?: string };
 }
 export type ApprovalState = 'pending' | 'working' | 'done' | 'declined' | 'expired' | 'uncertain';
@@ -68,7 +76,7 @@ export interface SubmitMessageResponse {
 export interface VerificationRequest {
   id: string;
   turnId: string;
-  kind: 'otp' | 'payment';
+  kind: 'payment';
 }
 export interface Turn {
   id: string;
@@ -191,26 +199,6 @@ export interface VaultImportResult {
   authenticatorKeys: number;
 }
 
-export interface CredentialRequest {
-  id: string;
-  turnId: string;
-  origin: string;
-  label: string;
-  kind: 'identifier' | 'password' | 'otp' | 'method';
-  methods?: { id: string; label: string }[];
-  fields?: { kind: 'identifier' | 'password' | 'otp'; selector: string; label: string }[];
-  status: 'pending' | 'entering' | 'uncertain' | 'filled' | 'expired';
-  notEntered?: boolean;
-  savedEntries?: (VaultLoginEntry & { username: string })[];
-  username?: string;
-  passwordManager?: { name: string; account?: string };
-}
-export interface PasswordManagerLogin {
-  id: string;
-  title: string;
-  username: string;
-  website: string;
-}
 export interface Connection {
   canReconnect?: boolean;
   canRename?: boolean;
