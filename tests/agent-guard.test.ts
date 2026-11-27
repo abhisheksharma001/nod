@@ -448,6 +448,8 @@ test('replies drop leaked tool-call blocks and keep text that only mentions the 
     'The format wraps each call in `<invoke name="get_weather">` with `<parameter name="city">Paris</parameter>` inside, then closes with `</invoke>`. Anything else?';
   const bare =
     'Put the call inside an <invoke> element, then add one <parameter> per argument. Remember the closing tag is required.';
+  const doubled =
+    'Quote a backtick with double backticks, like ``a ` <invoke name="get_weather">``, and keep the rest of the sentence.';
   const cases: Array<[string, string]> = [
     [
       'Your flight is on time.\n<function_calls>\n<invoke name="send_message">\n<parameter name="text">Hello</parameter>\n</invoke>\n</function_calls>',
@@ -463,6 +465,7 @@ test('replies drop leaked tool-call blocks and keep text that only mentions the 
     ],
     [mention, mention],
     [bare, bare],
+    [doubled, doubled],
     [fenced, fenced],
   ];
   const { result, replies } = await fixture(async (tools) => {
