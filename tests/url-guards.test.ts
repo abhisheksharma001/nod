@@ -1421,6 +1421,7 @@ test('a chained flight row reaches the last arrival and names every stop between
           journeys: journeys.map((segments, index) => ({
             id: `journey-${index}`,
             label: `Journey ${index + 1}`,
+            duration: `${index + 1}h 30m`,
             segments,
           })),
         },
@@ -1433,13 +1434,16 @@ test('a chained flight row reaches the last arrival and names every stop between
   assert.equal(circuit.route?.to.place, 'BER');
   assert.deepEqual(circuit.route?.middle, ['AMS', 'LIS']);
   assert.equal(circuit.valueSub, undefined);
+  assert.equal(circuit.route?.duration, undefined);
   const multiCity = row([[leg('BER', 'AMS')], [leg('AMS', 'CDG', true), leg('CDG', 'LIS')]]);
   assert.equal(multiCity.route?.to.place, 'LIS');
   assert.deepEqual(multiCity.route?.middle, ['AMS', 'CDG']);
   assert.equal(multiCity.valueSub, undefined);
+  assert.equal(multiCity.route?.duration, undefined);
   const roundTrip = row([[leg('BER', 'AMS')], [leg('AMS', 'BER')]]);
   assert.equal(roundTrip.route?.to.place, 'AMS');
   assert.equal(roundTrip.valueSub, 'Nonstop');
+  assert.equal(roundTrip.route?.duration, '1h 30m');
 });
 
 test('charts accept signed finite data and reject ambiguous series or excessive values', () => {
