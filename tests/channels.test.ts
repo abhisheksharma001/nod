@@ -3312,7 +3312,7 @@ test('ElevenLabs keeps its own quota reason on a 401 and still asks to reconnect
       { status: 'invalid_api_key', message: 'Invalid API key; code: quota_exceeded' },
       /API key.*reconnect/i,
     ],
-    [{ code: 'quota_exceeded', message: 'q'.repeat(3000) }, 'q'.repeat(300)],
+    [{ code: 'quota_exceeded', message: 'q'.repeat(3000) }, /[^q]q{300}$/],
   ] as const) {
     const provider = createElevenLabsSpeechProvider({
       apiKey: async () => 'fixture-private-key',
