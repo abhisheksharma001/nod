@@ -467,6 +467,10 @@ test('replies drop leaked tool-call blocks and keep text that only mentions the 
     [bare, bare],
     [doubled, doubled],
     [fenced, fenced],
+    [
+      'Example:\n```xml\n<invoke name="get_weather">\n</invoke>\n````\nChecking now.\n<function_calls>\n<invoke name="send_message">\n<parameter name="text">Hello</parameter>\n</invoke>\n</function_calls>',
+      'Example:\n```xml\n<invoke name="get_weather">\n</invoke>\n````\nChecking now.',
+    ],
   ];
   const { result, replies } = await fixture(async (tools) => {
     for (const [text] of cases) await call(tools, 'send_message', { text });
