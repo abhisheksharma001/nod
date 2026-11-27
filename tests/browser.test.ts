@@ -3009,7 +3009,14 @@ describe('native browser controls', { concurrency: 3 }, () => {
       try {
         await computer.act('a', { action: 'open', url: origin });
         failSwitch = true;
-        await assert.rejects(computer.act('a', { action: 'click', selector: '#popup' }));
+        await assert.rejects(
+          computer.act('a', { action: 'click', selector: '#popup' }),
+          (error) => {
+            assert.ok(error instanceof DaemonTransportError);
+            assert.equal(error.kind, 'timeout');
+            return true;
+          },
+        );
         failSwitch = false;
         await computer.act('a', { action: 'open', url: origin });
         assert.match((await computer.act('a', { action: 'snapshot' })).text, /Opener/);
