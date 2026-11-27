@@ -1408,26 +1408,27 @@ test('a chained flight row reaches the last arrival and names every stop between
     technicalStops: [],
     ...(change ? { connectionAfter: { airportChange: 'no', selfTransfer: 'no' } } : {}),
   });
-  const row = (journeys: Array<Array<ReturnType<typeof leg>>>) =>
-    flightItems(
-      presentationSchema.parse({
-        version: 1,
-        type: 'flights',
-        title: 'Synthetic trips',
-        sources: [],
-        options: [
-          {
-            id: 'option',
-            price: 'EUR 350',
-            journeys: journeys.map((segments, index) => ({
-              id: `journey-${index}`,
-              label: `Journey ${index + 1}`,
-              segments,
-            })),
-          },
-        ],
-      }),
-    ).items[0]!;
+  const row = (journeys: Array<Array<ReturnType<typeof leg>>>) => {
+    const card = presentationSchema.parse({
+      version: 1,
+      type: 'flights',
+      title: 'Synthetic trips',
+      sources: [],
+      options: [
+        {
+          id: 'option',
+          price: 'EUR 350',
+          journeys: journeys.map((segments, index) => ({
+            id: `journey-${index}`,
+            label: `Journey ${index + 1}`,
+            segments,
+          })),
+        },
+      ],
+    });
+    if (card.type !== 'flights') throw new Error('Expected a flight presentation.');
+    return flightItems(card).items[0]!;
+  };
   const circuit = row([[leg('BER', 'AMS')], [leg('AMS', 'LIS')], [leg('LIS', 'BER')]]);
   assert.equal(circuit.route?.to.place, 'BER');
   assert.deepEqual(circuit.route?.middle, ['AMS', 'LIS']);
