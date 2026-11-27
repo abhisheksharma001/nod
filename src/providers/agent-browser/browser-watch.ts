@@ -93,7 +93,8 @@ export async function watchBrowser(options: {
     const directory = completed ? await downloads.get(guid) : undefined;
     downloads.delete(guid);
     const file = resolve(options.incoming, guid);
-    if (!directory) return rm(file, { force: true });
+    if (!directory || !options.sessions().some((session) => session.directory === directory))
+      return rm(file, { force: true });
     await mkdir(directory, { recursive: true, mode: 0o700 });
     await rename(file, resolve(directory, guid));
   };
