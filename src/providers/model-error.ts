@@ -57,7 +57,14 @@ export async function modelServiceError(
         chunks.push(value);
       }
       const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-      const error = body.error ?? body;
+      const error =
+        body.error ??
+        (typeof body.message !== 'string' &&
+        body.detail &&
+        typeof body.detail === 'object' &&
+        !Array.isArray(body.detail)
+          ? body.detail
+          : body);
       if (typeof error === 'string') reason = serviceReason = error;
       else if (error && typeof error === 'object') {
         const message = typeof error.message === 'string' ? error.message : error.detail;
