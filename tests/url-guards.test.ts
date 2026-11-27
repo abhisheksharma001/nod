@@ -1400,6 +1400,47 @@ test('flight journeys preserve every leg and distinguish connections from techni
   );
 });
 
+test('a chained flight row reaches the last arrival and names every stop between', () => {
+  const leg = (from: string, to: string, change = false) => ({
+    airline: 'Synthetic Air',
+    departure: { airport: from, time: '08:00' },
+    arrival: { airport: to, time: '09:30' },
+    technicalStops: [],
+    ...(change ? { connectionAfter: { airportChange: 'no', selfTransfer: 'no' } } : {}),
+  });
+  const row = (journeys: Array<Array<ReturnType<typeof leg>>>) =>
+    flightItems(
+      presentationSchema.parse({
+        version: 1,
+        type: 'flights',
+        title: 'Synthetic trips',
+        sources: [],
+        options: [
+          {
+            id: 'option',
+            price: 'EUR 350',
+            journeys: journeys.map((segments, index) => ({
+              id: `journey-${index}`,
+              label: `Journey ${index + 1}`,
+              segments,
+            })),
+          },
+        ],
+      }),
+    ).items[0]!;
+  const circuit = row([[leg('BER', 'AMS')], [leg('AMS', 'LIS')], [leg('LIS', 'BER')]]);
+  assert.equal(circuit.route?.to.place, 'BER');
+  assert.deepEqual(circuit.route?.middle, ['AMS', 'LIS']);
+  assert.equal(circuit.valueSub, undefined);
+  const multiCity = row([[leg('BER', 'AMS')], [leg('AMS', 'CDG', true), leg('CDG', 'LIS')]]);
+  assert.equal(multiCity.route?.to.place, 'LIS');
+  assert.deepEqual(multiCity.route?.middle, ['AMS', 'CDG']);
+  assert.equal(multiCity.valueSub, undefined);
+  const roundTrip = row([[leg('BER', 'AMS')], [leg('AMS', 'BER')]]);
+  assert.equal(roundTrip.route?.to.place, 'AMS');
+  assert.equal(roundTrip.valueSub, 'Nonstop');
+});
+
 test('charts accept signed finite data and reject ambiguous series or excessive values', () => {
   const chart = {
     version: 1,
