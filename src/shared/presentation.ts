@@ -909,8 +909,9 @@ export function flightItems(value: FlightsPresentation): ItemsPresentation {
       const all = option.journeys.flatMap((journey) => journey.segments);
       const connections = option.journeys.flatMap((journey) => journey.segments.slice(0, -1));
       const chained =
-        option.journeys.length > 1 &&
-        airportCode(all.at(-1)!.arrival.airport) !== airportCode(first.departure.airport);
+        option.journeys.length > 2 ||
+        (option.journeys.length > 1 &&
+          airportCode(all.at(-1)!.arrival.airport) !== airportCode(first.departure.airport));
       const shown = chained ? all : segments;
       const last = shown.at(-1)!;
       const risks = option.journeys.flatMap((journey) =>
@@ -964,7 +965,7 @@ export function flightItems(value: FlightsPresentation): ItemsPresentation {
           ? { status: { label: 'Booked', tone: 'done' as const } }
           : {}),
         ...(option.price ? { value: clip(option.price, 40) } : {}),
-        ...(connections.length
+        ...(!chained && connections.length
           ? {
               valueSub: clip(
                 `${changes(connections.length)} · ${connections.map((segment) => airportCode(segment.arrival.airport)).join(', ')}`,
